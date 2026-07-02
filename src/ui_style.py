@@ -10,8 +10,8 @@ def page_css() -> str:
     :root {
       --ink: #111827;
       --muted: #6B7280;
-      --blue: #7C3AED;
-      --blue-soft: #F5F3FF;
+      --blue: #2563EB;
+      --blue-soft: #EFF6FF;
       --amber: #D97706;
       --amber-soft: #FFFBEB;
       --red: #DC2626;
@@ -23,7 +23,7 @@ def page_css() -> str:
       --orange: #EA580C;
       --orange-soft: #FFF7ED;
       --gray: #9CA3AF;
-      --bg: #F6F3EE;
+      --bg: #F3F4F6;
       --card: #FFFFFF;
       --line: #E7E5E4;
     }
@@ -65,7 +65,7 @@ def page_css() -> str:
       background: #FFFFFF !important;
     }
     [data-testid="stSidebar"] li[role="option"]:hover {
-      background: #F5F3FF !important;
+      background: #EFF6FF !important;
     }
     /* The popover container */
     [data-testid="stSidebar"] [data-baseweb="popover"] {
@@ -86,7 +86,7 @@ def page_css() -> str:
       background: #27272A;
     }
     [data-testid="stSidebar"] .stRadio div[data-testid="stRadio"] label[data-selected="true"] {
-      background: #A855F7 !important;
+      background: #2563EB !important;
       color: #FFFFFF !important;
     }
 
@@ -150,7 +150,7 @@ def page_css() -> str:
       color: #991B1B;
     }
     .alert-card.blue {
-      background: #F5F3FF;
+      background: #EFF6FF;
       border-color: #C4B5FD;
       color: #5B21B6;
     }
@@ -206,6 +206,17 @@ def page_css() -> str:
       border: 1px solid var(--line);
       border-radius: 8px;
       overflow: hidden;
+      background: #FFFFFF;
+    }
+    [data-testid="stDataFrame"] [role="gridcell"],
+    [data-testid="stDataFrame"] [role="columnheader"] {
+      font-size: 12px !important;
+      line-height: 1.25 !important;
+    }
+    [data-testid="stDataFrame"] [role="columnheader"] {
+      background: #F8FAFC !important;
+      color: #374151 !important;
+      font-weight: 700 !important;
     }
 
     /* Signal cards inside待买 */
@@ -290,7 +301,7 @@ def page_css() -> str:
       font-size: 0.9rem;
     }
     .mode-kicker {
-      color: #7C3AED;
+      color: #2563EB;
       font-size: 0.72rem;
       font-weight: 750;
       letter-spacing: 0.08rem;
@@ -343,7 +354,7 @@ def page_css() -> str:
     }
     .step-card span {
       display: block;
-      color: #7C3AED;
+      color: #2563EB;
       font-size: 0.72rem;
       font-weight: 750;
       margin-bottom: 0.2rem;

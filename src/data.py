@@ -6,7 +6,8 @@ from typing import BinaryIO
 
 import pandas as pd
 
-from src.rules import GROUPS, affordability, buy_signal, clean_code, ma5_deviation, screening_result
+from src.rules import GROUPS, affordability, buy_signal, clean_code, ma5_deviation, screening_result, stage_to_group
+from src.storage import backup_file, safe_write_csv
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -25,6 +26,7 @@ WATCHLIST_COLUMNS = [
     "成交额排名",
     "上市板块",
     "状态",
+    "分组",
     "MA5",
     "MA10",
     "MA20",
@@ -124,6 +126,8 @@ REQUIRED_DIRS = [
     DATA_DIR / "reports" / "monthly",
     DATA_DIR / "exports",
     DATA_DIR / "trades",
+    DATA_DIR / "runtime",
+    DATA_DIR / "backups",
 ]
 
 
@@ -178,6 +182,8 @@ def standardize_candidates(raw: pd.DataFrame) -> pd.DataFrame:
     for column in ["现价", "涨跌幅%", "成交额", "成交额排名"]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
     df["状态"] = "初筛通过"
+    df["分组"] = "初筛"
+    df["流程阶段"] = "初筛通过"
 
     # Initialize all watchlist columns
     for col in WATCHLIST_COLUMNS:
@@ -193,7 +199,11 @@ def standardize_candidates(raw: pd.DataFrame) -> pd.DataFrame:
 def load_watchlist() -> pd.DataFrame:
     ensure_data_dir()
     if WATCHLIST_FILE.exists():
-        df = pd.read_csv(WATCHLIST_FILE, dtype={"代码": str}, encoding="utf-8-sig")
+        try:
+            df = pd.read_csv(WATCHLIST_FILE, dtype={"代码": str}, encoding="utf-8-sig")
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+            backup_file(WATCHLIST_FILE, label="bad")
+            df = empty_frame(WATCHLIST_COLUMNS)
     elif SOURCE_FILE.exists():
         df = standardize_candidates(read_tabular(SOURCE_FILE))
         save_watchlist(df)
@@ -206,14 +216,18 @@ def load_watchlist() -> pd.DataFrame:
             else:
                 df[column] = pd.NA
     df["代码"] = df["代码"].map(clean_code)
-    df["状态"] = df["状态"].replace({
+    stage_aliases = {
         "初筛": "初筛通过",
         "观察": "重点观察",
         "待买": "待买观察",
         "持仓": "重点观察",
         "待买观察": "待买观察",
-    })
+    }
+    df["状态"] = df["状态"].replace(stage_aliases)
     df["状态"] = df["状态"].where(df["状态"].isin(GROUPS), "初筛通过")
+    df["流程阶段"] = df["流程阶段"].replace("", pd.NA).fillna(df["状态"]).replace(stage_aliases)
+    df["流程阶段"] = df["流程阶段"].where(df["流程阶段"].isin(GROUPS), df["状态"])
+    df["分组"] = df["流程阶段"].map(stage_to_group)
     rank = pd.to_numeric(df.get("成交额排名"), errors="coerce")
     turnover = pd.to_numeric(df.get("成交额"), errors="coerce")
     df["_rank_sort"] = rank.fillna(999999)
@@ -236,7 +250,7 @@ def save_watchlist(df: pd.DataFrame) -> None:
                 out[column] = False
             else:
                 out[column] = pd.NA
-    out[WATCHLIST_COLUMNS].to_csv(WATCHLIST_FILE, index=False, encoding="utf-8-sig")
+    safe_write_csv(out[WATCHLIST_COLUMNS], WATCHLIST_FILE, columns=WATCHLIST_COLUMNS)
 
 
 def merge_candidates(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
@@ -321,7 +335,11 @@ def load_simple_csv(path: Path, columns: list[str]) -> pd.DataFrame:
     ensure_data_dir()
     if not path.exists():
         return empty_frame(columns)
-    df = pd.read_csv(path, dtype={"代码": str}, encoding="utf-8-sig")
+    try:
+        df = pd.read_csv(path, dtype={"代码": str}, encoding="utf-8-sig")
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+        backup_file(path, label="bad")
+        return empty_frame(columns)
     for column in columns:
         if column not in df:
             df[column] = pd.NA
@@ -336,7 +354,7 @@ def save_simple_csv(df: pd.DataFrame, path: Path, columns: list[str]) -> None:
     for column in columns:
         if column not in out:
             out[column] = pd.NA
-    out[columns].to_csv(path, index=False, encoding="utf-8-sig")
+    safe_write_csv(out[columns], path, columns=columns)
 
 
 def load_holdings() -> pd.DataFrame:
@@ -365,10 +383,18 @@ def normalize_holdings(df: pd.DataFrame) -> pd.DataFrame:
 def load_trades() -> pd.DataFrame:
     ensure_data_dir()
     if TRADES_FILE.exists():
-        df = pd.read_csv(TRADES_FILE, dtype={"代码": str}, encoding="utf-8-sig")
+        try:
+            df = pd.read_csv(TRADES_FILE, dtype={"代码": str}, encoding="utf-8-sig")
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+            backup_file(TRADES_FILE, label="bad")
+            return empty_frame(TRADE_COLUMNS)
         return normalize_trade_records(df)
     if LEGACY_TRADES_FILE.exists():
-        df = pd.read_csv(LEGACY_TRADES_FILE, dtype={"代码": str}, encoding="utf-8-sig")
+        try:
+            df = pd.read_csv(LEGACY_TRADES_FILE, dtype={"代码": str}, encoding="utf-8-sig")
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+            backup_file(LEGACY_TRADES_FILE, label="bad")
+            return empty_frame(TRADE_COLUMNS)
         return normalize_trade_records(df)
     else:
         return empty_frame(TRADE_COLUMNS)

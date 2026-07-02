@@ -17,7 +17,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "allow_unaffordable_watchlist": False,
     "history_source": "本地缓存 + AKShare",
     "quote_source": "自动切换",
-    "quote_refresh_mode": "60秒",
+    "quote_refresh_mode": "手动",
     "quote_refresh_seconds": 60,
     "auto_pool_size": 30,
     "commission_rate": 0.00025,

@@ -15,6 +15,19 @@ PIPELINE_STAGES = [
     "淘汰",
 ]
 GROUPS = PIPELINE_STAGES
+MAIN_GROUPS = ["初筛", "观察", "待买", "持仓", "淘汰"]
+
+
+def stage_to_group(stage: Any) -> str:
+    """Map detailed rule stages to the user-facing workbench group."""
+    text = str(stage or "").strip()
+    if text == "待买观察":
+        return "待买"
+    if text in {"重点观察", "等回踩", "资金不足观察"}:
+        return "观察"
+    if text == "淘汰":
+        return "淘汰"
+    return "初筛"
 
 
 def clean_code(value: Any) -> str:
@@ -114,7 +127,7 @@ def rank_top_30(row: dict[str, Any]) -> bool:
 
 def valid_history(row: dict[str, Any]) -> bool:
     status = str(row.get("history_status", "") or "")
-    if status in {"缺少历史K线", "自动获取失败", "数据不足"}:
+    if status in {"缺少历史K线", "自动获取失败", "数据不足", "缓存过旧"}:
         return False
     rows = row.get("history_rows")
     if is_number(rows) and float(rows) < 20:
@@ -140,6 +153,9 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
     history_status = str(row.get("history_status", "") or "")
     if history_status in {"自动获取失败", "缺少历史K线"}:
         return "缺少历史K线", "缺少有效历史K线", "缺少历史K线，暂不能判断MA5"
+    if history_status == "缓存过旧":
+        error = str(row.get("history_error", "") or "历史K线缓存过旧")
+        return "缺少历史K线", "缓存过旧", error
     if history_status == "数据不足":
         error = str(row.get("history_error", "") or "历史K线数据不足")
         return "缺少历史K线", "历史K线数据不足", error
@@ -172,6 +188,31 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
     if deviation_f <= 5:
         return "重点观察", "MA5偏离率2%-5%", "强势在线，继续观察回踩"
     return "等回踩", "远离5日线，不追", "远离5日线，不追，等回踩"
+
+
+def evaluate_stock(row: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate one stock row without side effects.
+
+    Rules stay pure here: no file IO, no network, no Streamlit state.
+    """
+    stage, reason, reminder = stock_stage_result(row)
+    group = stage_to_group(stage)
+    can_buy = stage == "待买观察"
+    if stage == "淘汰":
+        risk_level = "danger"
+    elif stage in {"缺少历史K线", "资金不足观察"}:
+        risk_level = "warning"
+    else:
+        risk_level = "normal"
+    return {
+        "code": clean_code(row.get("代码", "")),
+        "group": group,
+        "stage": stage,
+        "can_buy": can_buy,
+        "risk_level": risk_level,
+        "reason": reason,
+        "reminder": reminder,
+    }
 
 
 def holding_advice(

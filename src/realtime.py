@@ -23,6 +23,9 @@ QUOTE_COLUMNS = [
     "昨收",
     "最高",
     "最低",
+    "更新时间",
+    "来源",
+    "状态",
 ]
 
 EASTMONEY_SPOT_HOSTS = [
@@ -49,6 +52,21 @@ def is_a_share_trading_time(now: datetime | None = None) -> bool:
 
 
 def _with_status(df: pd.DataFrame, source: str = "", message: str = "") -> pd.DataFrame:
+    if not df.empty:
+        refresh_time = china_now().strftime("%Y-%m-%d %H:%M:%S")
+        if "更新时间" not in df:
+            df["更新时间"] = refresh_time
+        else:
+            df["更新时间"] = df["更新时间"].fillna(refresh_time).replace("", refresh_time)
+        if "来源" not in df:
+            df["来源"] = source
+        else:
+            df["来源"] = df["来源"].fillna(source).replace("", source)
+        quote_status = "部分成功" if "未获取" in str(message) else "成功"
+        if "状态" not in df:
+            df["状态"] = quote_status
+        else:
+            df["状态"] = df["状态"].fillna(quote_status).replace("", quote_status)
     df.attrs["source"] = source
     df.attrs["message"] = message
     return df

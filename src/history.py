@@ -104,7 +104,7 @@ def diagnose_history(code: str, max_age_days: int = 10) -> dict[str, Any]:
     age_days = (pd.Timestamp(date.today()).normalize() - last_date.normalize()).days
     if age_days > max_age_days:
         result.update({
-            "history_status": "数据不足",
+            "history_status": "缓存过旧",
             "history_error": f"最后交易日 {last_date.date().isoformat()} 过旧",
         })
         return result
@@ -515,6 +515,8 @@ def classify_reminder(reminder_text: str) -> str:
         return "缺少历史K线"
     if "数据不足" in reminder_text:
         return "历史K线数据不足"
+    if "缓存过旧" in reminder_text or "过旧" in reminder_text:
+        return "缓存过旧"
     if "跌破5日线" in reminder_text or "跌破" in reminder_text:
         return "跌破不买"
     if "接近5日线" in reminder_text or "重点观察" in reminder_text:

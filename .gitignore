@@ -49,6 +49,8 @@ data/processed/
 data/raw/
 data/exports/
 data/trades/
+data/runtime/
+data/backups/
 
 # Reports and exports
 data/reports/

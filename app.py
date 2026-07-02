@@ -40,12 +40,13 @@ from src.account import (
 )
 from src.rules import (
     PIPELINE_STAGES,
+    evaluate_stock,
     holding_advice,
     ma5_deviation,
-    score_stock,
     screening_result,
-    stock_stage_result,
+    stage_to_group,
 )
+from src.charts import render_kline_chart
 from src.history import (
     compute_all_reminders,
     diagnose_history,
@@ -62,6 +63,7 @@ from src.realtime import (
     merge_quotes_into_holdings,
     merge_quotes_into_watchlist,
 )
+from src.storage import load_last_refresh, load_quote_snapshot, save_quote_snapshot
 from src.portfolio import (
     account_state_from_trades,
     asset_curve_from_trades,
@@ -345,19 +347,17 @@ def render_return_home(current_page: str) -> None:
         navigate_now("今日看板")
 
 
+def trigger_global_refresh() -> None:
+    st.session_state.manual_quote_refresh = int(st.session_state.get("manual_quote_refresh", 0)) + 1
+    st.session_state.force_quote_refresh = True
+    st.session_state.reminder_computed = False
+    st.cache_data.clear()
+    st.rerun()
+
+
 def schedule_auto_refresh(enabled: bool, interval_seconds: int) -> None:
-    if not enabled:
-        return
-    st.html(
-        f"""
-        <script>
-          setTimeout(function() {{
-            window.parent.location.reload();
-          }}, {int(interval_seconds) * 1000});
-        </script>
-        """,
-        unsafe_allow_javascript=True,
-    )
+    del enabled, interval_seconds
+    return
 
 
 def trade_history_context(code: str, trade_date: object, trade_price: object) -> dict[str, object]:
@@ -614,6 +614,150 @@ def render_columns(
     render_table(df[table_columns], height)
 
 
+STOCK_TABLE_COLUMNS = [
+    "代码", "名称", "涨跌幅%", "现价", "成交额", "成交额排名", "MA5", "MA10", "MA20",
+    "MA5偏离率%", "最近大阳线%", "MA5向上", "一手金额", "本金是否可买", "分组", "流程阶段", "提醒",
+]
+
+HOLDING_TABLE_COLUMNS = [
+    "代码", "名称", "数量", "平均成本", "当前价", "市值", "浮动盈亏", "浮动盈亏%",
+    "MA5", "MA5偏离率%", "持仓天数", "操作提醒",
+]
+
+
+def workbench_column_config(df: pd.DataFrame) -> dict[str, object]:
+    config: dict[str, object] = {
+        "代码": st.column_config.TextColumn(width="small"),
+        "名称": st.column_config.TextColumn(width="small"),
+        "分组": st.column_config.TextColumn(width="small"),
+        "流程阶段": st.column_config.TextColumn(width="small"),
+        "提醒": st.column_config.TextColumn(width="medium"),
+        "操作提醒": st.column_config.TextColumn(width="medium"),
+        "本金是否可买": st.column_config.TextColumn(width="small"),
+        "MA5向上": st.column_config.CheckboxColumn(width="small"),
+    }
+    price_cols = {"现价", "当前价", "MA5", "MA10", "MA20", "平均成本"}
+    amount_cols = {"成交额", "一手金额", "市值", "浮动盈亏"}
+    percent_cols = {"涨跌幅%", "MA5偏离率%", "最近大阳线%", "浮动盈亏%"}
+    integer_cols = {"成交额排名", "数量", "持仓天数"}
+    for column in df.columns:
+        if column in price_cols:
+            config[column] = st.column_config.NumberColumn(format="%.3f", width="small")
+        elif column in amount_cols:
+            config[column] = st.column_config.NumberColumn(format="¥%.2f", width="small")
+        elif column in percent_cols:
+            config[column] = st.column_config.NumberColumn(format="%.2f%%", width="small")
+        elif column in integer_cols:
+            config[column] = st.column_config.NumberColumn(format="%d", width="small")
+    return {column: value for column, value in config.items() if column in df.columns}
+
+
+def color_positive_red(value: object) -> str:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric) or float(numeric) == 0:
+        return ""
+    color = "#DC2626" if float(numeric) > 0 else "#16A34A"
+    return f"color: {color}; font-weight: 650"
+
+
+def style_workbench_frame(df: pd.DataFrame):
+    style = df.style
+    color_columns = [column for column in ["涨跌幅%", "MA5偏离率%", "浮动盈亏", "浮动盈亏%"] if column in df.columns]
+    if color_columns:
+        style = style.map(color_positive_red, subset=color_columns)
+    formatters = {}
+    for column in df.columns:
+        if column in {"现价", "当前价", "MA5", "MA10", "MA20", "平均成本"}:
+            formatters[column] = "{:.3f}"
+        elif column in {"涨跌幅%", "MA5偏离率%", "最近大阳线%", "浮动盈亏%"}:
+            formatters[column] = "{:.2f}%"
+        elif column in {"成交额", "一手金额", "市值", "浮动盈亏"}:
+            formatters[column] = "¥{:,.2f}"
+    return style.format(formatters, na_rep="")
+
+
+def selected_rows_from_event(event: object) -> list[int]:
+    if event is None:
+        return []
+    selection = event.get("selection", {}) if isinstance(event, dict) else getattr(event, "selection", {})
+    if selection is None:
+        return []
+    if isinstance(selection, dict):
+        return list(selection.get("rows", []) or [])
+    return list(getattr(selection, "rows", []) or [])
+
+
+def render_workbench_table(
+    df: pd.DataFrame,
+    columns: list[str],
+    *,
+    key: str,
+    height: int = 480,
+) -> pd.Series | None:
+    table_columns = select_columns(df, columns)
+    display = df[table_columns].copy() if table_columns else df.copy()
+    if display.empty:
+        st.dataframe(display, width="stretch", height=180, hide_index=True, row_height=26, key=f"{key}_empty")
+        return None
+
+    numeric_columns = [
+        "涨跌幅%", "现价", "成交额", "成交额排名", "MA5", "MA10", "MA20", "MA5偏离率%",
+        "最近大阳线%", "一手金额", "数量", "平均成本", "当前价", "市值", "浮动盈亏",
+        "浮动盈亏%", "持仓天数",
+    ]
+    for column in numeric_columns:
+        if column in display:
+            display[column] = pd.to_numeric(display[column], errors="coerce")
+    if "MA5向上" in display:
+        display["MA5向上"] = display["MA5向上"].map(is_truthy)
+
+    event = st.dataframe(
+        style_workbench_frame(display),
+        width="stretch",
+        height=height,
+        hide_index=True,
+        row_height=26,
+        column_config=workbench_column_config(display),
+        on_select="rerun",
+        selection_mode="single-row",
+        key=key,
+    )
+    selected_rows = selected_rows_from_event(event)
+    if selected_rows:
+        selected_index = selected_rows[0]
+        if 0 <= selected_index < len(display):
+            return display.iloc[selected_index]
+    return None
+
+
+def render_kline_for_selection(selected: pd.Series | None) -> None:
+    if selected is None:
+        st.caption("单击表格中的股票查看K线。")
+        return
+    render_kline_chart(str(selected.get("代码", "")), str(selected.get("名称", "")))
+
+
+def history_action_advice(status: str) -> str:
+    mapping = {
+        "已有缓存": "可参与MA规则判断",
+        "缺少历史K线": "点击补K线",
+        "自动获取失败": "稍后重试或手动导入",
+        "数据不足": "可能是新股/次新股，暂不参与MA20/完整规则判断",
+        "缓存过旧": "点击强制刷新",
+        "自动获取成功": "已更新，重新计算规则",
+    }
+    return mapping.get(str(status or ""), "检查数据后重试")
+
+
+def count_risk_positions(positions: pd.DataFrame) -> int:
+    if positions.empty:
+        return 0
+    deviation = pd.to_numeric(positions.get("MA5偏离率%", pd.Series(dtype=float)), errors="coerce")
+    reminders = positions.get("操作提醒", pd.Series([""] * len(positions))).fillna("").astype(str)
+    risk_text = reminders.str.contains("跌破|减仓|清仓|卖出|风险", regex=True)
+    return int(deviation.lt(0).fillna(False).sum() + (risk_text & ~deviation.lt(0).fillna(False)).sum())
+
+
 def observation_result(row: pd.Series) -> tuple[bool, str]:
     deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
     has_history = pd.notna(row.get("MA5"))
@@ -653,28 +797,35 @@ def build_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     out["观察通过"] = False
     out["待买通过"] = False
     out["流程阶段"] = "初筛通过"
+    out["分组"] = "初筛"
     out["筛选原因"] = ""
 
     for index, row in out.iterrows():
-        stage, reason, reminder = stock_stage_result(row.to_dict())
-        out.loc[index, "流程阶段"] = stage
-        out.loc[index, "状态"] = stage
-        out.loc[index, "筛选原因"] = reason
-        if reminder:
-            out.loc[index, "提醒"] = reminder
-        out.loc[index, "观察通过"] = stage in {"重点观察", "等回踩", "待买观察", "资金不足观察"}
-        out.loc[index, "待买通过"] = stage == "待买观察"
+        result = evaluate_stock(row.to_dict())
+        out.loc[index, "流程阶段"] = result["stage"]
+        out.loc[index, "状态"] = result["stage"]
+        out.loc[index, "分组"] = result["group"]
+        out.loc[index, "筛选原因"] = result["reason"]
+        if result["reminder"]:
+            out.loc[index, "提醒"] = result["reminder"]
+        out.loc[index, "观察通过"] = result["group"] in {"观察", "待买"}
+        out.loc[index, "待买通过"] = bool(result["can_buy"])
 
     return out
 
 
 def pipeline_views(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    views = {stage: df[df["流程阶段"] == stage].copy() for stage in PIPELINE_STAGES}
-    views["初筛"] = df.copy()
-    views["观察"] = df[df["流程阶段"].isin(["重点观察", "等回踩", "待买观察", "资金不足观察"])].copy()
+    source = df.copy()
+    if "分组" not in source:
+        source["分组"] = source["流程阶段"].map(stage_to_group)
+    views = {stage: source[source["流程阶段"] == stage].copy() for stage in PIPELINE_STAGES}
+    views["初筛"] = source[source["分组"] == "初筛"].copy()
+    views["观察"] = source[source["分组"] == "观察"].copy()
+    views["持仓"] = source[source["分组"] == "持仓"].copy()
     views["待买"] = views["待买观察"]
-    views["观察未待买"] = df[df["流程阶段"].isin(["重点观察", "等回踩", "资金不足观察"])].copy()
-    views["未达规则"] = df[df["流程阶段"].isin(["缺少历史K线", "淘汰"])].copy()
+    views["观察未待买"] = source[source["流程阶段"].isin(["重点观察", "等回踩", "资金不足观察"])].copy()
+    views["未达规则"] = source[source["流程阶段"].isin(["缺少历史K线", "淘汰"])].copy()
+    views["淘汰分组"] = source[source["分组"] == "淘汰"].copy()
     return views
 
 
@@ -724,15 +875,23 @@ def prepare_current_stock_batch(
         if column not in batch:
             batch[column] = False if column in {"MA5向上", "放量跌破MA5"} else pd.NA
     batch["状态"] = "初筛通过"
+    batch["流程阶段"] = "初筛通过"
+    batch["分组"] = "初筛"
     return batch[WATCHLIST_COLUMNS].reset_index(drop=True)
 
 
-def fetch_history_for_codes(codes: list[str], *, only_missing: bool = True) -> dict[str, object]:
+def fetch_history_for_codes(
+    codes: list[str],
+    *,
+    only_missing: bool = True,
+    statuses_to_fetch: set[str] | None = None,
+) -> dict[str, object]:
     cleaned_codes = [str(code) for code in codes if str(code).strip()]
     if only_missing:
+        allowed_statuses = statuses_to_fetch or {"缺少历史K线", "数据不足", "自动获取失败", "缓存过旧"}
         cleaned_codes = [
             code for code in cleaned_codes
-            if diagnose_history(code)["history_status"] in {"缺少历史K线", "数据不足", "自动获取失败"}
+            if diagnose_history(code)["history_status"] in allowed_statuses
         ]
     summary: dict[str, object] = {
         "fetched": 0,
@@ -803,7 +962,7 @@ def _run_analysis(uploaded, incoming: pd.DataFrame, fetch_missing: bool = False)
         available_cash,
         max_position_ratio=max_position_ratio,
     ))
-    for column in ["流程阶段", "筛选原因", "提醒", "规则状态"]:
+    for column in ["分组", "流程阶段", "筛选原因", "提醒", "规则状态"]:
         if column in analyzed.columns:
             merged[column] = analyzed[column].values
     merged["状态"] = analyzed["流程阶段"].values
@@ -837,7 +996,7 @@ def _recompute_reminders(
         max_position_ratio=float(st.session_state.settings.get("max_position_pct", 100)) / 100,
     )
     analyzed = build_pipeline(enriched)
-    for column in ["流程阶段", "筛选原因", "提醒", "规则状态"]:
+    for column in ["分组", "流程阶段", "筛选原因", "提醒", "规则状态"]:
         if column in analyzed.columns:
             target[column] = analyzed[column].values
     target["状态"] = analyzed["流程阶段"].values
@@ -959,6 +1118,7 @@ def rule_snapshot_for_trade(
     principal_ok = amount <= cash
     time_ok = trade_time_allowed(trade_time)
     stage = str(row.get("流程阶段", row.get("状态", "")) or "")
+    group_name = str(row.get("分组") or stage_to_group(stage))
 
     tags: list[str] = []
     if not passed:
@@ -998,6 +1158,19 @@ def rule_snapshot_for_trade(
     else:
         conclusion = "部分符合"
 
+    def snapshot_value(value: object) -> object:
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except (TypeError, ValueError):
+                return value
+        return value
+
     snapshot = {
         "是否主板": passed,
         "是否成交额前30": rank_ok,
@@ -1006,7 +1179,14 @@ def rule_snapshot_for_trade(
         "是否MA5偏离率0%-2%": deviation_ok,
         "是否本金可买": principal_ok,
         "是否在允许交易时间": time_ok,
+        "买入时分组": group_name,
         "买入时状态": stage or "未在当前股票池",
+        "买入时流程阶段": stage or "未在当前股票池",
+        "买入时MA5": snapshot_value(row.get("MA5", pd.NA)),
+        "买入时MA5偏离率%": snapshot_value(deviation),
+        "买入时最近20日最大涨幅%": snapshot_value(row.get("最近大阳线%", pd.NA)),
+        "买入时MA5向上": ma5_up,
+        "买入时资金足够": principal_ok,
     }
     return json.dumps(snapshot, ensure_ascii=False), conclusion, "；".join(unique_tags) if unique_tags else "无"
 
@@ -1274,6 +1454,8 @@ if pending_page_navigation:
     del st.session_state["pending_page_navigation"]
 elif st.session_state.get("page_navigation") == "待买观察":
     st.session_state.page_navigation = "待买"
+elif st.session_state.get("page_navigation") in {"交易复盘", "报告中心"}:
+    st.session_state.page_navigation = "复盘报告"
 
 # ── Sidebar ──
 with st.sidebar:
@@ -1296,9 +1478,12 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    if st.button("刷新行情 / 重新计算", key="sidebar_global_refresh", use_container_width=True):
+        trigger_global_refresh()
+    st.divider()
     page = st.radio(
         "导航",
-        ["今日看板", "数据导入", "股票分组", "盘中观察", "待买", "交易记录", "持仓监控", "资产看板", "交易复盘", "报告中心", "系统设置"],
+        ["今日看板", "数据导入", "股票分组", "盘中观察", "待买", "交易记录", "持仓监控", "资产看板", "复盘报告", "系统设置"],
         label_visibility="collapsed",
         key="page_navigation",
     )
@@ -1322,14 +1507,53 @@ quote_codes = sorted(
     set(st.session_state.watchlist["代码"].dropna().astype(str))
     | set(st.session_state.holdings["代码"].dropna().astype(str))
 )
-quote_status = "非交易时段，使用本地缓存"
-if quote_codes and (trading_now or force_quote_refresh):
+quote_snapshot = load_quote_snapshot()
+last_refresh = load_last_refresh()
+quote_status = "暂无行情快照，使用本地数据"
+if not quote_snapshot.empty:
+    st.session_state.watchlist = merge_quotes_into_watchlist(
+        st.session_state.watchlist,
+        quote_snapshot,
+    )[WATCHLIST_COLUMNS]
+    st.session_state.holdings = merge_quotes_into_holdings(
+        st.session_state.holdings,
+        quote_snapshot,
+    )[HOLDING_COLUMNS]
+    snapshot_times = quote_snapshot["更新时间"].dropna().astype(str)
+    snapshot_sources = quote_snapshot["来源"].dropna().astype(str)
+    snapshot_states = quote_snapshot["状态"].dropna().astype(str)
+    refresh_time = str(last_refresh.get("更新时间") or (snapshot_times.max() if not snapshot_times.empty else ""))
+    refresh_source = str(last_refresh.get("来源") or (snapshot_sources.iloc[0] if not snapshot_sources.empty else "行情快照"))
+    refresh_state = str(last_refresh.get("状态") or (snapshot_states.iloc[0] if not snapshot_states.empty else "缓存"))
+    quote_status = f"行情快照 {refresh_time}｜{refresh_source}｜{refresh_state}"
+
+if quote_codes and force_quote_refresh:
     quotes = cached_realtime_quotes(
         tuple(quote_codes),
         settings.get("quote_source", "自动切换"),
         int(st.session_state.get("manual_quote_refresh", 0)),
     )
     if not quotes.empty:
+        quote_message = quotes.attrs.get("message") or quotes.attrs.get("source") or "行情已更新"
+        quote_source = quotes.attrs.get("source") or settings.get("quote_source", "自动切换")
+        quote_state = "部分成功" if "未获取" in str(quote_message) else "成功"
+        quotes_for_snapshot = quotes.copy()
+        if not quote_snapshot.empty:
+            fresh_codes = set(quotes_for_snapshot["代码"].dropna().astype(str))
+            active_codes = set(quote_codes)
+            snapshot_codes = quote_snapshot["代码"].astype(str)
+            cached_fallback = quote_snapshot[
+                snapshot_codes.isin(active_codes) & ~snapshot_codes.isin(fresh_codes)
+            ].copy()
+            if not cached_fallback.empty:
+                cached_fallback["状态"] = "缓存兜底"
+                quotes_for_snapshot = pd.concat([quotes_for_snapshot, cached_fallback], ignore_index=True)
+        save_quote_snapshot(
+            quotes_for_snapshot,
+            source=str(quote_source),
+            status=quote_state,
+            message=str(quote_message),
+        )
         st.session_state.watchlist = merge_quotes_into_watchlist(
             st.session_state.watchlist,
             quotes,
@@ -1342,11 +1566,13 @@ if quote_codes and (trading_now or force_quote_refresh):
         save_holdings(st.session_state.holdings)
         st.session_state.reminder_computed = False
         st.session_state.last_quote_time = market_now.strftime("%H:%M:%S")
-        quote_message = quotes.attrs.get("message") or quotes.attrs.get("source") or "行情已更新"
         quote_status = f"{quote_message} · {st.session_state.last_quote_time}"
     else:
         quote_error = quotes.attrs.get("message", "未知原因")
-        quote_status = f"行情抓取失败，使用本地缓存：{quote_error}"
+        if not quote_snapshot.empty:
+            quote_status = f"行情抓取失败，使用快照缓存：{quote_error}"
+        else:
+            quote_status = f"行情抓取失败，且暂无快照缓存：{quote_error}"
 elif st.session_state.get("last_quote_time"):
     quote_status = f"最近行情更新 {st.session_state.last_quote_time}"
 
@@ -1395,20 +1621,29 @@ if cash_changed or not st.session_state.reminder_computed or "提醒" not in wat
 
 # Pipeline views
 watchlist = build_pipeline(watchlist)
-for column in ["状态", "流程阶段", "筛选原因", "提醒", "规则状态"]:
+held_codes = set(portfolio_positions["代码"].dropna().astype(str)) if not portfolio_positions.empty else set()
+if held_codes and "代码" in watchlist:
+    held_mask = watchlist["代码"].astype(str).isin(held_codes)
+    watchlist.loc[held_mask, "分组"] = "持仓"
+watchlist_changed = False
+for column in ["状态", "分组", "流程阶段", "筛选原因", "提醒", "规则状态"]:
     if column in watchlist.columns and column in st.session_state.watchlist.columns:
-        st.session_state.watchlist[column] = watchlist[column].values
-save_watchlist(st.session_state.watchlist)
+        old_values = st.session_state.watchlist[column].reset_index(drop=True).fillna("")
+        new_values = watchlist[column].reset_index(drop=True).fillna("")
+        if not old_values.equals(new_values):
+            st.session_state.watchlist[column] = watchlist[column].values
+            watchlist_changed = True
+if watchlist_changed:
+    save_watchlist(st.session_state.watchlist)
 views = pipeline_views(watchlist)
-held_codes = set(st.session_state.holdings["代码"].dropna().astype(str))
 if held_codes:
-    for view_name in ["重点观察", "等回踩", "待买观察", "资金不足观察", "观察", "待买", "观察未待买"]:
+    for view_name in list(views.keys()):
         views[view_name] = views[view_name][
             ~views[view_name]["代码"].astype(str).isin(held_codes)
         ].copy()
 counts = {name: len(frame) for name, frame in views.items()}
 
-valid_pages = {"今日看板", "数据导入", "股票分组", "盘中观察", "待买", "交易记录", "持仓监控", "资产看板", "交易复盘", "报告中心", "系统设置"}
+valid_pages = {"今日看板", "数据导入", "股票分组", "盘中观察", "待买", "交易记录", "持仓监控", "资产看板", "复盘报告", "系统设置"}
 if page not in valid_pages:
     page = "今日看板"
     st.session_state.page_navigation = page
@@ -1421,107 +1656,67 @@ if page == "今日看板":
 
     missing_history = len(views["缺少历史K线"])
     today_buy_watch = len(views["待买观察"])
+    risk_holding_count = count_risk_positions(portfolio_positions)
+    today_key = date.today().isoformat()
+    trades_today = st.session_state.trades[
+        pd.to_datetime(st.session_state.trades.get("日期", pd.Series(dtype=str)), errors="coerce")
+        == pd.Timestamp(date.today())
+    ] if not st.session_state.trades.empty else pd.DataFrame()
+    unreviewed_trades = len(trades_today) if len(trades_today) and not load_report_note("daily", today_key) else 0
 
-    st.markdown("#### 账户状态 KPI")
-    kpi_cols = st.columns(4)
-    kpi_cols[0].metric("账户模式", account_mode)
-    kpi_cols[1].metric("可用现金", money_display(available_cash))
-    kpi_cols[2].metric("账户权益", money_display(account["equity"]))
-    kpi_cols[3].metric("持仓市值", money_display(account["market_value"]))
-    kpi_cols_2 = st.columns(4)
-    kpi_cols_2[0].metric("浮动盈亏", money_display(account["floating_pnl"]))
-    kpi_cols_2[1].metric("今日待买观察", today_buy_watch)
-    kpi_cols_2[2].metric("当前持仓", len(portfolio_positions))
-    kpi_cols_2[3].metric("缺少历史K线", missing_history)
+    top_cols = st.columns([1, 3])
+    with top_cols[0]:
+        if st.button("刷新行情 / 重新计算", type="primary", use_container_width=True):
+            trigger_global_refresh()
+    top_cols[1].caption(f"{quote_status} · {funds_source} · 页面切换不自动联网，盘中手动轻刷新。")
 
-    stage_cols = st.columns(7)
-    for i, stage in enumerate(["初筛通过", "重点观察", "等回踩", "待买观察", "资金不足观察", "缺少历史K线", "淘汰"]):
-        label = "资金不足" if stage == "资金不足观察" else stage
-        stage_cols[i].metric(label, counts.get(stage, 0))
+    st.markdown("#### 账户状态")
+    account_cols = st.columns(4)
+    account_cols[0].metric("可用现金", money_display(available_cash))
+    account_cols[1].metric("账户权益", money_display(account["equity"]))
+    account_cols[2].metric("持仓市值", money_display(account["market_value"]))
+    account_cols[3].metric("浮动盈亏", money_display(account["floating_pnl"]))
 
-    st.markdown("#### 今日操作步骤")
-    st.markdown(
-        """
-        <div class="step-strip">
-          <div class="step-card"><span>01</span><b>生成/上传股票池</b></div>
-          <div class="step-card"><span>02</span><b>补全历史K线</b></div>
-          <div class="step-card"><span>03</span><b>查看重点观察</b></div>
-          <div class="step-card"><span>04</span><b>盘中确认</b></div>
-          <div class="step-card"><span>05</span><b>记录交易</b></div>
-          <div class="step-card"><span>06</span><b>收盘复盘</b></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    step_buttons = st.columns(6)
-    with step_buttons[0]:
-        nav_button("股票池", "数据导入", key="dash_step_import")
-    with step_buttons[1]:
+    st.markdown("#### 今日动作")
+    action_cols = st.columns(6)
+    action_cols[0].metric("初筛数量", counts.get("初筛", 0))
+    action_cols[1].metric("观察数量", counts.get("观察", 0))
+    action_cols[2].metric("待买数量", counts.get("待买", 0))
+    action_cols[3].metric("持仓数量", len(portfolio_positions))
+    action_cols[4].metric("缺K线数量", missing_history)
+    action_cols[5].metric("风险持仓数量", risk_holding_count)
+
+    st.markdown("#### 今日待处理事项")
+    todo_frame = pd.DataFrame([
+        {"事项": "需要补K线", "数量": missing_history, "处理入口": "数据导入"},
+        {"事项": "待买确认", "数量": today_buy_watch, "处理入口": "待买"},
+        {"事项": "持仓风险", "数量": risk_holding_count, "处理入口": "持仓监控"},
+        {"事项": "今日未复盘交易", "数量": unreviewed_trades, "处理入口": "复盘报告"},
+    ])
+    st.dataframe(todo_frame, width="stretch", hide_index=True, height=170, row_height=28)
+
+    st.markdown("#### 快捷按钮")
+    quick_cols = st.columns(7)
+    with quick_cols[0]:
+        if st.button("刷新行情", key="dash_refresh_quotes", use_container_width=True):
+            trigger_global_refresh()
+    with quick_cols[1]:
+        nav_button("生成股票池", "数据导入", key="dash_step_import")
+    with quick_cols[2]:
         nav_button("补K线", "数据导入", key="dash_step_history")
-    with step_buttons[2]:
-        nav_button("重点观察", "股票分组", key="dash_step_focus")
-    with step_buttons[3]:
-        nav_button("盘中确认", "盘中观察", key="dash_step_intraday")
-    with step_buttons[4]:
+    with quick_cols[3]:
+        nav_button("去观察", "股票分组", key="dash_step_focus")
+    with quick_cols[4]:
+        nav_button("去待买", "待买", key="dash_step_buy")
+    with quick_cols[5]:
         nav_button("记录交易", "交易记录", key="dash_step_trade")
-    with step_buttons[5]:
-        nav_button("收盘复盘", "交易复盘", key="dash_step_review")
-
-    refresh_cols = st.columns([1, 4])
-    with refresh_cols[0]:
-        if st.button("刷新行情", use_container_width=True):
-            st.session_state.manual_quote_refresh += 1
-            st.session_state.force_quote_refresh = True
-            st.rerun()
-    refresh_cols[1].caption(
-        f"{quote_status} · {funds_source} · "
-        f"{'交易时段自动刷新' if trading_now else '非交易时段不自动刷新'}"
-    )
-
-    st.markdown("#### 今日重点")
-    focus = views["待买观察"].copy()
-    near = pd.concat(
-        [views["重点观察"], views["资金不足观察"]],
-        ignore_index=True,
-    ) if not views["重点观察"].empty or not views["资金不足观察"].empty else pd.DataFrame()
-    risk = views["淘汰"].copy()
-
-    table_cols = st.columns(3)
-    with table_cols[0]:
-        st.markdown("##### 今日待买观察")
-        if focus.empty:
-            st.info("暂无。")
-        else:
-            render_columns(
-                focus,
-                ["代码", "名称", "现价", "涨跌幅%", "MA5偏离率%", "一手金额", "流程阶段", "提醒"],
-                260,
-            )
-    with table_cols[1]:
-        st.markdown("##### 今日接近但未达标")
-        if near.empty:
-            st.info("暂无。")
-        else:
-            render_columns(
-                near,
-                ["代码", "名称", "现价", "涨跌幅%", "MA5偏离率%", "一手金额", "流程阶段", "提醒"],
-                260,
-            )
-    with table_cols[2]:
-        st.markdown("##### 今日风险排除")
-        if risk.empty:
-            st.info("暂无。")
-        else:
-            render_columns(
-                risk,
-                ["代码", "名称", "现价", "涨跌幅%", "MA5偏离率%", "流程阶段", "提醒"],
-                260,
-            )
+    with quick_cols[6]:
+        nav_button("写复盘", "复盘报告", key="dash_step_review")
 
     with st.expander("查看强势回踩交易规则", expanded=False):
         render_trading_mode_panel()
 
-    refresh_mode = settings.get("quote_refresh_mode", "60秒")
+    refresh_mode = settings.get("quote_refresh_mode", "手动")
     if refresh_mode != "手动":
         seconds = 30 if refresh_mode == "30秒" else int(settings.get("quote_refresh_seconds", 60))
         schedule_auto_refresh(page == "今日看板" and trading_now, seconds)
@@ -1611,13 +1806,15 @@ elif page == "数据导入":
     missing_count = sum(1 for item in diagnostics.values() if item.get("history_status") == "缺少历史K线")
     failed_count = len(st.session_state.get("history_failed_codes", []))
     insufficient_count = sum(1 for item in diagnostics.values() if item.get("history_status") == "数据不足")
+    stale_count = sum(1 for item in diagnostics.values() if item.get("history_status") == "缓存过旧")
 
-    hist_cols = st.columns(5)
+    hist_cols = st.columns(6)
     hist_cols[0].metric("股票总数", total_stocks)
     hist_cols[1].metric("已有历史K线", with_history)
     hist_cols[2].metric("缺少历史K线", missing_count)
     hist_cols[3].metric("获取失败", failed_count)
     hist_cols[4].metric("数据不足", insufficient_count)
+    hist_cols[5].metric("缓存过旧", stale_count)
 
     diag_rows = []
     fetch_statuses = st.session_state.get("history_fetch_statuses", {})
@@ -1630,26 +1827,27 @@ elif page == "数据导入":
         diag_rows.append({
             "代码": str(code),
             "名称": name_match.iloc[0].get("名称", "") if not name_match.empty else "",
-            "history_status": row.get("history_status", ""),
-            "history_rows": row.get("history_rows", 0),
-            "history_last_date": row.get("history_last_date", ""),
-            "history_error": row.get("history_error", ""),
+            "状态": row.get("history_status", ""),
+            "历史行数": row.get("history_rows", 0),
+            "最后日期": row.get("history_last_date", ""),
+            "失败原因": row.get("history_error", ""),
+            "操作建议": history_action_advice(str(row.get("history_status", ""))),
         })
     diag_frame = pd.DataFrame(diag_rows)
     if not diag_frame.empty:
         render_columns(
             diag_frame,
-            ["代码", "名称", "history_status", "history_rows", "history_last_date", "history_error"],
+            ["代码", "名称", "状态", "历史行数", "最后日期", "失败原因", "操作建议"],
             260,
         )
 
-    hist_actions = st.columns(2)
+    hist_actions = st.columns(3)
     with hist_actions[0]:
         if st.button("只补缺失股票", type="primary", use_container_width=True):
             if settings.get("history_source", "本地缓存 + AKShare") == "仅本地缓存":
                 st.warning("当前历史K线数据源为“仅本地缓存”。如需自动补历史K线，请在系统设置中改为“本地缓存 + AKShare”。")
             else:
-                summary = fetch_history_for_codes(list(codes_list), only_missing=True)
+                summary = fetch_history_for_codes(list(codes_list), only_missing=True, statuses_to_fetch={"缺少历史K线"})
                 _recompute_reminders()
                 st.success(
                     f"补全完成：成功 {summary['fetched']} 只，失败 {summary['failed']} 只，数据不足 {summary['insufficient']} 只。"
@@ -1667,6 +1865,17 @@ elif page == "数据导入":
                 _recompute_reminders()
                 st.success(
                     f"重试完成：成功 {summary['fetched']} 只，失败 {summary['failed']} 只，数据不足 {summary['insufficient']} 只。"
+                )
+                st.rerun()
+    with hist_actions[2]:
+        if st.button("强制重抓当前股票池全部K线", use_container_width=True):
+            if settings.get("history_source", "本地缓存 + AKShare") == "仅本地缓存":
+                st.warning("当前历史K线数据源为“仅本地缓存”。")
+            else:
+                summary = fetch_history_for_codes(list(codes_list), only_missing=False)
+                _recompute_reminders()
+                st.success(
+                    f"强制重抓完成：成功 {summary['fetched']} 只，失败 {summary['failed']} 只，数据不足 {summary['insufficient']} 只。"
                 )
                 st.rerun()
 
@@ -1714,65 +1923,37 @@ elif page == "数据导入":
 # PAGE: 股票分组
 # ══════════════════════════════════════════════════════════════════
 elif page == "股票分组":
-    page_header("股票分组", "确认哪些股票进入待买观察，哪些只是等待。")
+    page_header("股票分组", "按初筛、观察、待买、持仓四个工作分组盯盘。")
 
-    group_count_cols = st.columns(7)
-    for i, stage in enumerate(["初筛通过", "重点观察", "等回踩", "待买观察", "资金不足观察", "缺少历史K线", "淘汰"]):
-        label = "资金不足" if stage == "资金不足观察" else stage
-        group_count_cols[i].metric(label, counts.get(stage, 0))
+    group_tabs = st.tabs([
+        f"初筛（{counts.get('初筛', 0)}）",
+        f"观察（{counts.get('观察', 0)}）",
+        f"待买（{counts.get('待买', 0)}）",
+        f"持仓（{len(portfolio_positions)}）",
+    ])
 
-    st.divider()
-
-    group_specs = [
-        (
-            "待买观察",
-            views["待买观察"],
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%", "一手金额", "流程阶段", "提醒"],
-            True,
-        ),
-        (
-            "重点观察",
-            views["重点观察"],
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%", "一手金额", "流程阶段", "提醒"],
-            True,
-        ),
-        (
-            "等回踩",
-            views["等回踩"],
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%", "一手金额", "流程阶段", "提醒"],
-            True,
-        ),
-        (
-            "资金不足观察",
-            views["资金不足观察"],
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%", "一手金额", "流程阶段", "提醒"],
-            False,
-        ),
-        (
-            "缺少历史K线",
-            views["缺少历史K线"],
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "history_status", "history_rows", "history_last_date", "history_error", "提醒"],
-            False,
-        ),
-        (
-            "初筛通过",
-            views["初筛通过"],
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%", "一手金额", "流程阶段", "提醒"],
-            False,
-        ),
-        (
-            "淘汰",
-            views["淘汰"],
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%", "流程阶段", "筛选原因", "提醒"],
-            False,
-        ),
+    tab_specs = [
+        ("初筛", views["初筛"], STOCK_TABLE_COLUMNS, "stock_group_initial"),
+        ("观察", views["观察"], STOCK_TABLE_COLUMNS, "stock_group_observe"),
+        ("待买", views["待买"], STOCK_TABLE_COLUMNS, "stock_group_buy"),
     ]
-    for group, group_df, columns, expanded in group_specs:
-        if not group_df.empty:
-            with st.expander(f"{group}（{len(group_df)}只）", expanded=expanded):
-                render_columns(group_df, columns, 340)
-        else:
-            st.info(f"暂无{group}股票。")
+    for tab, (label, frame, columns, key) in zip(group_tabs[:3], tab_specs):
+        with tab:
+            if frame.empty:
+                st.info(f"暂无{label}股票。")
+            selected = render_workbench_table(frame, columns, key=key, height=500)
+            render_kline_for_selection(selected)
+
+    with group_tabs[3]:
+        if portfolio_positions.empty:
+            st.info("暂无持仓。持仓由交易记录自动推导。")
+        selected_holding = render_workbench_table(
+            portfolio_positions,
+            HOLDING_TABLE_COLUMNS,
+            key="stock_group_holding",
+            height=500,
+        )
+        render_kline_for_selection(selected_holding)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1784,9 +1965,7 @@ elif page == "盘中观察":
     refresh_cols = st.columns([1, 1, 3])
     with refresh_cols[0]:
         if st.button("刷新行情", type="primary", use_container_width=True):
-            st.session_state.manual_quote_refresh += 1
-            st.session_state.force_quote_refresh = True
-            st.rerun()
+            trigger_global_refresh()
     with refresh_cols[1]:
         nav_button("去待买确认", "待买", key="intraday_go_buy")
     refresh_cols[2].caption(
@@ -1816,16 +1995,17 @@ elif page == "盘中观察":
         metric_cols[3].metric("跌破MA5", int(pd.to_numeric(intraday["MA5偏离率%"], errors="coerce").lt(0).sum()))
         metric_cols[4].metric("资金不足", len(views["资金不足观察"]))
 
-        render_columns(
+        selected_intraday = render_workbench_table(
             intraday,
-            ["盯盘阶段", "代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%",
-             "一手金额", "流程阶段", "提醒"],
-            560,
+            ["盯盘阶段", *STOCK_TABLE_COLUMNS],
+            key="intraday_workbench_table",
+            height=560,
         )
+        render_kline_for_selection(selected_intraday)
     else:
         st.info("暂无观察池或待买观察股票。请先生成/导入股票池并分析。")
 
-    refresh_mode = settings.get("quote_refresh_mode", "60秒")
+    refresh_mode = settings.get("quote_refresh_mode", "手动")
     if refresh_mode != "手动":
         seconds = 30 if refresh_mode == "30秒" else int(settings.get("quote_refresh_seconds", 60))
         schedule_auto_refresh(trading_now, seconds)
@@ -1839,16 +2019,20 @@ elif page == "待买":
 
     buy_candidates = views["待买"]
     if not buy_candidates.empty:
-        render_columns(
+        selected_buy_row = render_workbench_table(
             buy_candidates,
-            ["代码", "名称", "现价", "涨跌幅%", "成交额排名", "MA5偏离率%",
-             "一手金额", "流程阶段", "提醒"],
-            500,
+            STOCK_TABLE_COLUMNS,
+            key="buy_page_workbench_table",
+            height=420,
         )
+        render_kline_for_selection(selected_buy_row)
         st.divider()
         st.markdown("#### 买入操作")
         st.caption("确认后只写入交易流水，持仓和资产由流水自动生成。")
-        buy_code = st.selectbox("选择股票", buy_candidates["代码"].tolist())
+        default_buy_code = str(selected_buy_row.get("代码")) if selected_buy_row is not None else None
+        buy_codes = buy_candidates["代码"].astype(str).tolist()
+        default_index = buy_codes.index(default_buy_code) if default_buy_code in buy_codes else 0
+        buy_code = st.selectbox("选择股票", buy_codes, index=default_index)
         if buy_code:
             selected = buy_candidates[buy_candidates["代码"] == buy_code].iloc[0]
             if str(selected.get("本金是否可买", "")) != "可以买":
@@ -2056,13 +2240,16 @@ elif page == "持仓监控":
         card_html.append("</div>")
         st.markdown("".join(card_html), unsafe_allow_html=True)
 
-        render_table(
-            display_holdings[
-                ["代码", "名称", "买入日期", "买入价", "数量", "当前价", "MA5",
-                 "市值", "盈亏", "盈亏%", "MA5偏离率%", "纪律建议"]
-            ],
-            240,
+        holding_workbench = display_holdings.rename(
+            columns={"买入价": "平均成本", "盈亏": "浮动盈亏", "盈亏%": "浮动盈亏%", "纪律建议": "操作提醒"}
         )
+        selected_holding_monitor = render_workbench_table(
+            holding_workbench,
+            HOLDING_TABLE_COLUMNS,
+            key="holding_monitor_workbench_table",
+            height=300,
+        )
+        render_kline_for_selection(selected_holding_monitor)
 
         st.divider()
         st.markdown("#### 卖出操作")
@@ -2274,256 +2461,125 @@ elif page == "资产看板":
 
 
 # ══════════════════════════════════════════════════════════════════
-# PAGE: 交易复盘
+# PAGE: 复盘报告
 # ══════════════════════════════════════════════════════════════════
-elif page == "交易复盘":
-    page_header("交易复盘", "验证每笔交易是否遵守规则。")
+elif page == "复盘报告":
+    page_header("复盘报告", "复盘交易证据，保存今日、周、月记录。")
 
     trades = st.session_state.trades
     audited_trades = audit_trades_against_rules(trades)
     if not audited_trades.empty:
         audited_trades["日期_dt"] = pd.to_datetime(audited_trades["日期"], errors="coerce")
-        buy_trades = audited_trades[audited_trades["类型"] == "买入"]
-        sell_trades = audited_trades[audited_trades["类型"] == "卖出"]
-        total_buy = pd.to_numeric(buy_trades["金额"], errors="coerce").sum() if not buy_trades.empty else 0
-        total_sell = pd.to_numeric(sell_trades["金额"], errors="coerce").sum() if not sell_trades.empty else 0
-        realized_total = pd.to_numeric(audited_trades["实现盈亏"], errors="coerce").sum()
-        compliant = audited_trades["规则结论"].fillna("").astype(str).str.contains("符合规则|符合", regex=True)
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("总交易次数", len(audited_trades))
-        col2.metric("买入次数", len(buy_trades))
-        col3.metric("卖出次数", len(sell_trades))
-        col4.metric("净投入", f"¥{total_buy - total_sell:,.2f}")
-        col5.metric("规则符合率", f"{(compliant.mean() * 100 if len(audited_trades) else 0):.1f}%")
-
-        st.divider()
-        tabs = st.tabs(["规则审计", "日报", "周报", "月报", "补录交易"])
-
-        with tabs[0]:
-            render_columns(
-                audited_trades,
-                ["日期", "类型", "代码", "名称", "价格", "数量", "金额", "MA5", "MA5偏离率%",
-                 "最近大阳线%", "规则结论", "规则依据", "偏离点", "时间审计", "实现盈亏", "实现盈亏%"],
-                520,
-            )
-
-        with tabs[1]:
-            selected_day = st.date_input("日报日期", date.today(), key="daily_report_date")
-            selected_day_ts = pd.Timestamp(selected_day)
-            render_trade_audit_report(
-                audited_trades,
-                f"{selected_day.isoformat()} 日报",
-                audited_trades["日期_dt"] == selected_day_ts,
-            )
-
-        with tabs[2]:
-            week_values = (
-                audited_trades["日期_dt"]
-                .dropna()
-                .dt.to_period("W")
-                .astype(str)
-                .sort_values()
-                .unique()
-                .tolist()
-            )
-            if week_values:
-                selected_week = st.selectbox("周报周期", week_values[::-1], key="weekly_report_period")
-                render_trade_audit_report(
-                    audited_trades,
-                    f"{selected_week} 周报",
-                    audited_trades["日期_dt"].dt.to_period("W").astype(str) == selected_week,
-                )
-            else:
-                st.info("暂无可生成周报的交易记录。")
-
-        with tabs[3]:
-            month_values = (
-                audited_trades["日期_dt"]
-                .dropna()
-                .dt.to_period("M")
-                .astype(str)
-                .sort_values()
-                .unique()
-                .tolist()
-            )
-            if month_values:
-                selected_month = st.selectbox("月报周期", month_values[::-1], key="monthly_report_period")
-                render_trade_audit_report(
-                    audited_trades,
-                    f"{selected_month} 月报",
-                    audited_trades["日期_dt"].dt.to_period("M").astype(str) == selected_month,
-                )
-            else:
-                st.info("暂无可生成月报的交易记录。")
-
-        with tabs[4]:
-            render_trade_form(trades)
-    else:
-        st.info("暂无交易记录。买入股票时会自动生成记录；当日没有买入卖出时不会生成日报分析。")
-        render_trade_form(trades)
-
-    st.divider()
-    st.markdown("#### 持仓关联复盘")
-    holdings_view = prepare_holdings_view(st.session_state.holdings)
-    if holdings_view.empty:
-        st.info("当前没有持仓。")
-    else:
-        render_columns(
-            holdings_view,
-            ["代码", "名称", "买入日期", "买入价", "数量", "当前价", "MA5", "盈亏", "盈亏%", "纪律建议"],
-            320,
-        )
-
-
-# ══════════════════════════════════════════════════════════════════
-# PAGE: 报告中心
-# ══════════════════════════════════════════════════════════════════
-elif page == "报告中心":
-    page_header("报告中心", "保存日报、周报、月报和手写心得。")
-
-    audited = audit_trades_against_rules(st.session_state.trades)
-    positions_view = build_positions_from_trades(
-        st.session_state.trades,
-        watchlist=st.session_state.watchlist,
-        legacy_holdings=st.session_state.holdings,
-    )
-    account_view = account_state_from_trades(
-        st.session_state.trades,
-        positions_view,
-        float(initial_capital),
-        account_mode,
-    )
-    if not audited.empty:
-        audited["日期_dt"] = pd.to_datetime(audited["日期"], errors="coerce")
-
-    report_tabs = st.tabs(["日报", "周报", "月报"])
+    report_tabs = st.tabs(["今日复盘", "周复盘", "月复盘", "全部交易审计", "复盘笔记"])
 
     with report_tabs[0]:
-        selected_day = st.date_input("日期", date.today(), key="report_center_day")
-        key = selected_day.isoformat()
-        if audited.empty:
-            day_trades = pd.DataFrame()
-        else:
-            day_trades = audited[audited["日期_dt"] == pd.Timestamp(selected_day)].copy()
+        selected_day = st.date_input("复盘日期", date.today(), key="review_daily_date")
+        day_key = selected_day.isoformat()
+        day_trades = (
+            audited_trades[audited_trades["日期_dt"] == pd.Timestamp(selected_day)].copy()
+            if not audited_trades.empty else pd.DataFrame()
+        )
         buy_count = int((day_trades.get("类型", pd.Series(dtype=str)) == "买入").sum()) if not day_trades.empty else 0
         sell_count = int((day_trades.get("类型", pd.Series(dtype=str)) == "卖出").sum()) if not day_trades.empty else 0
-        compliant_count = int(day_trades.get("规则结论", pd.Series(dtype=str)).fillna("").str.contains("符合").sum()) if not day_trades.empty else 0
-        violation_count = len(day_trades) - compliant_count if not day_trades.empty else 0
-        day_realized = pd.to_numeric(
-            day_trades.loc[day_trades.get("类型", pd.Series(dtype=str)) == "卖出", "实现盈亏"],
-            errors="coerce",
-        ).fillna(0).sum() if not day_trades.empty and "实现盈亏" in day_trades else 0
-        metrics = {
-            "今日资产": money_display(float(account_view["当前总资产"])),
-            "今日盈亏": money_display(float(day_realized)),
-            "今日买入": buy_count,
-            "今日卖出": sell_count,
-            "当前持仓": len(positions_view),
-            "规则内交易数": compliant_count,
-            "违规交易数": violation_count,
-        }
-        cols = st.columns(4)
-        cols[0].metric("今日资产", metrics["今日资产"])
-        cols[1].metric("今日盈亏", metrics["今日盈亏"])
-        cols[2].metric("今日买入/卖出", f"{buy_count}/{sell_count}")
-        cols[3].metric("违规交易", violation_count)
+        compliant = day_trades.get("规则结论", pd.Series(dtype=str)).fillna("").astype(str).str.contains("符合规则|符合", regex=True) if not day_trades.empty else pd.Series(dtype=bool)
+        violation_rows = day_trades[day_trades.get("偏离点", pd.Series(dtype=str)).fillna("无") != "无"] if not day_trades.empty else pd.DataFrame()
+        day_sells = day_trades[day_trades.get("类型", pd.Series(dtype=str)) == "卖出"] if not day_trades.empty else pd.DataFrame()
+        day_realized = pd.to_numeric(day_sells.get("实现盈亏", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if not day_sells.empty else 0
+        risk_holding_count = count_risk_positions(portfolio_positions)
+
+        metric_cols = st.columns(6)
+        metric_cols[0].metric("今日买入次数", buy_count)
+        metric_cols[1].metric("今日卖出次数", sell_count)
+        metric_cols[2].metric("今日规则符合率", f"{(compliant.mean() * 100 if len(compliant) else 0):.1f}%")
+        metric_cols[3].metric("今日违规点", len(violation_rows))
+        metric_cols[4].metric("今日已实现盈亏", money_display(float(day_realized)))
+        metric_cols[5].metric("今日持仓风险", risk_holding_count)
+
         if day_trades.empty:
-            st.info("当日没有买入卖出记录，不生成交易分析；可以记录今日观察和执行心得。")
+            st.info("当日没有买入卖出记录，可以只保存观察心得和明日计划。")
         else:
-            render_columns(day_trades, ["日期", "类型", "代码", "名称", "价格", "数量", "规则结论", "偏离点"], 320)
-        saved = load_report_note("daily", key)
-        today_note = st.text_area("今日心得", value=saved if saved and not saved.startswith("# ") else "", height=120, key="daily_note")
-        tomorrow_plan = st.text_area("明日计划", height=100, key="daily_plan")
-        if st.button("保存日报", type="primary"):
+            render_columns(
+                day_trades,
+                ["日期", "时间", "类型", "代码", "名称", "价格", "数量", "规则结论", "偏离点", "实现盈亏"],
+                320,
+            )
+            if not violation_rows.empty:
+                st.caption("今日违规点")
+                for text, count in violation_rows["偏离点"].value_counts().head(5).items():
+                    st.write(f"- {text}：{count}次")
+
+        saved_daily = load_report_note("daily", day_key)
+        default_daily = "" if saved_daily.startswith("# ") else saved_daily
+        today_note = st.text_area("今日心得", value=default_daily, height=110, key="review_today_note")
+        tomorrow_plan = st.text_area("明日计划", height=90, key="review_tomorrow_plan")
+        if st.button("保存今日复盘", type="primary", key="save_review_daily"):
+            metrics = {
+                "今日买入次数": buy_count,
+                "今日卖出次数": sell_count,
+                "今日规则符合率": f"{(compliant.mean() * 100 if len(compliant) else 0):.1f}%",
+                "今日违规点": len(violation_rows),
+                "今日已实现盈亏": money_display(float(day_realized)),
+                "今日持仓风险": risk_holding_count,
+            }
             note = f"## 今日心得\n\n{today_note.strip()}\n\n## 明日计划\n\n{tomorrow_plan.strip()}"
-            save_report_note("daily", key, report_markdown(f"{key} 日报", metrics, note))
-            st.success("日报已保存")
+            save_report_note("daily", day_key, report_markdown(f"{day_key} 日报", metrics, note))
+            st.success("今日复盘已保存")
 
     with report_tabs[1]:
-        if audited.empty:
-            st.info("暂无可生成周报的交易记录。")
-            week_key = pd.Timestamp(date.today()).to_period("W").strftime("%Y-%m-%d")
-            week_note = st.text_area("本周心得 / 下周计划", value=load_report_note("weekly", week_key), height=180)
-            if st.button("保存周报", type="primary"):
-                save_report_note("weekly", week_key, report_markdown(f"{week_key} 周报", {"交易次数": 0}, week_note))
-                st.success("周报已保存")
+        if audited_trades.empty:
+            st.info("暂无可生成周复盘的交易记录。")
         else:
-            weeks = audited["日期_dt"].dropna().dt.to_period("W").astype(str).sort_values().unique().tolist()
-            selected_week = st.selectbox("周期", weeks[::-1], key="report_center_week")
-            week_mask = audited["日期_dt"].dt.to_period("W").astype(str) == selected_week
-            week_trades = audited[week_mask].copy()
-            compliant = week_trades["规则结论"].fillna("").str.contains("符合")
-            sells = week_trades[week_trades["类型"] == "卖出"]
-            realized = pd.to_numeric(sells.get("实现盈亏", pd.Series(dtype=float)), errors="coerce").dropna()
-            win_rate = (realized.gt(0).mean() * 100) if len(realized) else 0
-            profits = realized[realized > 0]
-            losses = realized[realized < 0]
-            week_return = realized.sum() / float(initial_capital) * 100 if initial_capital else 0
-            metrics = {
-                "周收益率": f"{week_return:.2f}%",
-                "交易次数": len(week_trades),
-                "胜率": f"{win_rate:.1f}%",
-                "平均盈利": money_display(float(profits.mean()) if len(profits) else 0),
-                "平均亏损": money_display(float(losses.mean()) if len(losses) else 0),
-                "最大亏损": money_display(float(losses.min()) if len(losses) else 0),
-                "规则执行率": f"{(compliant.mean() * 100 if len(week_trades) else 0):.1f}%",
-            }
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("周收益率", metrics["周收益率"])
-            metric_cols[1].metric("交易次数", metrics["交易次数"])
-            metric_cols[2].metric("胜率", metrics["胜率"])
-            metric_cols[3].metric("规则执行率", metrics["规则执行率"])
-            render_columns(week_trades, ["日期", "类型", "代码", "名称", "价格", "数量", "规则结论", "偏离点", "实现盈亏"], 360)
-            saved = load_report_note("weekly", selected_week)
-            week_errors = st.text_area("本周错误", value=saved if saved and not saved.startswith("# ") else "", height=100, key="weekly_errors")
-            next_improve = st.text_area("下周改进", height=100, key="weekly_next")
-            if st.button("保存周报", type="primary"):
-                note = f"## 本周错误\n\n{week_errors.strip()}\n\n## 下周改进\n\n{next_improve.strip()}"
-                save_report_note("weekly", selected_week, report_markdown(f"{selected_week} 周报", metrics, note))
-                st.success("周报已保存")
+            week_values = audited_trades["日期_dt"].dropna().dt.to_period("W").astype(str).sort_values().unique().tolist()
+            selected_week = st.selectbox("周复盘周期", week_values[::-1], key="review_week_period")
+            week_mask = audited_trades["日期_dt"].dt.to_period("W").astype(str) == selected_week
+            render_trade_audit_report(audited_trades, f"{selected_week} 周复盘", week_mask)
 
     with report_tabs[2]:
-        if audited.empty:
-            st.info("暂无可生成月报的交易记录。")
+        if audited_trades.empty:
+            st.info("暂无可生成月复盘的交易记录。")
         else:
-            months = audited["日期_dt"].dropna().dt.to_period("M").astype(str).sort_values().unique().tolist()
-            selected_month = st.selectbox("月份", months[::-1], key="report_center_month")
-            month_mask = audited["日期_dt"].dt.to_period("M").astype(str) == selected_month
-            month_trades = audited[month_mask].copy()
-            compliant = month_trades["规则结论"].fillna("").str.contains("符合")
-            sells = month_trades[month_trades["类型"] == "卖出"]
-            realized = pd.to_numeric(sells.get("实现盈亏", pd.Series(dtype=float)), errors="coerce").dropna()
-            win_rate = realized.gt(0).mean() * 100 if len(realized) else 0
-            best = realized.max() if len(realized) else 0
-            worst = realized.min() if len(realized) else 0
-            month_return = realized.sum() / float(initial_capital) * 100 if initial_capital else 0
-            month_curve = asset_curve_from_trades(month_trades, float(initial_capital))
-            month_dd = max_drawdown(month_curve["现金"]) if not month_curve.empty and "现金" in month_curve else 0
-            metrics = {
-                "月收益率": f"{month_return:.2f}%",
-                "最大回撤": f"{month_dd:.2f}%",
-                "交易次数": len(month_trades),
-                "胜率": f"{win_rate:.1f}%",
-                "规则执行率": f"{(compliant.mean() * 100 if len(month_trades) else 0):.1f}%",
-                "最赚钱交易": money_display(float(best)),
-                "最亏钱交易": money_display(float(worst)),
-            }
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("月收益率", metrics["月收益率"])
-            metric_cols[1].metric("最大回撤", metrics["最大回撤"])
-            metric_cols[2].metric("交易次数", metrics["交易次数"])
-            metric_cols[3].metric("胜率", metrics["胜率"])
-            render_columns(month_trades, ["日期", "类型", "代码", "名称", "价格", "数量", "规则结论", "偏离点", "实现盈亏"], 360)
-            saved = load_report_note("monthly", selected_month)
-            month_note = st.text_area("本月心得", value=saved if saved and not saved.startswith("# ") else "", height=100, key="monthly_note")
-            next_month_plan = st.text_area("下月计划", height=100, key="monthly_plan")
-            if st.button("保存月报", type="primary"):
-                note = f"## 本月心得\n\n{month_note.strip()}\n\n## 下月计划\n\n{next_month_plan.strip()}"
-                save_report_note("monthly", selected_month, report_markdown(f"{selected_month} 月报", metrics, note))
-                st.success("月报已保存")
+            month_values = audited_trades["日期_dt"].dropna().dt.to_period("M").astype(str).sort_values().unique().tolist()
+            selected_month = st.selectbox("月复盘月份", month_values[::-1], key="review_month_period")
+            month_mask = audited_trades["日期_dt"].dt.to_period("M").astype(str) == selected_month
+            render_trade_audit_report(audited_trades, f"{selected_month} 月复盘", month_mask)
+
+    with report_tabs[3]:
+        if audited_trades.empty:
+            st.info("暂无交易记录。")
+        else:
+            render_columns(
+                audited_trades,
+                ["日期", "时间", "类型", "代码", "名称", "价格", "数量", "金额", "MA5", "MA5偏离率%",
+                 "最近大阳线%", "规则结论", "规则依据", "偏离点", "时间审计", "实现盈亏", "实现盈亏%"],
+                540,
+            )
+        nav_button("去记录交易", "交易记录", key="review_go_trade", use_container_width=False)
+
+    with report_tabs[4]:
+        note_cols = st.columns(3)
+        with note_cols[0]:
+            note_day = st.date_input("日报日期", date.today(), key="note_daily_date").isoformat()
+            daily_text = st.text_area("日报笔记", value=load_report_note("daily", note_day), height=240, key="note_daily_text")
+            if st.button("保存日报笔记", type="primary", key="save_daily_note"):
+                save_report_note("daily", note_day, daily_text)
+                st.success("日报笔记已保存")
+        with note_cols[1]:
+            current_week = str(pd.Timestamp(date.today()).to_period("W"))
+            week_key = st.text_input("周报周期", value=current_week, key="note_week_key")
+            weekly_text = st.text_area("周报笔记", value=load_report_note("weekly", week_key), height=240, key="note_weekly_text")
+            if st.button("保存周报笔记", type="primary", key="save_weekly_note"):
+                save_report_note("weekly", week_key, weekly_text)
+                st.success("周报笔记已保存")
+        with note_cols[2]:
+            month_key = st.text_input("月报月份", value=pd.Timestamp(date.today()).to_period("M").strftime("%Y-%m"), key="note_month_key")
+            monthly_text = st.text_area("月报笔记", value=load_report_note("monthly", month_key), height=240, key="note_monthly_text")
+            if st.button("保存月报笔记", type="primary", key="save_monthly_note"):
+                save_report_note("monthly", month_key, monthly_text)
+                st.success("月报笔记已保存")
 
 
+# ══════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════
 # PAGE: 系统设置
 # ══════════════════════════════════════════════════════════════════
@@ -2607,12 +2663,12 @@ elif page == "系统设置":
                 "刷新频率",
                 ["手动", "30秒", "60秒"],
                 index=["手动", "30秒", "60秒"].index(
-                    settings.get("quote_refresh_mode", "60秒")
-                    if settings.get("quote_refresh_mode", "60秒") in ["手动", "30秒", "60秒"]
-                    else "60秒"
+                    settings.get("quote_refresh_mode", "手动")
+                    if settings.get("quote_refresh_mode", "手动") in ["手动", "30秒", "60秒"]
+                    else "手动"
                 ),
             )
-            st.caption("自动切换顺序：东方财富 → AKShare → 新浪行情。开源/网页行情源稳定性不如商业行情终端，如行情异常，请以同花顺/券商软件为准。")
+            st.caption("自动切换顺序：东方财富 → AKShare → 新浪行情。当前以手动轻刷新为主，页面切换不自动联网。")
 
         st.divider()
         st.markdown("#### 数据管理")
