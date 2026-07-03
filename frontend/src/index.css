@@ -1,5 +1,20 @@
 @import "tailwindcss";
 
+@theme {
+  --color-slate-50: #f7f7f7;
+  --color-slate-100: #e8e8e8;
+  --color-slate-200: #d4d4d4;
+  --color-slate-300: #b8b8b8;
+  --color-slate-400: #9a9a9a;
+  --color-slate-500: #737373;
+  --color-slate-600: #5c5c5c;
+  --color-slate-700: #404040;
+  --color-slate-800: #2b2b2b;
+  --color-slate-850: #242424;
+  --color-slate-900: #191919;
+  --color-slate-950: #111111;
+}
+
 html,
 body,
 #root {
@@ -7,5 +22,11 @@ body,
 }
 
 body {
+  background: #111111;
+  color: #d4d4d4;
   overflow: hidden;
+}
+
+* {
+  scrollbar-color: #404040 #111111;
 }

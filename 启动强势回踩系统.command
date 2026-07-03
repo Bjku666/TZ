@@ -23,7 +23,7 @@ if [[ ! -x ".venv/bin/python" ]]; then
   /usr/bin/python3 -m venv .venv
 fi
 
-if ! .venv/bin/python -c "import fastapi, uvicorn, pandas, plotly, openpyxl" >/dev/null 2>&1; then
+if ! .venv/bin/python -c "import fastapi, uvicorn, pandas, openpyxl" >/dev/null 2>&1; then
   echo "正在安装或更新 Python 依赖..."
   .venv/bin/python -m pip install -r requirements.txt
 fi
@@ -134,10 +134,6 @@ echo "前端地址：$FRONTEND_URL"
 echo "后端健康检查：$BACKEND_URL/api/health"
 echo "后端日志：$PROJECT_DIR/.tmp/backend.log"
 echo "前端日志：$PROJECT_DIR/.tmp/frontend.log"
-echo ""
-echo "旧 Streamlit 入口仍保留在 app.py；如需旧版，可手动运行："
-echo ".venv/bin/streamlit run app.py --server.port 8501"
-
 /usr/bin/open "$FRONTEND_URL"
 
 echo ""

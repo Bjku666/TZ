@@ -40,9 +40,9 @@ export default function KLineChart({ code, name }: KLineChartProps) {
 
   if (loading) {
     return (
-      <div className="flex h-72 items-center justify-center bg-white border border-slate-200 rounded-lg shadow-sm">
-        <div className="text-center text-slate-500">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-2"></div>
+      <div className="flex h-72 items-center justify-center bg-slate-900 border border-slate-800 rounded-lg shadow-sm">
+        <div className="text-center text-slate-400">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-500 mx-auto mb-2"></div>
           <p className="text-xs">加载 K 线数据中...</p>
         </div>
       </div>
@@ -51,10 +51,10 @@ export default function KLineChart({ code, name }: KLineChartProps) {
 
   if (error || klines.length === 0) {
     return (
-      <div className="flex flex-col h-72 items-center justify-center bg-white border border-slate-200 rounded-lg p-4 text-center text-slate-500 shadow-sm">
+      <div className="flex flex-col h-72 items-center justify-center bg-slate-900 border border-slate-800 rounded-lg p-4 text-center text-slate-400 shadow-sm">
         <AlertTriangle className="h-8 w-8 text-amber-500 mb-2" />
-        <p className="text-sm font-medium text-slate-800">{error || "缺少历史K线数据"}</p>
-        <p className="text-xs text-slate-400 mt-1">代码: {code} | 名称: {name}</p>
+        <p className="text-sm font-medium text-slate-200">{error || "缺少历史K线数据"}</p>
+        <p className="text-xs text-slate-500 mt-1">代码: {code} | 名称: {name}</p>
         <button
           onClick={() => {
             setLoading(true);
@@ -143,12 +143,12 @@ export default function KLineChart({ code, name }: KLineChartProps) {
     {
       label: "价格",
       value: activePoint.close.toFixed(2),
-      valueClassName: activePoint.close >= activePoint.open ? "text-rose-600" : "text-emerald-600"
+      valueClassName: activePoint.close >= activePoint.open ? "text-rose-400" : "text-emerald-400"
     },
     {
       label: "涨跌幅",
       value: `${activeChangePct >= 0 ? "+" : ""}${activeChangePct.toFixed(2)}%`,
-      valueClassName: activeChangePct >= 0 ? "text-rose-600" : "text-emerald-600"
+      valueClassName: activeChangePct >= 0 ? "text-rose-400" : "text-emerald-400"
     },
     { label: "开", value: activePoint.open.toFixed(2) },
     { label: "高", value: activePoint.high.toFixed(2) },
@@ -159,28 +159,28 @@ export default function KLineChart({ code, name }: KLineChartProps) {
     }
   ] : [];
   const maMetrics = [
-    { label: "MA5", value: formatLineValue(activePoint?.ma5), className: "text-amber-600", swatchClassName: "bg-amber-500" },
-    { label: "MA10", value: formatLineValue(activePoint?.ma10), className: "text-cyan-600", swatchClassName: "bg-cyan-400" },
-    { label: "MA20", value: formatLineValue(activePoint?.ma20), className: "text-pink-600", swatchClassName: "bg-pink-500" }
+    { label: "MA5", value: formatLineValue(activePoint?.ma5), className: "text-amber-400", swatchClassName: "bg-amber-500" },
+    { label: "MA10", value: formatLineValue(activePoint?.ma10), className: "text-cyan-300", swatchClassName: "bg-cyan-400" },
+    { label: "MA20", value: formatLineValue(activePoint?.ma20), className: "text-pink-400", swatchClassName: "bg-pink-500" }
   ];
 
   return (
-    <div className="bg-white border border-slate-200 rounded-lg p-4 font-sans select-none text-slate-800 shadow-sm">
+    <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 font-sans select-none text-slate-200 shadow-sm">
       {/* 头部信息 */}
-      <div className="border-b border-slate-100 pb-3 mb-3 space-y-2 overflow-hidden">
+      <div className="border-b border-slate-800 pb-3 mb-3 space-y-2 overflow-hidden">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="shrink-0 whitespace-nowrap text-base font-bold text-slate-900">{name}</span>
-          <span className="shrink-0 whitespace-nowrap rounded bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-600">{code}</span>
+          <span className="shrink-0 whitespace-nowrap text-base font-bold text-slate-100">{name}</span>
+          <span className="shrink-0 whitespace-nowrap rounded border border-slate-800 bg-slate-950/70 px-2 py-0.5 font-mono text-xs text-slate-400">{code}</span>
         </div>
         {activePoint && (
           <dl
-            className="grid min-w-0 gap-x-3 gap-y-1.5 font-mono text-xs text-slate-600"
+            className="grid min-w-0 gap-x-3 gap-y-1.5 font-mono text-xs text-slate-400"
             style={{ gridTemplateColumns: "repeat(auto-fit, minmax(7.5rem, 1fr))" }}
           >
             {quoteMetrics.map(metric => (
               <div key={metric.label} className="flex min-w-0 items-baseline gap-1">
                 <dt className="shrink-0 text-slate-500">{metric.label}:</dt>
-                <dd className={`min-w-0 truncate font-semibold ${metric.valueClassName || "text-slate-700"}`}>
+                <dd className={`min-w-0 truncate font-semibold ${metric.valueClassName || "text-slate-300"}`}>
                   {metric.value}
                 </dd>
               </div>
@@ -217,9 +217,9 @@ export default function KLineChart({ code, name }: KLineChartProps) {
         {/* K线主图 */}
         <svg viewBox={`0 0 ${svgWidth} ${klineSvgHeight}`} className="w-full h-auto">
           {/* 背景网格线 */}
-          <line x1={padding.left} y1={getY(minPrice)} x2={svgWidth - padding.right} y2={getY(minPrice)} stroke="#f1f5f9" strokeDasharray="2,2" />
-          <line x1={padding.left} y1={getY((maxPrice + minPrice) / 2)} x2={svgWidth - padding.right} y2={getY((maxPrice + minPrice) / 2)} stroke="#f1f5f9" strokeDasharray="2,2" />
-          <line x1={padding.left} y1={getY(maxPrice)} x2={svgWidth - padding.right} y2={getY(maxPrice)} stroke="#f1f5f9" strokeDasharray="2,2" />
+          <line x1={padding.left} y1={getY(minPrice)} x2={svgWidth - padding.right} y2={getY(minPrice)} stroke="#2b2b2b" strokeDasharray="2,2" />
+          <line x1={padding.left} y1={getY((maxPrice + minPrice) / 2)} x2={svgWidth - padding.right} y2={getY((maxPrice + minPrice) / 2)} stroke="#2b2b2b" strokeDasharray="2,2" />
+          <line x1={padding.left} y1={getY(maxPrice)} x2={svgWidth - padding.right} y2={getY(maxPrice)} stroke="#2b2b2b" strokeDasharray="2,2" />
 
           {/* 价格 Y 轴刻度 */}
           <text x={padding.left - 8} y={getY(maxPrice) + 4} textAnchor="end" className="text-[10px] font-mono fill-slate-400">{maxPrice.toFixed(2)}</text>
@@ -274,7 +274,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
         </svg>
 
         {/* 交易量主图 */}
-        <div className="border-t border-slate-100 my-1"></div>
+        <div className="border-t border-slate-800 my-1"></div>
         <svg viewBox={`0 0 ${svgWidth} ${volSvgHeight}`} className="w-full h-auto">
           {/* 量柱子 */}
           {klines.map((k, i) => {
@@ -331,7 +331,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
       </div>
 
       <div className="mt-2 text-center text-[10px] text-slate-500 flex justify-center items-center space-x-1 font-mono">
-        <TrendingUp className="h-3 w-3 text-rose-600" />
+        <TrendingUp className="h-3 w-3 text-rose-400" />
         <span>支持鼠标悬停移动查看每根日K线细节与偏离指标。5日均线回踩区间在0%~2%最优。</span>
       </div>
     </div>

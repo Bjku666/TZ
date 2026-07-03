@@ -240,7 +240,7 @@ API: http://127.0.0.1:8000/api/health
 Web: http://127.0.0.1:5173
 ```
 
-### 旧 Streamlit 版本
+### 一键启动
 
 在 Finder 中打开 `/Users/lulu/Desktop/touzi`，双击：
 
@@ -252,7 +252,7 @@ Web: http://127.0.0.1:5173
 
 ```bash
 cd /Users/lulu/Desktop/touzi
-.venv/bin/streamlit run app.py --server.port 8502 --server.headless true
+./启动强势回踩系统.command
 ```
 
 ## 免责声明

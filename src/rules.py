@@ -252,7 +252,7 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
 def evaluate_stock(row: dict[str, Any]) -> dict[str, Any]:
     """Evaluate one stock row without side effects.
 
-    Rules stay pure here: no file IO, no network, no Streamlit state.
+    Rules stay pure here: no file IO, no network, no UI state.
     """
     stage, reason, reminder = stock_stage_result(row)
     group = stage_to_group(stage)

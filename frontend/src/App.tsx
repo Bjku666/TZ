@@ -320,6 +320,12 @@ function signedPercent(value: number): string {
   return `${safeValue >= 0 ? "+" : ""}${safeValue.toFixed(2)}%`;
 }
 
+function formatPercent(value?: number | null, withSign = false): string {
+  const safeValue = Number(value);
+  if (!Number.isFinite(safeValue)) return "-";
+  return `${withSign && safeValue >= 0 ? "+" : ""}${safeValue.toFixed(2)}%`;
+}
+
 function signedCurrency(value: number, suffix = ""): string {
   const safeValue = Number.isFinite(value) ? value : 0;
   return `${safeValue >= 0 ? "+" : ""}${safeValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${suffix}`;
@@ -1873,6 +1879,8 @@ export default function App() {
   );
 
   const buyReadyStocks = stocksForGroup(watchlist, "待买");
+  const buyReadyPreviewStocks = buyReadyStocks.slice(0, 4);
+  const buyReadyMoreCount = Math.max(0, buyReadyStocks.length - buyReadyPreviewStocks.length);
   const todayTotalPnLForAccount = accountState.todayPnL ?? 0;
 
   // 股票搜索过滤。初筛是成交额前30基础池；观察/待买是从基础池派生出的规则视图。
@@ -1901,6 +1909,8 @@ export default function App() {
   const poolGeneratedLabel = poolMeta?.poolGeneratedAt
     ? formatDateTimeLabel(poolMeta.poolGeneratedAt)
     : (poolMeta?.poolBatchId || "-");
+  const missingKLineCount = watchlist.filter(stock => stock.historyStatus !== "已有缓存").length;
+  const latestQuoteLabel = lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : latestWatchlistUpdateLabel;
   const changeTotal = turnoverChanges
     ? turnoverChanges.newEntries.length + turnoverChanges.dropped.length + turnoverChanges.rankUp.length + turnoverChanges.rankDown.length
     : 0;
@@ -2152,6 +2162,157 @@ export default function App() {
         {items.length > 3 && (
           <div className="text-[10px] text-slate-600">另有 {items.length - 3} 只，可在下方完整明细处理</div>
         )}
+      </div>
+    );
+  };
+
+  const renderBuyReadyCard = (stock: Stock, dense = false) => (
+    <div
+      key={stock.code}
+      className={`group rounded-lg border border-cyan-500/25 bg-slate-950/70 transition hover:border-cyan-400/60 hover:bg-cyan-950/10 ${
+        dense ? "p-3" : "p-4"
+      }`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="truncate text-sm font-black text-slate-100">{stock.name}</span>
+            <span className="font-mono text-[11px] font-semibold text-slate-400">{stock.code}</span>
+            <span className="rounded bg-cyan-950/70 px-1.5 py-0.5 text-[10px] font-black text-cyan-300">
+              #{stock.poolRankAtGeneration || stock.rank || "-"}
+            </span>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2 font-mono text-[11px]">
+            <span className="text-slate-300">现价 <b className="text-sm text-slate-100">{formatPrice(stock.price)}</b></span>
+            <span className="text-cyan-300">MA5 <b className="text-sm">{formatPrice(stock.ma5)}</b></span>
+            <span className="rounded border border-cyan-500/30 bg-cyan-950/30 px-2 py-0.5 font-black text-cyan-200">
+              偏离 {formatPercent(stock.deviation5)}
+            </span>
+            <span className={stock.pct >= 0 ? "font-bold text-rose-400" : "font-bold text-emerald-400"}>
+              {formatPercent(stock.pct, true)}
+            </span>
+          </div>
+        </div>
+        <button
+          onClick={() => openBuyModal(stock)}
+          className="shrink-0 rounded bg-rose-600 px-3 py-1.5 text-xs font-black text-white shadow-sm transition hover:bg-rose-500"
+        >
+          盘中确认
+        </button>
+      </div>
+      <CardText className="mt-2 line-clamp-1 text-[11px] font-semibold text-slate-300">
+        {stock.reason || stock.reminder || "MA5偏离率0%~2%，等待盘中确认"}
+      </CardText>
+    </div>
+  );
+
+  const renderBuyReadyPreview = () => (
+    <div className="rounded-xl border border-slate-800 bg-slate-900 p-4 shadow-sm">
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-2">
+          <CheckCircle2 className="h-4 w-4 text-cyan-400" />
+          <h3 className="text-sm font-black text-slate-100">待买观察简表</h3>
+          <span className="rounded bg-cyan-950 px-2 py-0.5 text-xs font-black text-cyan-300">{buyReadyStocks.length} 只</span>
+        </div>
+        <button
+          type="button"
+          onClick={handleQuickBuyEntry}
+          className="inline-flex items-center justify-center gap-1.5 rounded border border-cyan-600/40 bg-cyan-950/40 px-3 py-1.5 text-xs font-bold text-cyan-200 transition hover:bg-cyan-900/50"
+        >
+          <Eye className="h-3.5 w-3.5" />
+          <span>查看待买</span>
+        </button>
+      </div>
+      {buyReadyStocks.length === 0 ? (
+        <CardText as="div" className="rounded-lg border border-dashed border-slate-800 bg-slate-950/50 p-4 text-center text-xs font-semibold text-slate-500">
+          暂无待买观察。刷新行情后，这里只显示进入 MA5 0%~2% 低吸区的股票
+        </CardText>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          {buyReadyPreviewStocks.map(stock => renderBuyReadyCard(stock, true))}
+          {buyReadyMoreCount > 0 && (
+            <button
+              type="button"
+              onClick={handleQuickBuyEntry}
+              className="rounded-lg border border-dashed border-cyan-700/40 bg-cyan-950/10 p-3 text-left text-xs font-bold text-cyan-300 transition hover:bg-cyan-950/25"
+            >
+              还有 {buyReadyMoreCount} 只待买观察，点击进入完整列表
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderPositionDashboardCard = (position: Position, index: number) => {
+    const plan = buildPositionSellPlan(position);
+    const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
+    const canSellToday = Math.max(0, Math.floor(Number(position.availableQuantity) || 0)) > 0;
+    const pnlClass = position.floatingPnL >= 0 ? "text-rose-400" : "text-emerald-400";
+    const actionClass = plan.tone === "danger"
+      ? "border-rose-700/60 bg-rose-950/20"
+      : plan.tone === "warning"
+        ? "border-amber-700/60 bg-amber-950/20"
+        : "border-emerald-800/50 bg-emerald-950/10";
+
+    return (
+      <div key={position.code} className={`rounded-lg border p-3 ${plan.cardClass}`}>
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(180px,1fr)_1.7fr_auto] lg:items-center">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-[10px] font-black text-slate-300">
+                {index + 1}
+              </span>
+              <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${plan.dotClass}`}></span>
+              <div className="min-w-0">
+                <div className="truncate text-sm font-black text-slate-100">{position.name}</div>
+                <div className="font-mono text-[11px] font-semibold text-slate-400">{position.code} · {holdingTimeLabel(position)}</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
+              <span className="block text-[10px] font-bold text-slate-500">现价</span>
+              <span className="font-mono text-sm font-black text-slate-100">{formatPrice(position.currentPrice)}</span>
+            </div>
+            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
+              <span className="block text-[10px] font-bold text-slate-500">MA5/偏离</span>
+              <span className={`font-mono text-sm font-black ${position.deviation5 < 0 ? "text-emerald-400" : "text-cyan-300"}`}>
+                {hasMa5 ? `${formatPrice(position.ma5)} / ${formatPercent(position.deviation5)}` : "待补K线"}
+              </span>
+            </div>
+            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
+              <span className="block text-[10px] font-bold text-slate-500">浮盈亏</span>
+              <span className={`font-mono text-sm font-black ${pnlClass}`}>
+                {signedCurrency(position.floatingPnL)} ({formatPercent(position.floatingPnLPct, true)})
+              </span>
+            </div>
+            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
+              <span className="block text-[10px] font-bold text-slate-500">可卖/跌破</span>
+              <span className="font-mono text-sm font-black text-slate-100">
+                {position.availableQuantity}股 / {Math.max(0, Math.floor(Number(position.belowMa5Days) || 0))}天
+              </span>
+            </div>
+          </div>
+
+          <div className={`rounded border px-3 py-2 ${actionClass}`}>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <span className={`rounded px-2 py-0.5 text-[10px] font-black ${plan.badgeClass}`}>{plan.statusLabel}</span>
+            </div>
+            <div className="text-sm font-black text-slate-100">{plan.title}</div>
+            <CardText className="mt-1 line-clamp-2 max-w-xl text-[11px] font-semibold leading-normal text-slate-300">{plan.primaryAction}</CardText>
+            <button
+              onClick={() => openSellModal(position)}
+              disabled={!canSellToday}
+              className={`mt-2 w-full rounded px-3 py-1.5 text-xs font-black text-white transition ${
+                canSellToday ? "bg-emerald-600 hover:bg-emerald-500" : "bg-slate-800 text-slate-500 cursor-not-allowed"
+              }`}
+            >
+              {plan.buttonLabel}
+            </button>
+          </div>
+        </div>
       </div>
     );
   };
@@ -2511,14 +2672,17 @@ export default function App() {
     <div className="h-screen overflow-hidden bg-slate-950 text-slate-200 flex flex-col font-sans selection:bg-blue-500/20 selection:text-blue-200">
       
       {/* 顶部系统状态 Bar */}
-      <header className="shrink-0 bg-slate-900 border-b border-slate-800 py-3 px-4 grid grid-cols-1 lg:grid-cols-[minmax(220px,1fr)_auto_minmax(140px,1fr)] items-center sticky top-0 z-40 shadow-sm text-white gap-3">
-        <div className="flex items-center space-x-3 min-w-0">
-          <div className="bg-gradient-to-tr from-blue-600 to-indigo-500 p-1.5 rounded-lg shadow-inner">
-            <ShieldAlert className="h-5 w-5 text-white" />
+      <header className="shrink-0 bg-slate-900 border-b border-slate-800 py-3 px-4 grid grid-cols-1 lg:grid-cols-[minmax(260px,1fr)_auto_minmax(140px,1fr)] items-center sticky top-0 z-40 shadow-sm text-white gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[10px] border border-white/10 bg-gradient-to-br from-orange-500 via-red-500 to-rose-600 shadow-lg shadow-red-950/35">
+            <TrendingUp className="h-[22px] w-[22px] text-white" strokeWidth={3} />
           </div>
-          <div>
-            <h1 className="text-sm font-bold tracking-tight text-white">强势回踩短线交易纪律系统</h1>
-            <CardText className="text-[10px] text-slate-400">主板前排股票 5日线低吸回踩纪律工作台</CardText>
+          <div className="min-w-0">
+            <h1 className="truncate text-[16px] font-black leading-tight tracking-normal text-white">强势回踩短线交易纪律系统</h1>
+            <div className="mt-1 flex min-w-0 items-center gap-1.5">
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-orange-400 shadow-[0_0_0_3px_rgba(251,146,60,0.14)]"></span>
+              <CardText className="truncate text-[10px] font-semibold leading-none text-slate-400">主板前排股票 5日线低吸回踩纪律工作台</CardText>
+            </div>
           </div>
         </div>
 
@@ -2787,47 +2951,59 @@ export default function App() {
               {/* 大统计面板 */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm">
-                  <span className="text-[10px] text-slate-400 font-bold uppercase block tracking-wider">主板初筛</span>
+                  <span className="text-xs text-slate-300 font-black uppercase block tracking-wider">主板初筛</span>
                   <div className="flex items-baseline space-x-2 mt-1">
-                    <span className="text-2xl font-bold text-slate-100">{stocksForGroup(watchlist, "初筛").length}</span>
-                    <span className="text-[10px] text-slate-400 font-medium">基础候选</span>
+                    <span className="text-3xl font-black text-slate-100">{initialPoolCount}</span>
+                    <span className="text-xs text-slate-300 font-bold">基础候选</span>
                   </div>
-                  <CardText className="text-[10px] text-slate-500 mt-2">成交额前30，已排除ST/创业/科创/北交等</CardText>
+                  <CardText className="text-[11px] text-slate-400 mt-2 font-semibold">成交额前30，已排除ST/创业/科创/北交等</CardText>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm">
-                  <span className="text-[10px] text-slate-400 font-bold uppercase block tracking-wider">观察</span>
+                  <span className="text-xs text-slate-300 font-black uppercase block tracking-wider">观察</span>
                   <div className="flex items-baseline space-x-2 mt-1">
-                    <span className="text-2xl font-bold text-slate-100">{stocksForGroup(watchlist, "观察").length}</span>
-                    <span className="text-[10px] text-slate-400 font-medium">等待回踩</span>
+                    <span className="text-3xl font-black text-slate-100">{observationCount}</span>
+                    <span className="text-xs text-slate-300 font-bold">等待回踩</span>
                   </div>
-                  <CardText className="text-[10px] text-slate-500 mt-2">含待买观察、继续观察、偏高不追、远离不追</CardText>
+                  <CardText className="text-[11px] text-slate-400 mt-2 font-semibold">含待买观察、继续观察、偏高不追、远离不追</CardText>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm border-l-cyan-500 border-l-4">
-                  <span className="text-[10px] text-cyan-400 font-bold uppercase block tracking-wider">待买观察</span>
+                  <span className="text-xs text-cyan-300 font-black uppercase block tracking-wider">待买观察</span>
                   <div className="flex items-baseline space-x-2 mt-1">
-                    <span className="text-2xl font-bold text-cyan-400">{buyReadyStocks.length}</span>
-                    <span className="text-[10px] text-cyan-500 font-medium">重点盯</span>
+                    <span className="text-3xl font-black text-cyan-300">{pendingBuyCount}</span>
+                    <span className="text-xs text-cyan-300 font-bold">重点盯</span>
                   </div>
-                  <CardText className="text-[10px] text-slate-500 mt-2">大阳启动后回踩MA5 0%~2%，未跌破</CardText>
+                  <CardText className="text-[11px] text-slate-300 mt-2 font-semibold">大阳启动后回踩MA5 0%~2%，未跌破</CardText>
                 </div>
               </div>
 
+              {renderBuyReadyPreview()}
+
               {/* 持仓卖点与交易铁律操作指南卡 */}
               <div className="space-y-3">
-                <div className="flex items-center space-x-2">
-                  <ShieldAlert className="h-4 w-4 text-cyan-400" />
-                  <h3 className="text-xs font-extrabold text-slate-200 uppercase tracking-wider">
-                    当前持仓卖点监控与操作计划
-                  </h3>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center space-x-2">
+                    <ShieldAlert className="h-4 w-4 text-cyan-400" />
+                    <h3 className="text-sm font-black text-slate-100">
+                      当前持仓精简监控
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleQuickSellEntry}
+                    className="inline-flex w-fit items-center gap-1.5 rounded border border-emerald-700/50 bg-emerald-950/30 px-3 py-1.5 text-xs font-bold text-emerald-300 transition hover:bg-emerald-900/40"
+                  >
+                    <Briefcase className="h-3.5 w-3.5" />
+                    <span>查看完整持仓卡</span>
+                  </button>
                 </div>
 
                 {positions.length === 0 ? (
-                  <CardText as="div" className="bg-slate-900/40 border border-slate-800 rounded-lg p-4 text-center text-xs text-slate-500 italic">
+                  <CardText as="div" className="bg-slate-900/40 border border-slate-800 rounded-lg p-4 text-center text-xs font-semibold text-slate-500">
                     当前账户暂无持仓。买入流水录入后，这里会按次日强度、远离MA5止盈、跌破MA5风控三层规则生成卖点计划。
                   </CardText>
                 ) : (
-                  <div className="grid grid-cols-1 gap-4">
-                    {sortedPositions.map((p, idx) => renderPositionSellCard(p, idx))}
+                  <div className="grid grid-cols-1 gap-3">
+                    {sortedPositions.map((p, idx) => renderPositionDashboardCard(p, idx))}
                   </div>
                 )}
               </div>
@@ -2973,15 +3149,17 @@ export default function App() {
                   <div className="flex items-center space-x-3 w-full md:w-auto shrink-0">
                     <button
                       onClick={handleQuickBuyEntry}
-                      className="flex-1 md:flex-initial px-5 py-2.5 bg-rose-950/50 hover:bg-rose-900/50 border border-rose-900/60 rounded-lg font-bold text-xs text-rose-300 transition duration-150 text-center active:scale-95 cursor-pointer"
+                      className="flex-1 md:flex-initial px-5 py-2.5 bg-rose-950/50 hover:bg-rose-900/50 border border-rose-900/60 rounded-lg font-black text-xs text-rose-200 transition duration-150 active:scale-95 cursor-pointer inline-flex items-center justify-center gap-1.5"
                     >
-                      💡 记录实盘买入
+                      <Plus className="h-3.5 w-3.5" />
+                      <span>记录实盘买入</span>
                     </button>
                     <button
                       onClick={handleQuickSellEntry}
-                      className="flex-1 md:flex-initial px-5 py-2.5 bg-emerald-950/50 hover:bg-emerald-900/50 border border-emerald-900/60 rounded-lg font-bold text-xs text-emerald-300 transition duration-150 text-center active:scale-95 cursor-pointer"
+                      className="flex-1 md:flex-initial px-5 py-2.5 bg-emerald-950/50 hover:bg-emerald-900/50 border border-emerald-900/60 rounded-lg font-black text-xs text-emerald-200 transition duration-150 active:scale-95 cursor-pointer inline-flex items-center justify-center gap-1.5"
                     >
-                      💡 记录实盘卖出
+                      <Briefcase className="h-3.5 w-3.5" />
+                      <span>记录实盘卖出</span>
                     </button>
                   </div>
                 </div>
@@ -2994,19 +3172,26 @@ export default function App() {
             <div className="space-y-4">
               
               {/* 今日锁池与行情同步中心 */}
-              <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm space-y-4">
-                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 border-b border-slate-800 pb-3">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
+              <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm space-y-3">
+                <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3 border-b border-slate-800 pb-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
                       <ShieldAlert className="h-4 w-4 text-cyan-400" />
-                      <h3 className="text-sm font-bold text-slate-100">今日锁池与行情同步中心</h3>
+                      <h3 className="text-sm font-black text-slate-100">今日锁池与行情同步</h3>
+                      <span className={`rounded px-2 py-0.5 text-xs font-black ${poolMeta?.isPoolLocked ? "bg-cyan-950 text-cyan-300" : "bg-slate-800 text-slate-300"}`}>
+                        {poolMeta?.isPoolLocked ? "已锁池" : "未锁池"}
+                      </span>
                     </div>
-                    <CardText className="text-[11px] text-slate-400 leading-normal">
-                      自动刷新会重算观察/待买分组但不改名单；扫描异动只提醒新进/跌出；重建初筛才会覆盖今日股票名单。
-                    </CardText>
+                    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-semibold text-slate-400">
+                      <span>批次 <b className="font-mono text-slate-200">{poolGeneratedLabel}</b></span>
+                      <span>池内 <b className="font-mono text-slate-200">{initialPoolCount}</b></span>
+                      <span>观察/待买 <b className="font-mono text-cyan-300">{observationCount}/{pendingBuyCount}</b></span>
+                      <span>K线缺口 <b className={missingKLineCount > 0 ? "font-mono text-amber-300" : "font-mono text-emerald-300"}>{missingKLineCount}</b></span>
+                      <span>行情 <b className="font-mono text-slate-200">{latestQuoteLabel}</b></span>
+                    </div>
                   </div>
 
-                  <div className="relative w-full md:w-80">
+                  <div className="relative w-full xl:w-80">
                     <Search className="h-3.5 w-3.5 text-slate-500 absolute left-3 top-2.5" />
                     <input
                       type="text"
@@ -3018,59 +3203,22 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="rounded-lg border border-slate-800 bg-slate-950/35 p-3">
-                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-x-4 gap-y-3 text-[10px]">
-                    <div>
-                      <span className="text-slate-600 block">今日初筛池</span>
-                      <span className={`font-bold ${poolMeta?.isPoolLocked ? "text-cyan-300" : "text-slate-300"}`}>
-                        {poolMeta?.isPoolLocked ? "已锁池" : "未锁池"}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">批次</span>
-                      <span className="text-slate-300 font-mono break-all">{poolGeneratedLabel}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">来源</span>
-                      <span className="text-slate-300">{poolMeta?.poolSource || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">池内股票</span>
-                      <span className="text-slate-300 font-mono">{initialPoolCount} 只</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">观察 / 待买</span>
-                      <span className="text-slate-300 font-mono">{observationCount} / {pendingBuyCount}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">上次行情刷新</span>
-                      <span className="text-slate-300 font-mono">{lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : latestWatchlistUpdateLabel}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 items-stretch">
-                  <div className="border border-slate-800 bg-slate-950/35 rounded-lg p-3 h-full flex flex-col gap-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2 text-xs font-bold text-cyan-300">
-                          <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
-                          <span>安全刷新</span>
+                <div className="grid grid-cols-1 2xl:grid-cols-[1fr_1.35fr] gap-3 items-stretch">
+                  <div className="rounded-lg border border-cyan-800/40 bg-cyan-950/10 p-3">
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 text-sm font-black text-cyan-200">
+                          <RefreshCw className={`h-4 w-4 ${quoteRefreshing ? "animate-spin" : ""}`} />
+                          <span>安全刷新行情</span>
+                          <span className="rounded bg-cyan-950 px-2 py-0.5 text-xs font-black text-cyan-300">
+                            {autoQuoteRefreshEnabled ? (quoteRefreshing ? "刷新中" : `${quoteRefreshCountdown}s`) : "手动"}
+                          </span>
                         </div>
-                        <CardText className="text-[10px] text-slate-400 leading-normal">
-                          只更新池内股票现价、成交额、MA5偏离率，并重算观察/待买分组；不改变初筛池名单。
+                        <CardText className="mt-1 text-[11px] font-semibold text-slate-300">
+                          更新现价、成交额、MA5偏离并重算分组；名单不变
                         </CardText>
                       </div>
-                      <span className="text-[10px] font-mono text-cyan-300 bg-cyan-950/60 border border-cyan-500/20 rounded px-2 py-0.5 whitespace-nowrap">
-                        {autoQuoteRefreshEnabled ? (quoteRefreshing ? "刷新中" : `${quoteRefreshCountdown}s`) : "已关闭"}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2 text-[10px] font-mono">
-                      <div className="rounded border border-cyan-500/20 bg-cyan-950/10 px-2 py-1.5 text-slate-400">更新 <span className="text-cyan-300">行情</span></div>
-                      <div className="rounded border border-cyan-500/20 bg-cyan-950/10 px-2 py-1.5 text-slate-400">重算 <span className="text-cyan-300">分组</span></div>
-                      <div className="rounded border border-slate-700 bg-slate-950/50 px-2 py-1.5 text-slate-400">名单 <span className="text-slate-300">不变</span></div>
-                    </div>
-                    <div className="mt-auto grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-2">
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] lg:w-[520px]">
                       <button
                         type="button"
                         role="switch"
@@ -3090,115 +3238,111 @@ export default function App() {
                       <button
                         onClick={() => void handleRefreshQuotes("manual")}
                         disabled={quoteRefreshing}
-                        className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
+                        className="px-3.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-60 disabled:cursor-not-allowed text-white rounded text-xs font-black shadow-sm flex items-center justify-center gap-1.5 transition"
                       >
                         <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
-                        <span>{quoteRefreshing ? "刷新中..." : "立刻刷新当前池行情"}</span>
+                        <span>{quoteRefreshing ? "刷新中..." : "立刻刷新"}</span>
                       </button>
                     </div>
-                    <div className="text-[10px] text-slate-500 font-mono">
-                      最新行情 {lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : latestWatchlistUpdateLabel}
                     </div>
                   </div>
 
-                  <div className="border border-slate-800 bg-slate-950/35 rounded-lg p-3 h-full flex flex-col gap-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
-                          <AlertCircle className="h-3.5 w-3.5" />
-                          <span>异动提醒</span>
+                  <div className="rounded-lg border border-amber-800/40 bg-amber-950/10 p-3">
+                    <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2 text-sm font-black text-amber-200">
+                          <AlertCircle className="h-4 w-4" />
+                          <span>前30异动提醒</span>
+                          <span className="rounded bg-amber-950 px-2 py-0.5 text-xs font-black text-amber-300">
+                            {autoTurnoverScanEnabled ? (turnoverScanning ? "扫描中" : `${turnoverScanCountdown}s`) : "手动"}
+                          </span>
                         </div>
-                        <CardText className="text-[10px] text-slate-400 leading-normal">
-                          发现成交额前30的新进/跌出票；扫描只提醒，不替换当前池。只有点击新进票的“纳入”才会改名单。
+                        <CardText className="mt-1 text-[11px] font-semibold text-slate-300">
+                          只提醒新进/跌出，不自动替换锁池
                         </CardText>
                       </div>
-                      <span className="text-[10px] font-mono text-amber-300 bg-amber-950/60 border border-amber-500/20 rounded px-2 py-0.5 whitespace-nowrap">
-                        {autoTurnoverScanEnabled ? (turnoverScanning ? "扫描中" : `${turnoverScanCountdown}s`) : "已关闭"}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-4 gap-2 text-[10px] font-mono">
-                      <div className="rounded border border-cyan-500/20 bg-cyan-950/10 px-2 py-1.5 text-slate-400">新进 <span className="text-cyan-300">{turnoverChanges?.newEntries.length || 0}</span></div>
-                      <div className="rounded border border-amber-500/20 bg-amber-950/10 px-2 py-1.5 text-slate-400">跌出 <span className="text-amber-300">{turnoverChanges?.dropped.length || 0}</span></div>
-                      <div className="rounded border border-emerald-500/20 bg-emerald-950/10 px-2 py-1.5 text-slate-400">上升 <span className="text-emerald-300">{turnoverChanges?.rankUp.length || 0}</span></div>
-                      <div className="rounded border border-rose-500/20 bg-rose-950/10 px-2 py-1.5 text-slate-400">下降 <span className="text-rose-300">{turnoverChanges?.rankDown.length || 0}</span></div>
-                    </div>
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-                      <div className="space-y-1.5">
-                        <div className="text-[10px] font-bold text-cyan-300">新进前30</div>
-                        {turnoverChanges ? renderTurnoverPreviewRows(turnoverChanges.newEntries, "new") : (
-                          <div className="rounded border border-dashed border-slate-800 bg-slate-950/30 px-3 py-2 text-[10px] text-slate-600">
-                            扫描后这里会显示新进票，并提供“纳入”按钮
-                          </div>
-                        )}
-                      </div>
-                      <div className="space-y-1.5">
-                        <div className="text-[10px] font-bold text-amber-300">跌出前30</div>
-                        {turnoverChanges ? renderTurnoverPreviewRows(turnoverChanges.dropped, "dropped") : (
-                          <div className="rounded border border-dashed border-slate-800 bg-slate-950/30 px-3 py-2 text-[10px] text-slate-600">
-                            扫描后这里会显示跌出票，只做提醒
-                          </div>
-                        )}
+                      <div className="grid grid-cols-4 gap-2 text-xs font-mono xl:w-[360px]">
+                        <div className="rounded border border-cyan-500/20 bg-cyan-950/10 px-2 py-1.5 text-slate-300">新进 <span className="font-black text-cyan-300">{turnoverChanges?.newEntries.length || 0}</span></div>
+                        <div className="rounded border border-amber-500/20 bg-amber-950/10 px-2 py-1.5 text-slate-300">跌出 <span className="font-black text-amber-300">{turnoverChanges?.dropped.length || 0}</span></div>
+                        <div className="rounded border border-emerald-500/20 bg-emerald-950/10 px-2 py-1.5 text-slate-300">上升 <span className="font-black text-emerald-300">{turnoverChanges?.rankUp.length || 0}</span></div>
+                        <div className="rounded border border-rose-500/20 bg-rose-950/10 px-2 py-1.5 text-slate-300">下降 <span className="font-black text-rose-300">{turnoverChanges?.rankDown.length || 0}</span></div>
                       </div>
                     </div>
-                    <div className="mt-auto grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-2">
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={autoTurnoverScanEnabled}
-                        onClick={() => setAutoTurnoverScanEnabled(prev => !prev)}
-                        className={`px-3.5 py-1.5 rounded border text-xs font-semibold flex items-center justify-between gap-3 transition ${
-                          autoTurnoverScanEnabled
-                            ? "bg-amber-600/20 border-amber-500/40 text-amber-200"
-                            : "bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200"
-                        }`}
-                      >
-                        <span>自动扫描前30异动 3分钟</span>
-                        <span className={`h-4 w-7 rounded-full p-0.5 transition ${autoTurnoverScanEnabled ? "bg-amber-500" : "bg-slate-700"}`}>
-                          <span className={`block h-3 w-3 rounded-full bg-white transition ${autoTurnoverScanEnabled ? "translate-x-3" : "translate-x-0"}`}></span>
-                        </span>
-                      </button>
-                      <button
-                        onClick={() => void handleScanTurnoverChanges("manual")}
-                        disabled={turnoverScanning}
-                        className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
-                      >
-                        <AlertCircle className="h-3.5 w-3.5 text-amber-300" />
-                        <span>{turnoverScanning ? "扫描中..." : "手动扫描前30异动"}</span>
-                      </button>
-                    </div>
-                    <div className="text-[10px] text-slate-500 font-mono">
-                      上次扫描 {lastTurnoverScanAt ? lastTurnoverScanAt.toLocaleTimeString() : "未触发"}
+                    <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+                      <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+                        <div className="space-y-1.5">
+                          <div className="text-[11px] font-black text-cyan-300">新进前30</div>
+                          {turnoverChanges ? renderTurnoverPreviewRows(turnoverChanges.newEntries, "new") : (
+                            <div className="rounded border border-dashed border-slate-800 bg-slate-950/30 px-3 py-2 text-[11px] font-semibold text-slate-500">
+                              等待扫描
+                            </div>
+                          )}
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="text-[11px] font-black text-amber-300">跌出前30</div>
+                          {turnoverChanges ? renderTurnoverPreviewRows(turnoverChanges.dropped, "dropped") : (
+                            <div className="rounded border border-dashed border-slate-800 bg-slate-950/30 px-3 py-2 text-[11px] font-semibold text-slate-500">
+                              等待扫描
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] lg:w-[500px] xl:grid-cols-1 xl:w-[210px]">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={autoTurnoverScanEnabled}
+                          onClick={() => setAutoTurnoverScanEnabled(prev => !prev)}
+                          className={`px-3.5 py-1.5 rounded border text-xs font-semibold flex items-center justify-between gap-3 transition ${
+                            autoTurnoverScanEnabled
+                              ? "bg-amber-600/20 border-amber-500/40 text-amber-200"
+                              : "bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          <span>自动扫描 3分钟</span>
+                          <span className={`h-4 w-7 rounded-full p-0.5 transition ${autoTurnoverScanEnabled ? "bg-amber-500" : "bg-slate-700"}`}>
+                            <span className={`block h-3 w-3 rounded-full bg-white transition ${autoTurnoverScanEnabled ? "translate-x-3" : "translate-x-0"}`}></span>
+                          </span>
+                        </button>
+                        <button
+                          onClick={() => void handleScanTurnoverChanges("manual")}
+                          disabled={turnoverScanning}
+                          className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-60 disabled:cursor-not-allowed text-white rounded text-xs font-black shadow-sm flex items-center justify-center gap-1.5 transition"
+                        >
+                          <AlertCircle className="h-3.5 w-3.5" />
+                          <span>{turnoverScanning ? "扫描中..." : "手动扫描"}</span>
+                        </button>
+                        <span className="text-[10px] font-mono text-slate-500">上次 {lastTurnoverScanAt ? lastTurnoverScanAt.toLocaleTimeString() : "未触发"}</span>
+                      </div>
                     </div>
                   </div>
 
                 </div>
 
-                <div className="rounded-lg border border-slate-800 bg-slate-950/30 px-3 py-3 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
-                      <Activity className="h-3.5 w-3.5 text-slate-400" />
-                      <span>名单管理与数据修复</span>
+                <div className="rounded-lg border border-slate-800 bg-slate-950/30 px-3 py-3 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-2 text-sm font-black text-slate-200">
+                      <Activity className="h-4 w-4 text-slate-400" />
+                      <span>数据修复</span>
                     </div>
-                    <CardText className="text-[10px] text-slate-500">
-                      补K线只补指标；重建或上传会覆盖当前名单；异动里的“纳入”只添加对应新进票。
-                    </CardText>
+                    <span className="text-[11px] font-semibold text-slate-400">补K线只补指标；重建/上传会覆盖名单</span>
                   </div>
                   <div className="flex flex-col sm:flex-row gap-2">
                     <button
                       onClick={handleRebuildStockPool}
-                      className="px-3.5 py-1.5 bg-rose-950/60 hover:bg-rose-900/60 text-rose-200 border border-rose-700/50 rounded text-xs font-semibold shadow-sm transition"
+                      className="px-3.5 py-1.5 bg-rose-950/60 hover:bg-rose-900/60 text-rose-200 border border-rose-700/50 rounded text-xs font-black shadow-sm transition"
                     >
                       重建今日初筛池
                     </button>
                     <button
                       onClick={() => handleFetchHistory(undefined, true)}
-                      className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm transition"
+                      className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded text-xs font-black shadow-sm transition"
                     >
                       补充所有K线
                     </button>
                     <button
                       onClick={() => setShowImportPanel(!showImportPanel)}
-                      className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
+                      className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded text-xs font-black shadow-sm flex items-center justify-center gap-1.5 transition"
                     >
                       <FileSpreadsheet className="h-3.5 w-3.5" />
                       <span>上传同花顺初筛池</span>
@@ -3209,8 +3353,8 @@ export default function App() {
                 {turnoverChanges && (
                   <div className="border-t border-slate-800 pt-3">
                     <div className="flex items-center justify-between gap-3 mb-2">
-                      <span className="text-xs font-bold text-slate-300">成交额前30变动提醒</span>
-                      <span className="text-[10px] text-slate-500 font-mono">{changeTotal} 条</span>
+                      <span className="text-sm font-black text-slate-200">成交额前30变动提醒</span>
+                      <span className="text-xs text-slate-400 font-mono">{changeTotal} 条</span>
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
                       {renderTurnoverList("新进", turnoverChanges.newEntries, "cyan")}
@@ -3563,32 +3707,22 @@ export default function App() {
 
               {/* 待买观察候选提示 */}
               <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-4">
-                <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
-                  <CheckCircle2 className="h-4 w-4 text-cyan-400" />
-                  <h3 className="text-xs font-bold uppercase text-slate-200 tracking-wider">待买观察候选 (5日线偏离度 0% ~ 2%)</h3>
+                <div className="flex flex-col gap-2 border-b border-slate-800 pb-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center space-x-2">
+                    <CheckCircle2 className="h-4 w-4 text-cyan-400" />
+                    <h3 className="text-sm font-black text-slate-100">待买观察候选</h3>
+                    <span className="rounded bg-cyan-950 px-2 py-0.5 text-xs font-black text-cyan-300">{buyReadyStocks.length} 只</span>
+                  </div>
+                  <span className="text-[11px] font-semibold text-slate-400">5日线偏离度 0%~2%，盘中确认后才记录买入</span>
                 </div>
 
-                <div className="grid grid-cols-1 gap-4">
+                <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
                   {buyReadyStocks.length === 0 ? (
-                    <CardText as="div" className="p-8 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40">
+                    <CardText as="div" className="p-8 text-center text-slate-500 bg-slate-950 rounded-lg border border-slate-800/40 text-xs font-semibold xl:col-span-2">
                       盘中暂无进入待买观察层（大阳启动后回踩MA5，偏离度0%~2%且未跌破MA5）的主板股。请刷新当前池行情或等待回踩。
                     </CardText>
                   ) : (
-                    buyReadyStocks.map(s => (
-                      <div key={s.code} className="p-4 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-lg flex items-center justify-between transition">
-                        <div className="space-y-1">
-                          <span className="text-xs font-bold text-slate-200">{s.name} <span className="font-mono text-slate-500 font-normal">{s.code}</span></span>
-                          <CardText className="text-[10px] text-rose-400 font-medium">MA5偏离度: {s.deviation5}% | 5日线: {s.ma5}</CardText>
-                          <CardText className="text-[11px] text-slate-400 leading-normal">{s.reason}</CardText>
-                        </div>
-                        <button
-                          onClick={() => openBuyModal(s)}
-                          className="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded transition shadow"
-                        >
-                          盘中手动确认
-                        </button>
-                      </div>
-                    ))
+                    buyReadyStocks.map(s => renderBuyReadyCard(s))
                   )}
                 </div>
               </div>
