@@ -62,6 +62,8 @@ def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> di
                 "ma5": number(row.get("MA5")),
                 "deviation5": deviation,
                 "holdDays": int(number(row.get("持仓天数"))),
+                "belowMa5Days": int(number(row.get("跌破MA5天数"))),
+                "buyDate": str(row.get("买入日期") or ""),
                 "advice": advice,
                 "riskLevel": _risk_level(advice, deviation),
             }
@@ -79,4 +81,3 @@ def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> di
         "todayPnL": round(today_pnl, 2),
     }
     return {"accountState": account_state, "positions": api_positions}
-

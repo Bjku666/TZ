@@ -7,14 +7,14 @@ from typing import Any
 import pandas as pd
 
 from src.data import TRADE_COLUMNS, WATCHLIST_COLUMNS
-from src.rules import clean_code, evaluate_stock, stage_to_group
+from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
 from src.storage import load_last_refresh
 
 FRONTEND_GROUP_TO_STAGE = {
     "初筛": "初筛通过",
-    "观察": "等回踩",
-    "待买": "接近买点",
-    "持仓": "等回踩",
+    "观察": "继续观察",
+    "待买": "待买观察",
+    "持仓": "继续观察",
 }
 
 
@@ -55,8 +55,7 @@ def watchlist_to_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for _, row in frame.iterrows():
         evaluation = evaluate_stock(row.to_dict())
-        stage = str(evaluation.get("stage") or row.get("流程阶段") or row.get("状态") or "初筛通过")
-        group = str(row.get("分组") or stage_to_group(stage))
+        stage = normalize_stage(evaluation.get("stage") or row.get("流程阶段") or row.get("状态") or "初筛通过")
         group = str(evaluation.get("group") or stage_to_group(stage))
         risk = evaluation.get("risk_level", "normal")
         result.append(
@@ -67,6 +66,12 @@ def watchlist_to_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
                 "pct": number(row.get("涨跌幅%")),
                 "volume": number(row.get("成交额")),
                 "rank": int(number(row.get("成交额排名"), 0)),
+                "poolBatchId": str(clean_value(row.get("pool_batch_id"), "")),
+                "poolSource": str(clean_value(row.get("pool_source"), "")),
+                "poolGeneratedAt": str(clean_value(row.get("pool_generated_at"), "")),
+                "poolRankAtGeneration": int(number(row.get("pool_rank_at_generation"), number(row.get("成交额排名"), 0))),
+                "isPoolLocked": bool_value(row.get("is_pool_locked")),
+                "isPinned": bool_value(row.get("is_pinned")),
                 "ma5": number(row.get("MA5")),
                 "ma10": number(row.get("MA10")),
                 "ma20": number(row.get("MA20")),
@@ -233,5 +238,5 @@ def ensure_watchlist_frame(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     for column in WATCHLIST_COLUMNS:
         if column not in out:
-            out[column] = False if column in {"MA5向上", "放量跌破MA5"} else pd.NA
+            out[column] = False if column in {"MA5向上", "放量跌破MA5", "is_pool_locked", "is_pinned"} else pd.NA
     return out[WATCHLIST_COLUMNS]

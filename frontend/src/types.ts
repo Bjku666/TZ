@@ -2,14 +2,17 @@
  * 强势回踩短线交易纪律系统 - 共享数据结构
  */
 
-export type StockGroup = "初筛" | "观察" | "待买" | "持仓";
+export type StockGroup = "初筛" | "观察" | "待买";
+export type StockViewGroup = StockGroup | "持仓";
 
 export type StockStage = 
   | "初筛通过" 
-  | "接近买点" 
-  | "等回踩" 
-  | "远离不追" 
+  | "强势确认"
+  | "继续观察"
+  | "偏高不追"
+  | "远离不追"
   | "待买观察" 
+  | "跌破MA5"
   | "未达规则"
   | "风险排除"
   | "淘汰";
@@ -25,13 +28,19 @@ export interface Stock {
   pct: number;
   volume: number; // 成交额 (元)
   rank: number;   // 成交额排名
+  poolBatchId: string;
+  poolSource: string;
+  poolGeneratedAt: string;
+  poolRankAtGeneration: number;
+  isPoolLocked: boolean;
+  isPinned: boolean;
   ma5: number;
   ma10: number;
   ma20: number;
   deviation5: number;   // 5日线偏离率 (%)
   bigCandlePct: number; // 最近20日内最大阳线涨幅 (%)
   ma5Upward: boolean;   // 5日线是否向上，仅作参考
-  canBuy: boolean;      // 是否满足待买观察条件 (接近买点且未放量跌破MA5)
+  canBuy: boolean;      // 是否满足待买观察条件 (MA5偏离率0%-2%且未放量跌破MA5)
   group: StockGroup;
   stage: StockStage;
   riskLevel: RiskLevel;
@@ -40,6 +49,26 @@ export interface Stock {
   historyStatus: HistoryStatus;
   lastUpdated: string;
   remark: string;       // 备注
+}
+
+export interface TurnoverChangeStock {
+  code: string;
+  name: string;
+  rank: number;
+  volume: number;
+  price?: number;
+  pct?: number;
+  oldRank?: number;
+  newRank?: number;
+  currentRank?: number | null;
+  isPinned?: boolean;
+}
+
+export interface TurnoverChanges {
+  newEntries: TurnoverChangeStock[];
+  dropped: TurnoverChangeStock[];
+  rankUp: TurnoverChangeStock[];
+  rankDown: TurnoverChangeStock[];
 }
 
 export interface Position {
@@ -55,6 +84,8 @@ export interface Position {
   ma5: number;
   deviation5: number;        // 5日线偏离度
   holdDays: number;          // 持股天数
+  belowMa5Days: number;      // 连续跌破5日线天数
+  buyDate: string;           // 买入日期
   advice: string;            // 建议
   riskLevel: RiskLevel;      // 风险级别
 }

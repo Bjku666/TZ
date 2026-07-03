@@ -9,21 +9,41 @@ BIG_CANDLE_LOOKBACK_DAYS = 20
 BIG_CANDLE_THRESHOLD_PCT = 5.0
 PIPELINE_STAGES = [
     "初筛通过",
-    "接近买点",
-    "等回踩",
+    "强势确认",
+    "继续观察",
+    "偏高不追",
     "远离不追",
-    "未达规则",
+    "待买观察",
+    "跌破MA5",
     "风险排除",
+    "未达规则",
     "淘汰",
 ]
 GROUPS = PIPELINE_STAGES
-MAIN_GROUPS = ["初筛", "观察", "待买", "持仓"]
-OBSERVATION_STAGES = {"接近买点", "等回踩", "远离不追"}
+MAIN_GROUPS = ["初筛", "观察", "待买"]
+OBSERVATION_STAGES = {"强势确认", "继续观察", "偏高不追", "远离不追"}
+LEGACY_STAGE_ALIASES = {
+    "初筛": "初筛通过",
+    "观察": "继续观察",
+    "待买": "待买观察",
+    "持仓": "继续观察",
+    "接近买点": "待买观察",
+    "等回踩": "继续观察",
+    "重点观察": "继续观察",
+    "资金不足观察": "未达规则",
+    "缺少历史K线": "未达规则",
+}
+
+
+def normalize_stage(stage: Any) -> str:
+    """Normalize legacy stage names into the v3 pipeline vocabulary."""
+    text = str(stage or "").strip()
+    return LEGACY_STAGE_ALIASES.get(text, text)
 
 
 def stage_to_group(stage: Any) -> str:
     """Map detailed rule stages to the user-facing workbench group."""
-    text = str(stage or "").strip()
+    text = normalize_stage(stage)
     if text == "待买观察":
         return "待买"
     if text in OBSERVATION_STAGES:
@@ -72,11 +92,13 @@ def buy_signal(deviation: float | None) -> str:
     if deviation is None:
         return "待补充MA5"
     if deviation < 0:
-        return "跌破5日线，不买"
+        return "跌破MA5"
     if deviation <= 2:
-        return "接近买点"
+        return "待买观察"
+    if deviation <= 5:
+        return "继续观察"
     if deviation <= 7:
-        return "等回踩"
+        return "偏高不追"
     return "远离不追"
 
 
@@ -92,7 +114,7 @@ def score_stock(row: dict[str, Any]) -> tuple[int, str]:
     passed, _ = screening_result(row.get("代码", ""), row.get("名称", ""))
     if passed:
         score += 1
-    rank = row.get("成交额排名")
+    rank = pool_generation_rank(row)
     if is_number(rank) and float(rank) <= 30:
         score += 1
     if is_number(row.get("最近大阳线%")) and float(row["最近大阳线%"]) >= 5:
@@ -104,7 +126,7 @@ def score_stock(row: dict[str, Any]) -> tuple[int, str]:
         score += 2
     if not bool(row.get("放量跌破MA5", False)):
         score += 2
-    level = "接近买点" if score >= 8 else "初筛通过"
+    level = "待买观察" if score >= 8 else "初筛通过"
     return score, level
 
 
@@ -119,6 +141,11 @@ def truthy(value: Any) -> bool:
 
 def recent_big_line(row: dict[str, Any]) -> bool:
     return is_number(row.get("最近大阳线%")) and float(row.get("最近大阳线%")) >= 5
+
+
+def pool_generation_rank(row: dict[str, Any]) -> Any:
+    rank = row.get("pool_rank_at_generation")
+    return rank if is_number(rank) else row.get("成交额排名")
 
 
 def recent_big_candle_pct(history: Any, lookback: int = BIG_CANDLE_LOOKBACK_DAYS) -> float | None:
@@ -158,7 +185,7 @@ def recent_big_candle_pct(history: Any, lookback: int = BIG_CANDLE_LOOKBACK_DAYS
 
 
 def rank_top_30(row: dict[str, Any]) -> bool:
-    rank = row.get("成交额排名")
+    rank = pool_generation_rank(row)
     return is_number(rank) and float(rank) <= 30
 
 
@@ -200,7 +227,6 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
         return "未达规则", "历史K线数据不足", "历史K线数据不足，至少需要20条有效收盘价"
 
     has_big_line = recent_big_line(row)
-    ma5_up = truthy(row.get("MA5向上"))
     deviation = row.get("MA5偏离率%")
     if not is_number(deviation):
         deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
@@ -208,18 +234,18 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
         return "风险排除", "放量跌破MA5", "放量跌破MA5，不进入观察池"
     if not has_big_line:
         return "未达规则", "无5%阳线启动信号", "近20日无5%阳线启动信号，不进入观察池"
-    if not ma5_up:
-        return "未达规则", "MA5未向上", "MA5未向上，不进入观察池"
     if deviation is None or not is_number(deviation):
         return "未达规则", "等待MA5偏离率", "无法计算MA5偏离率，暂不进入观察池"
 
     deviation_f = float(deviation)
     if deviation_f < 0:
-        return "风险排除", "跌破MA5", "当前价跌破MA5，不进入观察池"
+        return "跌破MA5", "跌破MA5", "当前价跌破MA5，不进入待买"
     if deviation_f <= 2:
-        return "接近买点", "MA5偏离率0%-2%", "接近5日线，盘中重点观察是否回踩不破。"
+        return "待买观察", "MA5偏离率0%-2%", "接近5日线，盘中重点观察是否回踩不破。"
+    if deviation_f <= 5:
+        return "继续观察", "MA5偏离率2%-5%", "趋势仍强，等待回踩到MA5附近。"
     if deviation_f <= 7:
-        return "等回踩", "MA5偏离率2%-7%", "趋势仍强，但还没回踩到位，继续等回踩。"
+        return "偏高不追", "MA5偏离率5%-7%", "位置偏高，不追，继续观察。"
     return "远离不追", "MA5偏离率>7%", "远离5日线，不追，等后续回踩。"
 
 
@@ -230,10 +256,10 @@ def evaluate_stock(row: dict[str, Any]) -> dict[str, Any]:
     """
     stage, reason, reminder = stock_stage_result(row)
     group = stage_to_group(stage)
-    can_buy = stage == "接近买点" and not truthy(row.get("放量跌破MA5"))
+    can_buy = stage == "待买观察" and not truthy(row.get("放量跌破MA5"))
     if stage == "淘汰":
         risk_level = "danger"
-    elif stage in {"未达规则", "风险排除"}:
+    elif stage in {"未达规则", "风险排除", "跌破MA5"}:
         risk_level = "warning"
     else:
         risk_level = "normal"
@@ -288,7 +314,6 @@ def can_be_watchlist_candidate(
     - non-京东方A
     - 有历史K线
     - 最近有5%阳线
-    - MA5向上
     - 当前价在MA5上方 (偏离率 >= 0)
     - MA5偏离率在0%-2%，当前价未有效跌破MA5
 
@@ -304,9 +329,6 @@ def can_be_watchlist_candidate(
 
     if not has_big_line:
         return False, "缺少5%阳线启动信号"
-
-    if not ma5_up:
-        return False, "MA5未向上"
 
     if deviation is None:
         return False, "无法计算MA5偏离率"
@@ -339,9 +361,6 @@ def can_be_observation_candidate(
     if not has_big_line:
         return False, "缺少5%阳线启动信号"
 
-    if not ma5_up:
-        return False, "MA5未向上"
-
     if deviation is None:
         return False, "无法计算MA5偏离率"
 
@@ -366,21 +385,27 @@ def determine_group(
         code, name, has_history, has_big_line, ma5_up, deviation, True
     )
     if qualifies:
-        return "接近买点"
+        return "待买观察"
 
     observation_ok, _ = can_be_observation_candidate(
         code, name, has_history, has_big_line, ma5_up, deviation
     )
     if observation_ok:
         if deviation is not None and is_number(deviation) and 0 <= float(deviation) <= 2:
-            return "接近买点"
+            return "待买观察"
+        if deviation is not None and is_number(deviation) and float(deviation) <= 5:
+            return "继续观察"
+        if deviation is not None and is_number(deviation) and float(deviation) <= 7:
+            return "偏高不追"
         if deviation is not None and is_number(deviation) and float(deviation) > 7:
             return "远离不追"
-        return "等回踩"
+        return "强势确认"
 
     if not has_history:
         return "未达规则"
-    return "初筛通过"
+    if deviation is not None and is_number(deviation) and float(deviation) < 0:
+        return "跌破MA5"
+    return "未达规则"
 
 
 def 提醒_level_for_deviation(deviation: float | None, has_5pct_candle: bool) -> str:

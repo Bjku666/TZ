@@ -45,6 +45,19 @@ def refresh_quotes() -> dict[str, Any]:
     return watchlist_service.refresh_quotes()
 
 
+@router.post("/scan-turnover-changes")
+def scan_turnover_changes() -> dict[str, Any]:
+    return watchlist_service.scan_turnover_changes()
+
+
+@router.post("/include-turnover-stock")
+def include_turnover_stock(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return watchlist_service.include_turnover_stock(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/fetch-history")
 def fetch_history(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}

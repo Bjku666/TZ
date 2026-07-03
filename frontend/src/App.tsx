@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { 
   Activity, 
   Briefcase, 
@@ -26,7 +26,15 @@ import {
   Edit
 } from "lucide-react";
 import KLineChart from "./components/KLineChart";
-import { Stock, TradeLog, StockGroup, StockStage, Position, AccountState, ReviewReport } from "./types";
+import { Stock, TradeLog, StockGroup, StockViewGroup, StockStage, Position, AccountState, ReviewReport, TurnoverChanges, TurnoverChangeStock } from "./types";
+
+const QUOTE_AUTO_REFRESH_SECONDS = 30;
+type QuoteRefreshTrigger = "manual" | "auto";
+
+function localDateString(date = new Date()): string {
+  const localTime = date.getTime() - date.getTimezoneOffset() * 60_000;
+  return new Date(localTime).toISOString().slice(0, 10);
+}
 
 function isMainBoard(code: string): boolean {
   if (!code) return false;
@@ -38,6 +46,218 @@ function isMainBoard(code: string): boolean {
     return true;
   }
   return false;
+}
+
+function tradeAmount(trade: TradeLog): number {
+  return Number.isFinite(trade.amount) && trade.amount > 0 ? trade.amount : trade.price * trade.quantity;
+}
+
+function calculateRealizedPnLByDate(trades: TradeLog[], targetDate: string): number {
+  const states = new Map<string, { qty: number; cost: number }>();
+  const orderedTrades = [...trades].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.time || "").localeCompare(b.time || "");
+  });
+
+  return orderedTrades.reduce((dailyPnL, trade) => {
+    const state = states.get(trade.code) ?? { qty: 0, cost: 0 };
+    const quantity = Number(trade.quantity) || 0;
+    const amount = tradeAmount(trade);
+    const totalFee = Number(trade.totalFee) || 0;
+
+    if (trade.type === "BUY") {
+      if (state.qty <= 0) {
+        state.qty = 0;
+        state.cost = 0;
+      }
+      state.qty += quantity;
+      state.cost += amount + totalFee;
+      states.set(trade.code, state);
+      return dailyPnL;
+    }
+
+    const sellQuantity = Math.min(quantity, state.qty);
+    if (sellQuantity <= 0) {
+      states.set(trade.code, state);
+      return dailyPnL;
+    }
+
+    const avgCost = state.cost / state.qty;
+    const realizedPnL = (trade.price - avgCost) * sellQuantity - totalFee;
+    state.qty -= sellQuantity;
+    state.cost -= avgCost * sellQuantity;
+    if (state.qty <= 0) {
+      state.qty = 0;
+      state.cost = 0;
+    }
+    states.set(trade.code, state);
+    return trade.date === targetDate ? dailyPnL + realizedPnL : dailyPnL;
+  }, 0);
+}
+
+type PositionSellPlan = {
+  tone: "danger" | "warning" | "normal" | "neutral";
+  statusLabel: string;
+  title: string;
+  primaryAction: string;
+  nextMorningRule: string;
+  takeProfitRule: string;
+  ma5RiskRule: string;
+  sizingRule: string;
+  sellReason: string;
+  buttonLabel: string;
+  cardClass: string;
+  dotClass: string;
+  badgeClass: string;
+};
+
+function signedPercent(value: number): string {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  return `${safeValue >= 0 ? "+" : ""}${safeValue.toFixed(2)}%`;
+}
+
+function holdingTimeLabel(position: Position): string {
+  if (position.holdDays <= 0) return "今日建仓";
+  return `持有 ${position.holdDays} 天`;
+}
+
+function buildPositionSellPlan(position: Position): PositionSellPlan {
+  const deviation = Number.isFinite(position.deviation5) ? position.deviation5 : 0;
+  const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
+  const belowMa5 = hasMa5 && deviation < 0;
+  const farFromMa5 = hasMa5 && deviation > 7;
+  const belowDays = Math.max(0, Math.floor(Number(position.belowMa5Days) || 0));
+  const smallPosition = position.quantity < 200;
+  const sizingRule = smallPosition
+    ? "100股或小仓位不能卖半手：要么继续持有，要么一次卖完。"
+    : "200股以上才考虑卖一半，剩余仓位继续用5日线管理。";
+  const holdText = holdingTimeLabel(position);
+  const nextMorningRule = position.holdDays <= 1
+    ? "次日10:00前核对强度：高开低走、冲高回落、弱于板块、没有继续上攻、跌破MA5，都按“不强”处理，冲高卖出或退出。"
+    : `${holdText}，首个隔日强弱窗口已过；后续仍看是否弱于板块、冲高回落或跌破MA5。`;
+  const takeProfitRule = !hasMa5
+    ? "缺少MA5，先补齐K线后再判断是否远离5日线。"
+    : farFromMa5
+      ? `当前偏离MA5 ${signedPercent(deviation)}，已进入远离5日线止盈层。${sizingRule}`
+      : `当前偏离MA5 ${signedPercent(deviation)}，尚未明显远离5日线；不因普通上涨随意卖飞。`;
+  const ma5RiskRule = !hasMa5
+    ? "缺少MA5，暂不能执行5日线风控判断。"
+    : belowDays >= 3
+      ? `已跌破MA5 ${belowDays} 天且未站回，触发清仓层。`
+      : belowMa5
+        ? `当前跌破MA5，14:50仍在5日线下方就考虑减仓或卖出；若连续3天站不回，清仓。`
+        : "当前仍在MA5上方，14:50例行复查；跌破后连续3天站不回才清仓。";
+
+  if (!hasMa5) {
+    return {
+      tone: "neutral",
+      statusLabel: "等待MA5",
+      title: "先补齐均线，再判断卖点",
+      primaryAction: "当前缺少MA5，先补K线或刷新行情，暂不把风险判断拍死。",
+      nextMorningRule,
+      takeProfitRule,
+      ma5RiskRule,
+      sizingRule,
+      sellReason: "缺少MA5数据，手动卖出并补充决策依据",
+      buttonLabel: "记录卖出",
+      cardClass: "bg-slate-900/60 border-slate-800 text-slate-200",
+      dotClass: "bg-slate-500",
+      badgeClass: "bg-slate-950/50 text-slate-300 border border-slate-700"
+    };
+  }
+
+  if (belowDays >= 3) {
+    return {
+      tone: "danger",
+      statusLabel: "清仓点",
+      title: "连续3天站不回MA5，按纪律清仓",
+      primaryAction: `已跌破MA5 ${belowDays} 天。这里不再找理由，优先执行清仓纪律。`,
+      nextMorningRule,
+      takeProfitRule,
+      ma5RiskRule,
+      sizingRule,
+      sellReason: "连续3天未站回MA5，按纪律清仓",
+      buttonLabel: "记录清仓",
+      cardClass: "bg-rose-950/40 border-rose-900/80 text-rose-200",
+      dotClass: "bg-rose-500",
+      badgeClass: "bg-rose-950 text-rose-300 border border-rose-700/60"
+    };
+  }
+
+  if (belowMa5) {
+    return {
+      tone: "danger",
+      statusLabel: "风控点",
+      title: "跌破MA5，等14:50做去留",
+      primaryAction: smallPosition
+        ? "100股持仓：14:50仍跌破MA5，按全卖或继续持有二选一，不做半手幻想。"
+        : "200股以上：14:50仍跌破MA5，考虑减仓或卖出，先把风险压下来。",
+      nextMorningRule,
+      takeProfitRule,
+      ma5RiskRule,
+      sizingRule,
+      sellReason: "14:50仍跌破5日线（MA5），执行减仓或卖出风控纪律",
+      buttonLabel: smallPosition ? "记录全卖" : "记录卖出",
+      cardClass: "bg-rose-950/40 border-rose-900/80 text-rose-200",
+      dotClass: "bg-rose-500",
+      badgeClass: "bg-rose-950 text-rose-300 border border-rose-700/60"
+    };
+  }
+
+  if (farFromMa5) {
+    return {
+      tone: "warning",
+      statusLabel: "止盈点",
+      title: "远离MA5，进入止盈观察",
+      primaryAction: smallPosition
+        ? "股价明显远离5日线；100股持仓只做“持有或全卖”的选择。"
+        : "股价明显远离5日线；200股以上可按原规则先卖一半锁定利润。",
+      nextMorningRule,
+      takeProfitRule,
+      ma5RiskRule,
+      sizingRule,
+      sellReason: smallPosition ? "远离5日线止盈，小仓位按全卖或持有二选一" : "远离5日线止盈，200股以上考虑卖出一半",
+      buttonLabel: "记录止盈",
+      cardClass: "bg-amber-950/40 border-amber-900/70 text-amber-200",
+      dotClass: "bg-amber-500",
+      badgeClass: "bg-amber-950 text-amber-300 border border-amber-700/60"
+    };
+  }
+
+  if (position.holdDays <= 1) {
+    return {
+      tone: "warning",
+      statusLabel: "次日观察",
+      title: "隔日短线，10点前看强不强",
+      primaryAction: "新仓或隔日仓的核心是强度。10点前不继续上攻，就冲高卖出或退出。",
+      nextMorningRule,
+      takeProfitRule,
+      ma5RiskRule,
+      sizingRule,
+      sellReason: "次日10点前不强，冲高卖出或退出",
+      buttonLabel: "记录卖出",
+      cardClass: "bg-cyan-950/30 border-cyan-900/60 text-cyan-100",
+      dotClass: "bg-cyan-400",
+      badgeClass: "bg-cyan-950 text-cyan-300 border border-cyan-700/60"
+    };
+  }
+
+  return {
+    tone: "normal",
+    statusLabel: "持有观察",
+    title: "未远离、未跌破，继续按MA5管理",
+    primaryAction: "当前位置没有触发卖点。继续盯强弱、板块跟随和14:50的MA5位置。",
+    nextMorningRule,
+    takeProfitRule,
+    ma5RiskRule,
+    sizingRule,
+    sellReason: "按持仓卖点规则主动卖出",
+    buttonLabel: "记录卖出",
+    cardClass: "bg-slate-900/60 border-slate-800 text-slate-200",
+    dotClass: "bg-emerald-500",
+    badgeClass: "bg-emerald-950 text-emerald-300 border border-emerald-700/60"
+  };
 }
 
 export default function App() {
@@ -55,13 +275,14 @@ export default function App() {
   });
   const [positions, setPositions] = useState<Position[]>([]);
   const [watchlist, setWatchlist] = useState<Stock[]>([]);
+  const [turnoverChanges, setTurnoverChanges] = useState<TurnoverChanges | null>(null);
   const [trades, setTrades] = useState<TradeLog[]>([]);
   const [loading, setLoading] = useState(false);
   const [actionLog, setActionLog] = useState<string[]>([]);
   const [currentMode, setCurrentMode] = useState<"simulation" | "real">("simulation");
 
   // 筛选与交互状态
-  const [watchlistGroup, setWatchlistGroup] = useState<StockGroup>("初筛");
+  const [watchlistGroup, setWatchlistGroup] = useState<StockViewGroup>("初筛");
   const [selectedStock, setSelectedStock] = useState<Stock | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -80,7 +301,7 @@ export default function App() {
   const [auditStats, setAuditStats] = useState<any>(null);
   const [reportSummary, setReportSummary] = useState("");
   const [reportPlan, setReportPlan] = useState("");
-  const [reportDate, setReportDate] = useState(new Date().toISOString().split("T")[0]);
+  const [reportDate, setReportDate] = useState(localDateString());
 
   // 标准化多维度复盘工作台状态
   const [shTrend, setShTrend] = useState("向上");
@@ -140,6 +361,12 @@ export default function App() {
 
   // 实时系统时钟
   const [currentTime, setCurrentTime] = useState(new Date());
+  const [quoteRefreshing, setQuoteRefreshing] = useState(false);
+  const [quoteRefreshCountdown, setQuoteRefreshCountdown] = useState(QUOTE_AUTO_REFRESH_SECONDS);
+  const [lastQuoteRefreshAt, setLastQuoteRefreshAt] = useState<Date | null>(null);
+  const quoteRefreshInFlightRef = useRef(false);
+  const lastQuoteRefreshAtMsRef = useRef(Date.now());
+  const refreshQuotesRef = useRef<(trigger?: QuoteRefreshTrigger) => Promise<void>>(async () => {});
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
@@ -281,22 +508,23 @@ export default function App() {
     logAction("⏳ 正在拉取主板成交额排行并执行纪律筛选...");
     try {
       const res = await fetch("/api/watchlist/generate", { method: "POST" });
-      if (res.ok) {
-        const data = await res.json();
-        setWatchlist(data.list);
-        logAction(`✅ 股票池自动构建完毕！已过滤ST、创业板、科创板、北交所、京东方A等笨重股。当前初筛数量: ${data.list.length} 只`);
-        setActiveTab("watchlist");
-        setWatchlistGroup("初筛");
-        if (data.list.length > 0) {
-          setSelectedStock(data.list[0]);
-        }
-        // 自动触发一次补充历史K线的通知
-        logAction("💡 提示: 初筛股票可能缺少K线计算指标，可点击「一键补充K线」进行指标加载");
-      } else {
-        throw new Error();
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.success === false) {
+        if (Array.isArray(data?.list)) setWatchlist(data.list);
+        throw new Error(data?.message || "自动股票池生成失败");
       }
+      setWatchlist(data.list || []);
+      setTurnoverChanges(null);
+      logAction(`✅ ${data.message || `已生成并锁定今日初筛池 ${(data.list || []).length} 只`}`);
+      setActiveTab("watchlist");
+      setWatchlistGroup("初筛");
+      if ((data.list || []).length > 0) {
+        setSelectedStock(data.list[0]);
+      }
+      logAction("💡 提示: 初筛股票可能缺少K线计算指标，可点击「一键补充K线」进行指标加载");
     } catch (err) {
-      logAction("❌ 自动股票池生成失败，请稍后重试");
+      const errorMessage = err instanceof Error && err.message ? err.message : "自动股票池生成失败，请稍后重试";
+      logAction(`❌ ${errorMessage}`);
     } finally {
       setLoading(false);
       loadAllData(true);
@@ -304,25 +532,124 @@ export default function App() {
   };
 
   // 盘中轻量刷新
-  const handleRefreshQuotes = async () => {
-    setLoading(true);
-    logAction("⏳ 盘中行情极轻刷新启动...");
+  const handleRefreshQuotes = async (trigger: QuoteRefreshTrigger = "manual") => {
+    const isManualRefresh = trigger === "manual";
+    if (quoteRefreshInFlightRef.current) {
+      if (isManualRefresh) {
+        logAction("⏳ 行情刷新正在进行中，请稍等片刻。");
+      }
+      return;
+    }
+
+    quoteRefreshInFlightRef.current = true;
+    setQuoteRefreshing(true);
+    if (isManualRefresh) setLoading(true);
+    logAction(isManualRefresh ? "⏳ 立刻刷新行情启动..." : "⏳ 30秒自动刷新行情启动...");
     try {
       const res = await fetch("/api/watchlist/refresh-quotes", { method: "POST" });
-      if (res.ok) {
-        const data = await res.json();
-        setWatchlist(data.list);
-        logAction("⚡ 盘中现价与MA5偏离率刷新完成！已自动评估买点区间。");
-      } else {
-        throw new Error();
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.success === false) {
+        if (Array.isArray(data?.list)) setWatchlist(data.list);
+        throw new Error(data?.message || "行情刷新失败，保留本地缓存");
       }
+
+      setWatchlist(data?.list || []);
+      const refreshMessage = data?.message ? `（${data.message}）` : "";
+      logAction(
+        isManualRefresh
+          ? `⚡ 行情立刻刷新完成，已重新评估买点区间。${refreshMessage}`
+          : `⚡ 30秒自动刷新完成，已重新评估买点区间。${refreshMessage}`
+      );
     } catch (err) {
-      logAction("❌ 行情刷新失败，保留本地缓存");
+      const errorMessage = err instanceof Error && err.message ? err.message : "行情刷新失败，保留本地缓存";
+      logAction(isManualRefresh ? `❌ ${errorMessage}` : `❌ 自动刷新失败：${errorMessage}`);
     } finally {
-      setLoading(false);
-      loadAllData(true);
+      const finishedAt = new Date();
+      lastQuoteRefreshAtMsRef.current = finishedAt.getTime();
+      setLastQuoteRefreshAt(finishedAt);
+      setQuoteRefreshCountdown(QUOTE_AUTO_REFRESH_SECONDS);
+      await loadAllData(true);
+      quoteRefreshInFlightRef.current = false;
+      setQuoteRefreshing(false);
+      if (isManualRefresh) setLoading(false);
     }
   };
+
+  // 扫描实时成交额前30变化，但不替换今日锁定池
+  const handleScanTurnoverChanges = async () => {
+    setLoading(true);
+    logAction("⏳ 正在扫描实时成交额前30变化，当前初筛池不会被替换...");
+    try {
+      const res = await fetch("/api/watchlist/scan-turnover-changes", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.success === false) {
+        throw new Error(data?.message || "扫描新进前30失败");
+      }
+      setTurnoverChanges(data.changes || null);
+      if (Array.isArray(data.list)) setWatchlist(data.list);
+      logAction(`🔎 ${data.message || "扫描完成，当前初筛池未被替换。"}`);
+    } catch (err) {
+      const errorMessage = err instanceof Error && err.message ? err.message : "扫描新进前30失败";
+      logAction(`❌ ${errorMessage}`);
+    } finally {
+      setLoading(false);
+      await loadAllData(true);
+    }
+  };
+
+  const handleIncludeTurnoverStock = async (stock: TurnoverChangeStock) => {
+    setLoading(true);
+    logAction(`⏳ 正在手动纳入今日初筛池: ${stock.name || stock.code}`);
+    try {
+      const res = await fetch("/api/watchlist/include-turnover-stock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(stock)
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.success === false) {
+        throw new Error(data?.detail || data?.message || "手动纳入失败");
+      }
+      setWatchlist(data.list || []);
+      setTurnoverChanges(prev => prev ? {
+        ...prev,
+        newEntries: prev.newEntries.filter(item => item.code !== stock.code)
+      } : prev);
+      logAction(`✅ ${data.message || "已手动纳入今日初筛池"}`);
+    } catch (err) {
+      const errorMessage = err instanceof Error && err.message ? err.message : "手动纳入失败";
+      logAction(`❌ ${errorMessage}`);
+    } finally {
+      setLoading(false);
+      await loadAllData(true);
+    }
+  };
+
+  useEffect(() => {
+    refreshQuotesRef.current = handleRefreshQuotes;
+  });
+
+  useEffect(() => {
+    if (activeTab !== "intraday") {
+      setQuoteRefreshCountdown(QUOTE_AUTO_REFRESH_SECONDS);
+      return;
+    }
+
+    lastQuoteRefreshAtMsRef.current = Date.now();
+    setQuoteRefreshCountdown(QUOTE_AUTO_REFRESH_SECONDS);
+
+    const timer = window.setInterval(() => {
+      const elapsedSeconds = Math.floor((Date.now() - lastQuoteRefreshAtMsRef.current) / 1000);
+      const secondsLeft = Math.max(QUOTE_AUTO_REFRESH_SECONDS - elapsedSeconds, 0);
+      setQuoteRefreshCountdown(secondsLeft);
+
+      if (secondsLeft <= 0 && !quoteRefreshInFlightRef.current) {
+        void refreshQuotesRef.current("auto");
+      }
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [activeTab]);
 
   // 补充K线历史
   const handleFetchHistory = async (code?: string, fetchAll = false) => {
@@ -380,19 +707,23 @@ export default function App() {
   // 打开卖出交易模态框
   const openSellModal = (pos: Position) => {
     const matched = watchlist.find(s => s.code === pos.code);
+    const sellPlan = buildPositionSellPlan(pos);
     setTradeTarget(matched || {
       code: pos.code,
       name: pos.name,
       price: pos.currentPrice,
-      pct: 0, volume: 0, rank: 99, ma5: pos.ma5, ma10: 0, ma20: 0,
+      pct: 0, volume: 0, rank: 99,
+      poolBatchId: "", poolSource: "持仓", poolGeneratedAt: "",
+      poolRankAtGeneration: 99, isPoolLocked: true, isPinned: true,
+      ma5: pos.ma5, ma10: 0, ma20: 0,
       deviation5: pos.deviation5, bigCandlePct: 10, ma5Upward: true, canBuy: false,
-      group: "持仓", stage: "等回踩", riskLevel: "normal", reason: "", reminder: "",
+      group: "观察", stage: "继续观察", riskLevel: "normal", reason: "", reminder: "",
       historyStatus: "已有缓存", lastUpdated: "", remark: ""
     });
     setTradeType("SELL");
     setTradePrice(pos.currentPrice || pos.avgCost);
     setTradeQuantity(pos.quantity);
-    setTradeReason(pos.currentPrice < pos.ma5 ? "跌破5日线（MA5）执行强制卖出风控止损纪律" : "达到目标，止盈出局");
+    setTradeReason(sellPlan.sellReason);
     setTradeRemark("");
     setShowTradeModal(true);
   };
@@ -509,8 +840,9 @@ export default function App() {
     }
 
     // 计算今日买卖数量
-    const todayStr = new Date().toISOString().split("T")[0];
+    const todayStr = localDateString();
     const todayTrades = trades.filter(t => t.date === todayStr);
+    const todayRealizedPnL = calculateRealizedPnLByDate(trades, todayStr);
     const buyCount = todayTrades.filter(t => t.type === "BUY").length;
     const sellCount = todayTrades.filter(t => t.type === "SELL").length;
     const compliantCount = todayTrades.filter(t => t.type === "BUY" && t.rulesConclusion === "符合规则").length;
@@ -524,7 +856,7 @@ export default function App() {
       sellCount,
       ruleComplianceRate: complianceRate,
       violations: todayTrades.filter(t => t.rulesConclusion === "违规交易").flatMap(t => t.violationTags),
-      realizedPnL: todayTrades.reduce((acc, t) => acc + (t.type === "SELL" ? t.amount - t.totalFee : -(t.amount + t.totalFee)), 0),
+      realizedPnL: Number(todayRealizedPnL.toFixed(2)),
       portfolioRisk: positions.filter(p => p.riskLevel === "danger").length > 0 ? "高风险 (部分持仓已破5日线)" : "正常 (持仓均在5日线上方)",
       summary: reportSummary,
       tomorrowPlan: reportPlan,
@@ -650,6 +982,7 @@ export default function App() {
       }
       const data = await res.json();
       setWatchlist(data.list || []);
+      setTurnoverChanges(null);
       logAction(`📂 ${data.message || "同花顺表格导入完成"}；原始代码 ${data.summary?.codeRows ?? "-"} 行，主板有效 ${data.summary?.mainBoardRows ?? "-"} 行。`);
       if (data.history) {
         logAction(`📈 自动补K线完成：成功 ${data.history.fetched || 0} 只，失败 ${data.history.failed || 0} 只。`);
@@ -744,7 +1077,7 @@ export default function App() {
         action: "均线低吸介入",
         color: "text-emerald-400",
         guidelines: [
-          "✅ 符合铁律买入期：此时间段主力拉升或踩支撑意图已初步明晰。立即核对「等回踩」和「待买」列表！",
+          "✅ 符合铁律买入期：此时间段主力拉升或踩支撑意图已初步明晰。立即核对「继续观察」和「待买」列表！",
           "📈 黄金偏离率买入：若看好个股出现回踩5日线，偏离度在 0% ~ 2% 且未有效跌破MA5，符合低吸纪律，可轻仓/按批次记录买入。"
         ]
       };
@@ -767,7 +1100,7 @@ export default function App() {
         color: "text-slate-400",
         guidelines: [
           "❌ 严禁午后追涨：午后开盘往往成交量低迷，个股波动缺乏持续性。此时买入，次日极易陷入被动。",
-          "🔍 备战尾盘：密切锁定加入自选的「等回踩」个股。看是否有标的在 14:30 后稳步回落至 5 日线附近、而不形成破位。"
+          "🔍 备战尾盘：密切锁定加入自选的「继续观察」个股。看是否有标的在 14:30 后稳步回落至 5 日线附近、而不形成破位。"
         ]
       };
     } else if (tot >= 14 * 60 + 30 && tot < 14 * 60 + 50) {
@@ -818,29 +1151,31 @@ export default function App() {
   };
 
   // 今日复盘相关计算
-  const todayStrForReview = new Date().toISOString().split("T")[0];
+  const todayStrForReview = localDateString();
   const todayTrades = trades.filter(t => t.date === todayStrForReview);
+  const todayRealizedPnL = calculateRealizedPnLByDate(trades, todayStrForReview);
   const reviewBuyCount = todayTrades.filter(t => t.type === "BUY").length;
   const reviewCompliantCount = todayTrades.filter(t => t.type === "BUY" && t.rulesConclusion === "符合规则").length;
   const complianceRate = reviewBuyCount > 0 ? Number(((reviewCompliantCount / reviewBuyCount) * 100).toFixed(2)) : 100;
 
   const hasStrongStartSignal = (stock: Stock) => stock.bigCandlePct >= 5;
   const hasValidMa5 = (stock: Stock) => stock.ma5 > 0;
-  const observationStages: StockStage[] = ["接近买点", "等回踩", "远离不追"];
+  const observationStages: StockStage[] = ["强势确认", "继续观察", "偏高不追", "远离不追", "待买观察"];
   const observationStageForStock = (stock: Stock): StockStage | null => {
-    if (hasStrongStartSignal(stock) && hasValidMa5(stock) && stock.ma5Upward && stock.deviation5 >= 0) {
-      if (stock.deviation5 <= 2) return "接近买点";
-      if (stock.deviation5 <= 7) return "等回踩";
+    if (hasStrongStartSignal(stock) && hasValidMa5(stock) && stock.deviation5 >= 0) {
+      if (stock.deviation5 <= 2) return "待买观察";
+      if (stock.deviation5 <= 5) return "继续观察";
+      if (stock.deviation5 <= 7) return "偏高不追";
       return "远离不追";
     }
     return observationStages.includes(stock.stage) ? stock.stage : null;
   };
   const isObservationStock = (stock: Stock) => observationStageForStock(stock) !== null;
 
-  const stockBelongsToGroup = (stock: Stock, group: StockGroup) => {
+  const stockBelongsToGroup = (stock: Stock, group: StockViewGroup) => {
     if (group === "初筛") return true;
     if (group === "持仓") {
-      return positions.some(pos => pos.code === stock.code) || stock.group === "持仓";
+      return positions.some(pos => pos.code === stock.code);
     }
     if (group === "待买") {
       return Boolean(stock.canBuy);
@@ -849,11 +1184,11 @@ export default function App() {
     return false;
   };
 
-  const stocksForGroup = (list: Stock[], group: StockGroup) => (
+  const stocksForGroup = (list: Stock[], group: StockViewGroup) => (
     list.filter(stock => stockBelongsToGroup(stock, group))
   );
 
-  const firstStockForGroup = (list: Stock[], group: StockGroup) => (
+  const firstStockForGroup = (list: Stock[], group: StockViewGroup) => (
     stocksForGroup(list, group)[0] || list[0]
   );
 
@@ -867,6 +1202,144 @@ export default function App() {
     }
     return true;
   });
+  const poolMeta = watchlist.find(s => s.poolBatchId || s.poolGeneratedAt || s.poolSource);
+  const changeTotal = turnoverChanges
+    ? turnoverChanges.newEntries.length + turnoverChanges.dropped.length + turnoverChanges.rankUp.length + turnoverChanges.rankDown.length
+    : 0;
+  const renderTurnoverList = (
+    title: string,
+    items: NonNullable<typeof turnoverChanges>["newEntries"],
+    tone: "cyan" | "amber" | "emerald" | "rose"
+  ) => {
+    const toneClass = {
+      cyan: "border-cyan-500/20 text-cyan-300",
+      amber: "border-amber-500/20 text-amber-300",
+      emerald: "border-emerald-500/20 text-emerald-300",
+      rose: "border-rose-500/20 text-rose-300"
+    }[tone];
+    return (
+      <div className={`border ${toneClass} bg-slate-950/50 rounded p-2 min-h-[72px]`}>
+        <div className="text-[10px] font-bold mb-1">{title} {items.length}</div>
+        {items.length === 0 ? (
+          <div className="text-[10px] text-slate-600">暂无</div>
+        ) : (
+          <div className="space-y-1">
+            {items.slice(0, 5).map(item => (
+              <div key={`${title}-${item.code}`} className="flex items-center justify-between gap-2 text-[10px] text-slate-400">
+                <span className="truncate">{item.name} <span className="font-mono text-slate-500">{item.code}</span></span>
+                <div className="flex items-center gap-1 shrink-0">
+                  <span className="font-mono text-slate-300 whitespace-nowrap">
+                    {item.oldRank && item.newRank ? `${item.oldRank}->${item.newRank}` : `#${item.rank || "-"}`}
+                  </span>
+                  {title === "新进" && (
+                    <button
+                      onClick={() => void handleIncludeTurnoverStock(item)}
+                      className="px-1.5 py-0.5 bg-cyan-950 hover:bg-cyan-900 text-cyan-300 border border-cyan-500/20 rounded"
+                    >
+                      纳入
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {items.length > 5 && <div className="text-[10px] text-slate-600">+{items.length - 5} 只</div>}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderPositionSellCard = (position: Position) => {
+    const plan = buildPositionSellPlan(position);
+    const priceClass = position.floatingPnL >= 0 ? "text-rose-400" : "text-emerald-400";
+
+    return (
+      <div key={position.code} className={`border rounded-lg p-4 space-y-3 ${plan.cardClass}`}>
+        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 border-b border-slate-800/40 pb-2.5">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className={`h-2.5 w-2.5 rounded-full ${plan.dotClass}`}></span>
+              <span className="font-mono text-xs font-bold text-slate-100">
+                {position.name} ({position.code})
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-400 font-mono">
+              <span>{position.buyDate || "买入日期待补"}</span>
+              <span>{holdingTimeLabel(position)}</span>
+              <span>可卖 {position.availableQuantity} 股</span>
+            </div>
+          </div>
+          <span className={`text-[10px] font-extrabold tracking-widest px-2.5 py-1 rounded ${plan.badgeClass}`}>
+            {plan.statusLabel}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 text-center text-[10px] font-mono">
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
+            <span className="text-slate-500 block mb-0.5">当前持股</span>
+            <span className="font-bold text-slate-100">{position.quantity} 股</span>
+          </div>
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
+            <span className="text-slate-500 block mb-0.5">持仓均价</span>
+            <span className="font-bold text-slate-100">¥{position.avgCost.toFixed(2)}</span>
+          </div>
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
+            <span className="text-slate-500 block mb-0.5">实时现价</span>
+            <span className="font-bold text-slate-100">¥{position.currentPrice.toFixed(2)}</span>
+          </div>
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
+            <span className="text-slate-500 block mb-0.5">MA5 / 偏离</span>
+            <span className={`font-bold ${position.deviation5 < 0 ? "text-emerald-400" : "text-rose-400"}`}>
+              ¥{position.ma5.toFixed(2)} / {signedPercent(position.deviation5)}
+            </span>
+          </div>
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2 col-span-2 lg:col-span-1">
+            <span className="text-slate-500 block mb-0.5">浮动盈亏</span>
+            <span className={`font-bold ${priceClass}`}>
+              {position.floatingPnL >= 0 ? "+" : ""}{position.floatingPnL.toFixed(2)} ({signedPercent(position.floatingPnLPct)})
+            </span>
+          </div>
+        </div>
+
+        <div className="bg-slate-950/30 border border-slate-800/40 rounded p-3 space-y-1.5">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-xs font-extrabold text-slate-100">{plan.title}</span>
+            <span className="text-[10px] text-slate-500 font-mono shrink-0">
+              跌破MA5 {Math.max(0, Math.floor(Number(position.belowMa5Days) || 0))} 天
+            </span>
+          </div>
+          <p className="text-xs leading-relaxed text-slate-300">{plan.primaryAction}</p>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 text-[11px] leading-relaxed">
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2.5">
+            <span className="text-cyan-300 font-bold block mb-1">1. 次日不强就走</span>
+            <span className="text-slate-400">{plan.nextMorningRule}</span>
+          </div>
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2.5">
+            <span className="text-amber-300 font-bold block mb-1">2. 远离5日线止盈</span>
+            <span className="text-slate-400">{plan.takeProfitRule}</span>
+          </div>
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2.5">
+            <span className="text-rose-300 font-bold block mb-1">3. 跌破5日线风控</span>
+            <span className="text-slate-400">{plan.ma5RiskRule}</span>
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-t border-slate-800/40 pt-2.5">
+          <span className="text-[10px] text-slate-500">
+            系统提醒：{position.advice || plan.sizingRule}
+          </span>
+          <button
+            onClick={() => openSellModal(position)}
+            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded transition shadow shrink-0"
+          >
+            {plan.buttonLabel}
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col font-sans selection:bg-blue-500/20 selection:text-blue-200">
@@ -1054,11 +1527,12 @@ export default function App() {
                     <span>生成今日初筛池</span>
                   </button>
                   <button
-                    onClick={handleRefreshQuotes}
-                    className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center space-x-1.5 transition"
+                    onClick={() => void handleRefreshQuotes("manual")}
+                    disabled={quoteRefreshing}
+                    className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center space-x-1.5 transition"
                   >
-                    <RefreshCw className="h-3.5 w-3.5" />
-                    <span>盘中轻量刷新</span>
+                    <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
+                    <span>{quoteRefreshing ? "刷新中..." : "盘中轻量刷新"}</span>
                   </button>
                 </div>
               </div>
@@ -1110,7 +1584,7 @@ export default function App() {
                     <span className="text-2xl font-bold text-slate-100">{stocksForGroup(watchlist, "观察").length}</span>
                     <span className="text-[10px] text-slate-400 font-medium">等待回踩</span>
                   </div>
-                  <p className="text-[10px] text-slate-500 mt-2">只含接近买点、等回踩、远离不追</p>
+                  <p className="text-[10px] text-slate-500 mt-2">含待买观察、继续观察、偏高不追、远离不追</p>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm border-l-cyan-500 border-l-4">
                   <span className="text-[10px] text-cyan-400 font-bold uppercase block tracking-wider">待买观察</span>
@@ -1188,85 +1662,22 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 持仓风控与交易铁律操作指南卡 */}
+              {/* 持仓卖点与交易铁律操作指南卡 */}
               <div className="space-y-3">
                 <div className="flex items-center space-x-2">
                   <ShieldAlert className="h-4 w-4 text-cyan-400" />
                   <h3 className="text-xs font-extrabold text-slate-200 uppercase tracking-wider">
-                    当前持仓风控监控与操作建议
+                    当前持仓卖点监控与操作计划
                   </h3>
                 </div>
 
                 {positions.length === 0 ? (
-                  <div className="bg-slate-900/40 border border-slate-800 rounded-xl p-4 text-center text-xs text-slate-500 italic">
-                    💡 当前账户暂无任何持仓。符合回踩 5 日均线的主板强势股启动后，可在「股票池」录入买入流水建仓。
+                  <div className="bg-slate-900/40 border border-slate-800 rounded-lg p-4 text-center text-xs text-slate-500 italic">
+                    当前账户暂无持仓。买入流水录入后，这里会按次日强度、远离MA5止盈、跌破MA5风控三层规则生成卖点计划。
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 gap-4">
-                    {positions.map(p => {
-                      const isDanger = p.riskLevel === "danger";
-                      const isWarning = p.riskLevel === "warning";
-                      const deviation = p.deviation5;
-
-                      let bgClass = "bg-slate-900/60 border-slate-800 text-slate-200";
-                      let titleLabel = "趋势观察中";
-                      let adviceText = "股价运行于 5 日线（MA5）上方且未过度发散，运行良好，请继续坚守纪律持有。";
-
-                      if (isDanger) {
-                        bgClass = "bg-rose-950/40 border-rose-900/80 text-rose-200 animate-pulse";
-                        titleLabel = "破位风控警告！";
-                        adviceText = `股价已跌破 5日均线（MA5: ¥${p.ma5.toFixed(2)}，偏离度: ${deviation}%）！根据超短线铁律：今日尾盘 14:50 仍无法收回，请于 14:55 前坚决减仓或卖出！若跌破后连续 3 天站不回，无条件全部清仓！`;
-                      } else if (isWarning) {
-                        bgClass = "bg-amber-950/40 border-amber-900/60 text-amber-200";
-                        titleLabel = "远离均线止盈！";
-                        adviceText = `股价偏离 5日均线过高（偏离度: ${deviation}% > 7%）！超短线获利丰厚，极易冲高回落。若持股为100股：要么持有、要么全卖；若持股在200股以上：可先考虑获利减仓一半止盈，落袋为安。`;
-                      } else if (deviation >= 0 && deviation <= 2.0) {
-                        bgClass = "bg-emerald-950/30 border-emerald-900/60 text-emerald-200";
-                        titleLabel = "均线低吸金区";
-                        adviceText = `当前正好运行于 5日线金区上方贴边运行（偏离度: ${deviation}%）。均线支撑保持向上，是最具盈亏比的健康持仓状态，请暂维持不动。`;
-                      }
-
-                      return (
-                        <div key={p.code} className={`border rounded-xl p-4 space-y-3 ${bgClass}`}>
-                          <div className="flex items-center justify-between border-b border-slate-800/40 pb-2">
-                            <div className="flex items-center space-x-2">
-                              <span className={`h-2.5 w-2.5 rounded-full ${isDanger ? "bg-rose-500" : isWarning ? "bg-amber-500" : "bg-emerald-500"}`}></span>
-                              <span className="font-mono text-xs font-bold text-slate-200">
-                                {p.name} ({p.code})
-                              </span>
-                            </div>
-                            <span className="text-[10px] font-extrabold uppercase tracking-widest px-2.5 py-0.5 rounded bg-slate-950/40 text-slate-200">
-                              {titleLabel}
-                            </span>
-                          </div>
-
-                          <div className="grid grid-cols-3 gap-2 text-center text-[10px] font-mono py-1.5 bg-slate-950/30 rounded border border-slate-850/40">
-                            <div>
-                              <span className="text-slate-400 block text-[9px] mb-0.5">当前持股</span>
-                              <span className="font-bold text-slate-200">{p.quantity} 股</span>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[9px] mb-0.5">持仓均价</span>
-                              <span className="font-bold text-slate-200">¥{p.avgCost.toFixed(2)}</span>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[9px] mb-0.5">当前现价</span>
-                              <span className="font-bold text-slate-100 font-extrabold">¥{p.currentPrice.toFixed(2)}</span>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center justify-between text-[11px] font-mono">
-                            <span className="text-slate-400">5 日均线: <b className="text-slate-200">¥{p.ma5.toFixed(2)}</b></span>
-                            <span className="text-slate-400">5日偏离率: <b className={deviation < 0 ? "text-emerald-400" : "text-rose-400"}>{deviation}%</b></span>
-                          </div>
-
-                          <div className="text-xs leading-relaxed border-t border-slate-800/40 pt-2 text-slate-300">
-                            <span className="font-extrabold text-slate-100 block mb-0.5">防守/风控策略:</span>
-                            {adviceText}
-                          </div>
-                        </div>
-                      );
-                    })}
+                    {positions.map(p => renderPositionSellCard(p))}
                   </div>
                 )}
               </div>
@@ -1323,7 +1734,7 @@ export default function App() {
                       <div className="space-y-1">
                         <h4 className="text-xs font-extrabold text-slate-200">距 MA5 0% ~ 2% 黄金低吸金区</h4>
                         <p className="text-[11px] text-slate-400 leading-normal">
-                          股价调整回踩至 <b>0%~2%</b> 为接近买点；<b>2%~7%</b> 等回踩；<b>&gt;7%</b> 远离不追；<b>&lt;0%</b> 跌破MA5，不进入观察池。
+                          股价调整回踩至 <b>0%~2%</b> 为待买观察；<b>2%~5%</b> 继续观察；<b>5%~7%</b> 偏高不追；<b>&gt;7%</b> 远离不追；<b>&lt;0%</b> 跌破MA5，不进入待买。
                         </p>
                       </div>
                     </div>
@@ -1419,7 +1830,22 @@ export default function App() {
                     onClick={handleGenerateStockPool}
                     className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded text-xs font-semibold transition"
                   >
-                    自动筛选并覆盖前30
+                    生成今日初筛池
+                  </button>
+                  <button
+                    onClick={() => void handleRefreshQuotes("manual")}
+                    disabled={quoteRefreshing}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:bg-slate-800 disabled:text-slate-500 text-slate-300 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
+                    <span>刷新当前池行情</span>
+                  </button>
+                  <button
+                    onClick={handleScanTurnoverChanges}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition"
+                  >
+                    <AlertCircle className="h-3.5 w-3.5 text-amber-300" />
+                    <span>扫描新进前30</span>
                   </button>
                   <button
                     onClick={() => handleFetchHistory(undefined, true)}
@@ -1432,7 +1858,7 @@ export default function App() {
                     className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition"
                   >
                     <FileSpreadsheet className="h-3.5 w-3.5" />
-                    <span>上传同花顺覆盖</span>
+                    <span>上传同花顺初筛池</span>
                   </button>
                 </div>
 
@@ -1489,6 +1915,52 @@ export default function App() {
                   </div>
                 </div>
               )}
+
+              <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_2fr] gap-3">
+                <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs font-bold text-slate-300">今日初筛池</span>
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${poolMeta?.isPoolLocked ? "bg-cyan-950 text-cyan-300 border border-cyan-500/20" : "bg-slate-800 text-slate-500"}`}>
+                      {poolMeta?.isPoolLocked ? "已锁池" : "未锁池"}
+                    </span>
+                  </div>
+                  <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+                    <div>
+                      <span className="text-slate-600 block">批次</span>
+                      <span className="text-slate-300 font-mono break-all">{poolMeta?.poolBatchId || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">来源</span>
+                      <span className="text-slate-300">{poolMeta?.poolSource || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">生成时间</span>
+                      <span className="text-slate-300 font-mono">{poolMeta?.poolGeneratedAt || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">钉住</span>
+                      <span className="text-slate-300 font-mono">{watchlist.filter(s => s.isPinned).length} / {watchlist.length}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg">
+                  <div className="flex items-center justify-between gap-3 mb-2">
+                    <span className="text-xs font-bold text-slate-300">成交额前30变动提醒</span>
+                    <span className="text-[10px] text-slate-500 font-mono">{turnoverChanges ? `${changeTotal} 条` : "未扫描"}</span>
+                  </div>
+                  {turnoverChanges ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
+                      {renderTurnoverList("新进", turnoverChanges.newEntries, "cyan")}
+                      {renderTurnoverList("跌出", turnoverChanges.dropped, "amber")}
+                      {renderTurnoverList("上升", turnoverChanges.rankUp, "emerald")}
+                      {renderTurnoverList("下降", turnoverChanges.rankDown, "rose")}
+                    </div>
+                  ) : (
+                    <div className="text-[10px] text-slate-500">点击「扫描新进前30」后显示。</div>
+                  )}
+                </div>
+              </div>
 
               {/* 分组 TAB 与表格视口 */}
               <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
@@ -1555,7 +2027,11 @@ export default function App() {
                               >
                                 <td className="p-3 font-mono">
                                   <div className="font-semibold text-slate-200">{s.name}</div>
-                                  <div className="text-[10px] text-slate-500">{s.code}</div>
+                                  <div className="text-[10px] text-slate-500">
+                                    {s.code}
+                                    <span className="ml-1">锁池#{s.poolRankAtGeneration || s.rank || "-"}</span>
+                                    {s.isPinned && <span className="ml-1 text-cyan-400">钉住</span>}
+                                  </div>
                                 </td>
                                 <td className="p-3 text-right font-mono font-semibold text-slate-300">
                                   {s.price > 0 ? s.price.toFixed(2) : "未同步"}
@@ -1574,8 +2050,9 @@ export default function App() {
                                 </td>
                                 <td className="p-3">
                                   <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${
-                                    displayStage === "待买观察" || displayStage === "接近买点" ? "bg-cyan-950 text-cyan-400 border border-cyan-500/20" :
-                                    displayStage === "等回踩" ? "bg-amber-950 text-amber-400 border border-amber-500/20" :
+                                    displayStage === "待买观察" ? "bg-cyan-950 text-cyan-400 border border-cyan-500/20" :
+                                    displayStage === "继续观察" ? "bg-amber-950 text-amber-400 border border-amber-500/20" :
+                                    displayStage === "偏高不追" ? "bg-orange-950 text-orange-300 border border-orange-500/20" :
                                     displayStage === "远离不追" ? "bg-rose-950 text-rose-400 border border-rose-500/20" :
                                     "bg-slate-800 text-slate-400"
                                   }`}>
@@ -1632,7 +2109,10 @@ export default function App() {
                       <div className="flex items-center justify-between border-b border-slate-800 pb-2">
                         <div>
                           <h3 className="text-sm font-bold text-slate-200">{selectedStock.name}</h3>
-                          <span className="text-[10px] text-slate-500 font-mono">{selectedStock.code} | {isMainBoard(selectedStock.code) ? "主板" : "非主板"}</span>
+                          <span className="text-[10px] text-slate-500 font-mono">
+                            {selectedStock.code} | {isMainBoard(selectedStock.code) ? "主板" : "非主板"} | 锁池#{selectedStock.poolRankAtGeneration || selectedStock.rank || "-"}
+                            {selectedStock.isPinned ? " | 钉住" : ""}
+                          </span>
                         </div>
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${selectedStock.ma5Upward ? "bg-rose-950 text-rose-400 border border-rose-500/20" : "bg-slate-950 text-slate-500"}`}>
                           {selectedStock.ma5Upward ? "MA5 向上 ↗" : "MA5参考"}
@@ -1727,11 +2207,12 @@ export default function App() {
                     <h3 className="text-sm font-bold text-slate-200">盘中强回踩低吸监控</h3>
                   </div>
                   <button
-                    onClick={handleRefreshQuotes}
-                    className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded text-xs font-semibold shadow-md flex items-center space-x-1.5 transition"
+                    onClick={() => void handleRefreshQuotes("manual")}
+                    disabled={quoteRefreshing}
+                    className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-cyan-700 disabled:opacity-75 disabled:cursor-not-allowed text-white rounded text-xs font-semibold shadow-md flex items-center space-x-1.5 transition"
                   >
-                    <RefreshCw className="h-3.5 w-3.5 animate-spin-hover" />
-                    <span>立刻刷新行情</span>
+                    <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : "animate-spin-hover"}`} />
+                    <span>{quoteRefreshing ? "刷新中..." : "立刻刷新行情"}</span>
                   </button>
                 </div>
 
@@ -1747,8 +2228,13 @@ export default function App() {
                     <span className="text-xs font-mono text-slate-300 mt-1 block">已启用主力成交量筛选约束</span>
                   </div>
                   <div className="p-3 bg-slate-950/60 border border-slate-850 rounded-lg">
-                    <span className="text-[10px] text-slate-500 font-bold block">极简盘中刷新</span>
-                    <span className="text-xs text-slate-300 mt-1 block">盘中仅轻量加载价格，保护内存</span>
+                    <span className="text-[10px] text-slate-500 font-bold block">30秒自动刷新</span>
+                    <span className="text-xs text-slate-300 mt-1 block">
+                      {quoteRefreshing ? "正在刷新行情..." : `${quoteRefreshCountdown}s 后自动刷新`}
+                    </span>
+                    <span className="text-[10px] text-slate-500 mt-1 block">
+                      上次本页刷新 {lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : "未触发"}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -1757,7 +2243,7 @@ export default function App() {
               <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-4">
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
                   <CheckCircle2 className="h-4 w-4 text-cyan-400" />
-                  <h3 className="text-xs font-bold uppercase text-slate-200 tracking-wider">待买观察候选 (接近买点: 5日线偏离度 0% ~ 2%)</h3>
+                  <h3 className="text-xs font-bold uppercase text-slate-200 tracking-wider">待买观察候选 (5日线偏离度 0% ~ 2%)</h3>
                 </div>
 
                 <div className="grid grid-cols-1 gap-4">
@@ -1785,34 +2271,20 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 持仓风险监控 */}
+              {/* 持仓实时卖点监控 */}
               <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-4">
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
-                  <XCircle className="h-4 w-4 text-rose-500" />
-                  <h3 className="text-xs font-bold uppercase text-slate-200 tracking-wider">持仓破位报警区 (现价跌破 5 日线)</h3>
+                  <Briefcase className="h-4 w-4 text-cyan-400" />
+                  <h3 className="text-xs font-bold uppercase text-slate-200 tracking-wider">持仓实时监控 (卖点纪律)</h3>
                 </div>
 
                 <div className="space-y-3">
-                  {positions.filter(p => p.riskLevel === "danger").length === 0 ? (
+                  {positions.length === 0 ? (
                     <div className="p-8 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40 text-xs">
-                      完美！当前全部持仓股票均稳在 5 日线（MA5）上方。趋势强健。
+                      当前暂无持仓。买入流水录入后，这里会同步显示实时价格、MA5偏离、持仓时间和卖点计划。
                     </div>
                   ) : (
-                    positions.filter(p => p.riskLevel === "danger").map(p => (
-                      <div key={p.code} className="p-4 bg-rose-950/20 border border-rose-900 hover:border-rose-850 rounded-lg flex items-center justify-between transition">
-                        <div className="space-y-1">
-                          <span className="text-xs font-bold text-rose-400">{p.name} <span className="font-mono text-rose-500 font-normal">{p.code}</span></span>
-                          <p className="text-[11px] text-rose-300 font-semibold">5日均线: {p.ma5} | 当前现价: {p.currentPrice} (偏离度: {p.deviation5}%)</p>
-                          <p className="text-xs text-rose-400">🚨 指令违规警告：股价已宣告跌破5日生命线！建议毫不留情，果断按纪律执行止损卖出！</p>
-                        </div>
-                        <button
-                          onClick={() => openSellModal(p)}
-                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded transition shadow shrink-0 ml-4"
-                        >
-                          卖出止损归档
-                        </button>
-                      </div>
-                    ))
+                    positions.map(p => renderPositionSellCard(p))
                   )}
                 </div>
               </div>
@@ -2006,13 +2478,13 @@ export default function App() {
                     </div>
 
                     <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg">
-                      <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">今日实现净损益</span>
+                      <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">今日已实现盈亏</span>
                       <span className={`text-xl font-bold font-mono block mt-1 ${
-                        todayTrades?.reduce((acc: number, t: any) => acc + (t.type === "SELL" ? (t.amount - t.totalFee) : -(t.amount + t.totalFee)), 0) >= 0 
+                        todayRealizedPnL >= 0 
                           ? "text-rose-400" 
                           : "text-emerald-400"
                       }`}>
-                        {(todayTrades?.reduce((acc: number, t: any) => acc + (t.type === "SELL" ? (t.amount - t.totalFee) : -(t.amount + t.totalFee)), 0) || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })} 元
+                        {todayRealizedPnL >= 0 ? "+" : ""}{todayRealizedPnL.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 元
                       </span>
                     </div>
                   </div>

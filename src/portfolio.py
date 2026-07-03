@@ -22,6 +22,7 @@ POSITION_COLUMNS = [
     "MA5",
     "MA5偏离率%",
     "持仓天数",
+    "跌破MA5天数",
     "操作提醒",
     "买入日期",
 ]
@@ -238,6 +239,9 @@ def build_positions_from_trades(
         floating_pnl = (current_price - avg_cost) * qty
         floating_pct = floating_pnl / (avg_cost * qty) * 100 if avg_cost and qty else 0
         deviation = ma5_deviation(current_price, ma5)
+        below_ma5_days = int(number_or(context.get("跌破MA5天数"), 0))
+        if deviation is not None:
+            below_ma5_days = max(1, below_ma5_days) if deviation < 0 else 0
         buy_date = date_or_today(state.get("买入日期"))
         rows.append({
             "代码": code,
@@ -252,7 +256,8 @@ def build_positions_from_trades(
             "MA5": ma5,
             "MA5偏离率%": deviation,
             "持仓天数": max(0, int((today - buy_date.normalize()).days)),
-            "操作提醒": holding_advice(current_price, ma5, qty, 0),
+            "跌破MA5天数": below_ma5_days,
+            "操作提醒": holding_advice(current_price, ma5, qty, below_ma5_days),
             "买入日期": buy_date.date().isoformat(),
         })
     return pd.DataFrame(rows, columns=POSITION_COLUMNS)
@@ -315,7 +320,7 @@ def portfolio_to_legacy_holdings(positions: pd.DataFrame) -> pd.DataFrame:
         "数量": positions["数量"],
         "当前价": positions["当前价"],
         "MA5": positions["MA5"],
-        "跌破MA5天数": 0,
+        "跌破MA5天数": positions["跌破MA5天数"] if "跌破MA5天数" in positions else 0,
         "备注": "由交易记录自动生成",
     })
     return out[HOLDING_COLUMNS]

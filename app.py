@@ -14,6 +14,7 @@ from src.data import (
     HOLDING_COLUMNS,
     TRADE_COLUMNS,
     WATCHLIST_COLUMNS,
+    assign_pool_batch,
     ensure_data_dir,
     load_holdings,
     load_trades,
@@ -45,6 +46,7 @@ from src.rules import (
     evaluate_stock,
     holding_advice,
     ma5_deviation,
+    normalize_stage,
     screening_result,
     stage_to_group,
 )
@@ -296,7 +298,7 @@ def render_trading_mode_panel(available_cash_value: float) -> None:
             <div class="mode-item">
               <span>买点区间</span>
               <b>距 MA5 0%-2%</b>
-              <small>0%-2%接近买点，2%-7%等回踩，>7%远离不追，<0%风险排除。</small>
+              <small>0%-2%待买观察，2%-5%继续观察，5%-7%偏高不追，>7%远离不追，<0%跌破MA5。</small>
             </div>
             <div class="mode-item">
               <span>买入时间</span>
@@ -520,7 +522,7 @@ def audit_trades_against_rules(trades: pd.DataFrame) -> pd.DataFrame:
                 elif float(deviation) < 0:
                     issues.append("买入价低于MA5，属于跌破后买入")
                 elif float(deviation) > 2:
-                    issues.append("买入价距离MA5超过2%，没有等回踩")
+                    issues.append("买入价距离MA5超过2%，未到待买区")
                 else:
                     basis.append("回踩MA5 0%-2%区间")
             if saved_conclusion:
@@ -836,7 +838,6 @@ def count_risk_positions(positions: pd.DataFrame) -> int:
 def observation_result(row: pd.Series) -> tuple[bool, str]:
     has_history = pd.notna(row.get("MA5"))
     has_big_line = number_or(row.get("最近大阳线%"), 0) >= 5
-    ma5_up = is_truthy(row.get("MA5向上"))
     deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
     passed, reason = screening_result(str(row.get("代码", "")), str(row.get("名称", "")))
     if not passed:
@@ -845,8 +846,6 @@ def observation_result(row: pd.Series) -> tuple[bool, str]:
         return False, "缺少历史K线，待补充"
     if not has_big_line:
         return False, "缺少5%阳线启动信号"
-    if not ma5_up:
-        return False, "MA5未向上"
     if deviation is None:
         return False, "无法计算MA5偏离率"
     if deviation < 0:
@@ -856,16 +855,13 @@ def observation_result(row: pd.Series) -> tuple[bool, str]:
 
 def capital_result(row: pd.Series) -> tuple[bool, str]:
     deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
-    ma5_up = is_truthy(row.get("MA5向上"))
-    if not ma5_up:
-        return False, "MA5未向上"
     if deviation is None:
         return False, "无法计算MA5偏离率"
     if deviation < 0:
         return False, "当前价在MA5下方"
     if deviation > 2:
         return False, "等待回踩到MA5 0%-2%"
-    return True, "接近买点，盘中手动确认"
+    return True, "待买观察，盘中手动确认"
 
 
 def build_pipeline(df: pd.DataFrame) -> pd.DataFrame:
@@ -884,6 +880,9 @@ def build_pipeline(df: pd.DataFrame) -> pd.DataFrame:
         out.loc[index, "筛选原因"] = result["reason"]
         if result["reminder"]:
             out.loc[index, "提醒"] = result["reminder"]
+        was_pinned = str(row.get("is_pinned", "")).strip().lower() in {"true", "1", "是", "yes", "y"}
+        if was_pinned or result["group"] in {"观察", "待买", "持仓"}:
+            out.loc[index, "is_pinned"] = True
         out.loc[index, "观察通过"] = result["group"] in {"观察", "待买"}
         out.loc[index, "待买通过"] = bool(result["can_buy"])
 
@@ -892,20 +891,22 @@ def build_pipeline(df: pd.DataFrame) -> pd.DataFrame:
 
 def pipeline_views(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     source = df.copy()
-    if "分组" not in source:
-        source["分组"] = source["流程阶段"].map(stage_to_group)
+    if "流程阶段" not in source:
+        source["流程阶段"] = source.get("状态", "初筛通过")
+    source["流程阶段"] = source["流程阶段"].map(normalize_stage)
+    source["分组"] = source["流程阶段"].map(stage_to_group)
     views = {stage: source[source["流程阶段"] == stage].copy() for stage in PIPELINE_STAGES}
     stage_text = source.get("流程阶段", pd.Series("", index=source.index)).fillna("").astype(str)
-    observe_mask = stage_text.isin(OBSERVATION_STAGES)
+    observe_mask = stage_text.isin(OBSERVATION_STAGES | {"待买观察"})
     volume_break = source.get("放量跌破MA5", pd.Series(False, index=source.index)).map(is_truthy)
-    buy_mask = stage_text.eq("接近买点") & ~volume_break
+    buy_mask = stage_text.eq("待买观察") & ~volume_break
     views["初筛"] = source.copy()
     views["观察"] = source[observe_mask].copy()
     views["持仓"] = source[source["分组"] == "持仓"].copy()
     views["待买"] = source[buy_mask].copy()
     views["待买观察"] = views["待买"].copy()
     views["观察未待买"] = source[observe_mask & ~buy_mask].copy()
-    views["未达规则"] = source[stage_text.isin(["未达规则", "风险排除", "淘汰"])].copy()
+    views["未达规则"] = source[stage_text.isin(["未达规则", "风险排除", "跌破MA5", "淘汰"])].copy()
     views["淘汰分组"] = source[source["分组"] == "淘汰"].copy()
     return views
 
@@ -923,6 +924,7 @@ def prepare_current_stock_batch(
     incoming: pd.DataFrame,
     existing: pd.DataFrame | None = None,
     limit: int = 30,
+    source: str = "手动生成",
 ) -> pd.DataFrame:
     """Use the latest import/generation as the current time batch, not an accumulation."""
     batch = incoming.copy()
@@ -958,6 +960,8 @@ def prepare_current_stock_batch(
     batch["状态"] = "初筛通过"
     batch["流程阶段"] = "初筛通过"
     batch["分组"] = "初筛"
+    batch["is_pinned"] = False
+    batch = assign_pool_batch(batch, source)
     return batch[WATCHLIST_COLUMNS].reset_index(drop=True)
 
 
@@ -1026,6 +1030,7 @@ def _run_analysis(uploaded, incoming: pd.DataFrame, fetch_missing: bool = False)
         incoming,
         existing=st.session_state.watchlist,
         limit=30,
+        source=f"数据导入:{uploaded.name}",
     )
     if merged.empty:
         st.error("当前批次没有识别到有效股票代码。")
@@ -1063,6 +1068,57 @@ def _run_analysis(uploaded, incoming: pd.DataFrame, fetch_missing: bool = False)
         f"分析完成。初筛 {len(summary['初筛'])}，观察 {len(summary['观察'])}，"
         f"待买观察 {len(summary['待买'])}，未达规则 {len(summary['未达规则'])}。"
     )
+
+
+def scan_turnover_changes_for_watchlist(current: pd.DataFrame, limit: int = 30) -> dict[str, object]:
+    live_pool = fetch_auto_stock_pool(limit, source="自动切换")
+    if live_pool.empty:
+        return {
+            "success": False,
+            "message": live_pool.attrs.get("message", "行情源未返回实时成交额前30"),
+            "new": pd.DataFrame(),
+            "dropped": pd.DataFrame(),
+            "rank_changed": pd.DataFrame(),
+        }
+
+    current_codes = set(current.get("代码", pd.Series(dtype=str)).dropna().astype(str).map(_data.clean_code))
+    live_codes = set(live_pool.get("代码", pd.Series(dtype=str)).dropna().astype(str).map(_data.clean_code))
+    current_rank_source = current.get("pool_rank_at_generation", current.get("成交额排名", pd.Series(dtype=object)))
+    current_rank = {
+        _data.clean_code(code): pd.to_numeric(rank, errors="coerce")
+        for code, rank in zip(current.get("代码", pd.Series(dtype=str)), current_rank_source)
+    }
+    live_rank = {
+        _data.clean_code(row.get("代码")): pd.to_numeric(row.get("成交额排名"), errors="coerce")
+        for _, row in live_pool.iterrows()
+    }
+
+    live_index = live_pool.assign(代码=live_pool["代码"].map(_data.clean_code)).set_index("代码", drop=False)
+    current_index = current.assign(代码=current["代码"].map(_data.clean_code)).set_index("代码", drop=False) if not current.empty else pd.DataFrame()
+
+    new = live_index.loc[[code for code in live_index.index if code in live_codes - current_codes]].copy()
+    dropped = current_index.loc[[code for code in current_index.index if code in current_codes - live_codes]].copy() if not current_index.empty else pd.DataFrame()
+    changed_rows: list[dict[str, object]] = []
+    for code in sorted(current_codes & live_codes, key=lambda item: live_rank.get(item, 999999)):
+        old_rank = current_rank.get(code)
+        new_rank = live_rank.get(code)
+        if pd.isna(old_rank) or pd.isna(new_rank) or int(old_rank) == int(new_rank):
+            continue
+        changed_rows.append({
+            "代码": code,
+            "名称": live_index.loc[code].get("名称", ""),
+            "生成排名": int(old_rank),
+            "实时排名": int(new_rank),
+            "方向": "上升" if int(new_rank) < int(old_rank) else "下降",
+        })
+
+    return {
+        "success": True,
+        "message": f"扫描完成：新进 {len(new)}，跌出 {len(dropped)}，排名变化 {len(changed_rows)}。当前初筛池未替换。",
+        "new": new.reset_index(drop=True),
+        "dropped": dropped.reset_index(drop=True),
+        "rank_changed": pd.DataFrame(changed_rows),
+    }
 
 
 def _recompute_reminders(
@@ -1123,7 +1179,7 @@ def lookup_trade_context(
                 "当前价": row.get("现价", row.get("当前价", pd.NA)),
                 "MA5": row.get("MA5", pd.NA),
                 "流程阶段": row.get("流程阶段", row.get("状态", "")),
-                "是否待买观察": row.get("流程阶段", row.get("状态", "")) == "接近买点",
+                "是否待买观察": normalize_stage(row.get("流程阶段", row.get("状态", ""))) == "待买观察",
                 "一手金额": row.get("一手金额", pd.NA),
                 "source": "当前股票池",
             })
@@ -1728,9 +1784,9 @@ watchlist = build_pipeline(watchlist)
 held_codes = set(portfolio_positions["代码"].dropna().astype(str)) if not portfolio_positions.empty else set()
 if held_codes and "代码" in watchlist:
     held_mask = watchlist["代码"].astype(str).isin(held_codes)
-    watchlist.loc[held_mask, "分组"] = "持仓"
+    watchlist.loc[held_mask, "is_pinned"] = True
 watchlist_changed = False
-for column in ["状态", "分组", "流程阶段", "筛选原因", "提醒", "规则状态"]:
+for column in ["状态", "分组", "流程阶段", "筛选原因", "提醒", "规则状态", "is_pinned"]:
     if column in watchlist.columns and column in st.session_state.watchlist.columns:
         old_values = st.session_state.watchlist[column].reset_index(drop=True).fillna("")
         new_values = watchlist[column].reset_index(drop=True).fillna("")
@@ -1871,6 +1927,47 @@ elif page == "数据导入":
                 uploaded_auto = InMemoryUpload(auto_name, auto_bytes)
                 _run_analysis(uploaded_auto, standardize_candidates(auto_pool), fetch_missing=auto_fetch_history)
                 st.rerun()
+
+    st.markdown("#### 扫描新进成交额前30")
+    scan_cols = st.columns([1, 3])
+    with scan_cols[0]:
+        if st.button("扫描新进前30", use_container_width=True):
+            with st.spinner("正在扫描实时成交额前30..."):
+                st.session_state.turnover_scan_result = scan_turnover_changes_for_watchlist(st.session_state.watchlist, 30)
+    with scan_cols[1]:
+        result = st.session_state.get("turnover_scan_result")
+        if result:
+            if result.get("success"):
+                st.success(str(result.get("message", "扫描完成")))
+                metric_cols = st.columns(3)
+                metric_cols[0].metric("新进", len(result.get("new", pd.DataFrame())))
+                metric_cols[1].metric("跌出", len(result.get("dropped", pd.DataFrame())))
+                metric_cols[2].metric("排名变化", len(result.get("rank_changed", pd.DataFrame())))
+            else:
+                st.warning(str(result.get("message", "扫描失败")))
+
+    result = st.session_state.get("turnover_scan_result")
+    if result and result.get("success"):
+        tabs = st.tabs(["新进前30", "跌出前30", "排名变化"])
+        with tabs[0]:
+            new_frame = result.get("new", pd.DataFrame())
+            if isinstance(new_frame, pd.DataFrame) and not new_frame.empty:
+                render_table(new_frame[["代码", "名称", "现价", "涨跌幅%", "成交额", "成交额排名"]], 220)
+            else:
+                st.caption("暂无新进。")
+        with tabs[1]:
+            dropped_frame = result.get("dropped", pd.DataFrame())
+            if isinstance(dropped_frame, pd.DataFrame) and not dropped_frame.empty:
+                display_cols = [col for col in ["代码", "名称", "pool_rank_at_generation", "成交额排名", "is_pinned", "流程阶段"] if col in dropped_frame.columns]
+                render_table(dropped_frame[display_cols], 220)
+            else:
+                st.caption("暂无跌出。")
+        with tabs[2]:
+            changed_frame = result.get("rank_changed", pd.DataFrame())
+            if isinstance(changed_frame, pd.DataFrame) and not changed_frame.empty:
+                render_table(changed_frame, 220)
+            else:
+                st.caption("暂无排名变化。")
 
     st.divider()
 
@@ -2037,7 +2134,7 @@ elif page == "数据导入":
 # PAGE: 股票分组
 # ══════════════════════════════════════════════════════════════════
 elif page == "股票分组":
-    page_header("股票分组", "按初筛、观察、待买、持仓四个工作分组盯盘。")
+    page_header("股票分组", "按初筛、观察、待买三组盯盘，持仓单独进入持仓监控。")
 
     search_cols = st.columns([2, 3])
     with search_cols[0]:
@@ -2102,8 +2199,8 @@ elif page == "盘中观察":
         metric_cols = st.columns(5)
         metric_cols[0].metric("待买观察", len(views["待买观察"]))
         metric_cols[1].metric("观察", len(views["观察"]))
-        metric_cols[2].metric("等回踩", len(views["等回踩"]))
-        metric_cols[3].metric("远离不追", len(views["远离不追"]))
+        metric_cols[2].metric("继续观察", len(views["继续观察"]))
+        metric_cols[3].metric("偏高不追", len(views["偏高不追"]))
         metric_cols[4].metric("未达规则", len(views["未达规则"]))
 
         selected_intraday = render_workbench_table(
@@ -2749,7 +2846,7 @@ elif page == "系统设置":
         with col3:
             allow_high = st.checkbox("允许高价股（单手金额>本金）", value=settings.get("allow_high_price", False))
         with col4:
-            allow_unaffordable = st.checkbox("允许资金不足股票入池", value=settings.get("allow_unaffordable_watchlist", False))
+            allow_unaffordable = st.checkbox("资金不足仍显示候选（仅交易时检查现金）", value=settings.get("allow_unaffordable_watchlist", False))
 
         st.divider()
         st.markdown("#### 数据源设置")

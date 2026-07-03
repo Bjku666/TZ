@@ -12,6 +12,7 @@ from src.rules import (
     buy_signal,
     clean_code,
     ma5_deviation,
+    normalize_stage,
     recent_big_candle_pct,
     screening_result,
     stage_to_group,
@@ -33,6 +34,12 @@ WATCHLIST_COLUMNS = [
     "涨跌幅%",
     "成交额",
     "成交额排名",
+    "pool_batch_id",
+    "pool_source",
+    "pool_generated_at",
+    "pool_rank_at_generation",
+    "is_pool_locked",
+    "is_pinned",
     "上市板块",
     "状态",
     "分组",
@@ -140,6 +147,22 @@ REQUIRED_DIRS = [
     DATA_DIR / "runtime",
     DATA_DIR / "backups",
 ]
+
+
+def normalize_watchlist_stage(value: object, default: str = "初筛通过") -> str:
+    """Normalize legacy watchlist stage values to the v3 pipeline vocabulary."""
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text:
+        return default
+    stage = normalize_stage(text)
+    return stage if stage in GROUPS else default
 
 
 def ensure_data_dir() -> None:
@@ -357,16 +380,47 @@ def standardize_candidates(raw: pd.DataFrame) -> pd.DataFrame:
     df["状态"] = "初筛通过"
     df["分组"] = "初筛"
     df["流程阶段"] = "初筛通过"
+    df["pool_rank_at_generation"] = df["成交额排名"]
+    df["is_pool_locked"] = True
+    df["is_pinned"] = False
 
     # Initialize all watchlist columns
     for col in WATCHLIST_COLUMNS:
         if col not in df:
-            if col in {"MA5向上", "放量跌破MA5"}:
+            if col in {"MA5向上", "放量跌破MA5", "is_pool_locked", "is_pinned"}:
                 df[col] = False
             else:
                 df[col] = pd.NA
 
     return df[WATCHLIST_COLUMNS].drop_duplicates("代码", keep="first").reset_index(drop=True)
+
+
+def assign_pool_batch(
+    df: pd.DataFrame,
+    source: str,
+    generated_at: str | None = None,
+    batch_id: str | None = None,
+    locked: bool = True,
+) -> pd.DataFrame:
+    """Stamp a newly generated/imported pool with immutable batch metadata."""
+    out = df.copy()
+    stamp = generated_at or pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
+    safe_source = str(source or "未知来源")
+    if not batch_id:
+        compact_stamp = pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y%m%d_%H%M%S")
+        batch_id = f"{compact_stamp}_{safe_source}"
+    out["pool_batch_id"] = batch_id
+    out["pool_source"] = safe_source
+    out["pool_generated_at"] = stamp
+    rank_source = out["成交额排名"] if "成交额排名" in out else pd.Series([pd.NA] * len(out), index=out.index)
+    out["pool_rank_at_generation"] = pd.to_numeric(
+        rank_source,
+        errors="coerce",
+    ).fillna(pd.Series(range(1, len(out) + 1), index=out.index))
+    out["is_pool_locked"] = locked
+    if "is_pinned" not in out:
+        out["is_pinned"] = False
+    return out
 
 
 def standardize_import_file(content: bytes, filename: str) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -392,34 +446,24 @@ def load_watchlist() -> pd.DataFrame:
         df = empty_frame(WATCHLIST_COLUMNS)
     for column in WATCHLIST_COLUMNS:
         if column not in df:
-            if column in {"MA5向上", "放量跌破MA5"}:
+            if column in {"MA5向上", "放量跌破MA5", "is_pool_locked", "is_pinned"}:
                 df[column] = False
             else:
                 df[column] = pd.NA
     df["代码"] = df["代码"].map(clean_code)
-    stage_aliases = {
-        "初筛": "初筛通过",
-        "观察": "等回踩",
-        "待买": "接近买点",
-        "持仓": "等回踩",
-        "待买观察": "接近买点",
-        "重点观察": "等回踩",
-        "偏高不追": "远离不追",
-        "资金不足观察": "未达规则",
-        "缺少历史K线": "未达规则",
-    }
-    df["状态"] = df["状态"].replace(stage_aliases)
-    df["状态"] = df["状态"].where(df["状态"].isin(GROUPS), "初筛通过")
-    df["流程阶段"] = df["流程阶段"].replace("", pd.NA).fillna(df["状态"]).replace(stage_aliases)
-    df["流程阶段"] = df["流程阶段"].where(df["流程阶段"].isin(GROUPS), df["状态"])
+    status_source = df["状态"].replace("", pd.NA)
+    group_source = df["分组"].replace("", pd.NA)
+    stage_source = df["流程阶段"].replace("", pd.NA).fillna(status_source).fillna(group_source)
+    df["流程阶段"] = stage_source.map(normalize_watchlist_stage)
+    df["状态"] = df["流程阶段"]
     df["分组"] = df["流程阶段"].map(stage_to_group)
     rank = pd.to_numeric(df.get("成交额排名"), errors="coerce")
+    generation_rank = pd.to_numeric(df.get("pool_rank_at_generation"), errors="coerce")
     turnover = pd.to_numeric(df.get("成交额"), errors="coerce")
-    df["_rank_sort"] = rank.fillna(999999)
+    df["_rank_sort"] = generation_rank.fillna(rank).fillna(999999)
     df["_turnover_sort"] = turnover.fillna(-1)
     df = (
         df.sort_values(["_rank_sort", "_turnover_sort"], ascending=[True, False], kind="stable")
-        .head(30)
         .drop(columns=["_rank_sort", "_turnover_sort"])
         .copy()
     )
@@ -431,7 +475,7 @@ def save_watchlist(df: pd.DataFrame) -> None:
     out = df.copy()
     for column in WATCHLIST_COLUMNS:
         if column not in out:
-            if column in {"MA5向上", "放量跌破MA5"}:
+            if column in {"MA5向上", "放量跌破MA5", "is_pool_locked", "is_pinned"}:
                 out[column] = False
             else:
                 out[column] = pd.NA
@@ -484,7 +528,7 @@ def enrich_watchlist(
 
 
 def auto_assign_groups(df: pd.DataFrame) -> pd.DataFrame:
-    from src.rules import can_be_watchlist_candidate, determine_group
+    from src.rules import determine_group
 
     out = df.copy()
     for index, row in out.iterrows():
@@ -494,10 +538,8 @@ def auto_assign_groups(df: pd.DataFrame) -> pd.DataFrame:
         has_big_line = pd.notna(row.get("最近大阳线%")) and float(row.get("最近大阳线%", 0) or 0) >= 5
         ma5_up = pd.notna(row.get("MA5向上", False)) and str(row.get("MA5向上", False)).lower() in {"true", "1", "是"}
         has_history = pd.notna(row.get("MA5"))  # has MA5 means has history
-        affordable = str(row.get("本金是否可买", "")) == "可以买"
-
         new_group = determine_group(
-            code, name, has_history, has_big_line, ma5_up, deviation, affordable,
+            code, name, has_history, has_big_line, ma5_up, deviation, True,
             current_group=str(row.get("状态", "")) if pd.notna(row.get("状态")) else None,
         )
         out.loc[index, "状态"] = new_group

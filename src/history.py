@@ -433,16 +433,15 @@ def compute_reminder_text(info: dict, price: float | None = None) -> str:
     if not has_big_line:
         return "近20日无5%阳线启动信号，不进入观察池"
 
-    if not bool(info.get("MA5向上", False)):
-        return "MA5未向上，不进入观察池"
-
     if deviation is not None:
         if deviation < 0:
-            return "当前价跌破MA5，不进入观察池"
+            return "当前价跌破MA5，不进入待买"
         elif deviation <= 2:
             return "接近5日线，盘中重点观察是否回踩不破。"
+        elif deviation <= 5:
+            return "趋势仍强，等待回踩到MA5附近。"
         elif deviation <= 7:
-            return "趋势仍强，但还没回踩到位，继续等回踩。"
+            return "位置偏高，不追，继续观察。"
         return "远离5日线，不追，等后续回踩。"
 
     return "无法计算MA5偏离率，暂不进入观察池"
@@ -511,11 +510,13 @@ def classify_reminder(reminder_text: str) -> str:
     if "缓存过旧" in reminder_text or "过旧" in reminder_text:
         return "未达规则"
     if "跌破5日线" in reminder_text or "跌破" in reminder_text:
-        return "风险排除"
+        return "跌破MA5"
     if "接近5日线" in reminder_text:
-        return "接近买点"
-    if "等回踩" in reminder_text:
-        return "等回踩"
+        return "待买观察"
+    if "等待回踩" in reminder_text:
+        return "继续观察"
+    if "位置偏高" in reminder_text:
+        return "偏高不追"
     if "远离" in reminder_text:
         return "远离不追"
     if "阳线启动信号" in reminder_text or "MA5未向上" in reminder_text or "无法计算" in reminder_text:
