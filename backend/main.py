@@ -9,7 +9,7 @@ from src.data import ensure_data_dir
 
 APP_NAME = "强势回踩短线交易纪律系统 API"
 APP_VERSION = "0.1.2"
-API_CONTRACT_VERSION = "trade-link-v5"
+API_CONTRACT_VERSION = "trade-link-v6"
 
 
 def create_app() -> FastAPI:

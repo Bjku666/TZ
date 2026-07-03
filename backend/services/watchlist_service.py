@@ -17,8 +17,10 @@ from src.data import (
 from src.history import compute_all_reminders, diagnose_history, fetch_and_cache
 from src.portfolio import account_state_from_trades, build_positions_from_trades
 from src.realtime import (
+    china_now,
     fetch_auto_stock_pool,
     fetch_realtime_quotes,
+    is_a_share_trading_time,
     merge_quotes_into_watchlist,
 )
 from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
@@ -34,6 +36,7 @@ from backend.storage.csv_adapter import (
 from backend.storage import trade_repository
 
 PINNED_GROUPS = {"观察", "待买", "持仓"}
+TRUE_VALUES = {"true", "1", "是", "yes", "y"}
 
 
 def _watchlist_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -69,6 +72,24 @@ def _held_codes(watchlist: pd.DataFrame) -> set[str]:
     except Exception:
         return codes
     return {code for code in codes if code}
+
+
+def _has_current_day_locked_pool(frame: pd.DataFrame, expected_size: int) -> bool:
+    if frame.empty:
+        return False
+    pool = ensure_watchlist_frame(frame)
+    codes = pool["代码"].map(clean_code).astype(bool)
+    locked = pool["is_pool_locked"].astype(str).str.strip().str.lower().isin(TRUE_VALUES)
+    generated_dates = pd.to_datetime(pool["pool_generated_at"], errors="coerce").dt.date
+    current_day_rows = codes & locked & generated_dates.eq(china_now().date())
+    return int(current_day_rows.sum()) >= max(int(expected_size or 1), 1)
+
+
+def _source_failure_message(source_message: object, *, trading_time: bool) -> str:
+    reason = str(source_message or "行情源未返回股票池")
+    if trading_time:
+        return f"当前为交易时间，实时行情源不可用。为避免使用旧数据误判，未重建今日初筛池，已保留当前名单。原因：{reason}"
+    return reason
 
 
 def _account_cash_for_watchlist(frame: pd.DataFrame) -> tuple[float, float]:
@@ -123,9 +144,19 @@ def generate_watchlist() -> dict[str, Any]:
     pool = fetch_auto_stock_pool(limit=limit, source=source)
     if pool.empty:
         cached = load_watchlist()
+        source_message = pool.attrs.get("message", "行情源未返回股票池")
+        trading_time = is_a_share_trading_time()
+        if not trading_time and _has_current_day_locked_pool(cached, limit):
+            cached = recompute_watchlist(cached)
+            return {
+                "success": True,
+                "usedCache": True,
+                "message": f"行情源暂时不可用，已保留今日已锁定初筛池 {len(cached)} 只。原因：{source_message}",
+                "list": _watchlist_api(cached),
+            }
         return {
             "success": False,
-            "message": pool.attrs.get("message", "行情源未返回股票池，保留本地缓存"),
+            "message": _source_failure_message(source_message, trading_time=trading_time),
             "list": _watchlist_api(cached),
         }
 

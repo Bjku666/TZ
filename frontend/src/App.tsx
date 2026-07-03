@@ -2411,68 +2411,84 @@ export default function App() {
     const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
     const canSellToday = Math.max(0, Math.floor(Number(position.availableQuantity) || 0)) > 0;
     const pnlClass = position.floatingPnL >= 0 ? "text-rose-400" : "text-emerald-400";
-    const actionClass = plan.tone === "danger"
-      ? "border-rose-700/60 bg-rose-950/20"
+    const cardToneClass = plan.tone === "danger"
+      ? "border-rose-900/50 border-l-rose-500/80 bg-slate-900/70"
       : plan.tone === "warning"
-        ? "border-amber-700/60 bg-amber-950/20"
-        : "border-emerald-800/50 bg-emerald-950/10";
+        ? "border-amber-900/50 border-l-amber-500/80 bg-slate-900/70"
+        : plan.tone === "neutral"
+          ? "border-slate-800 border-l-slate-600 bg-slate-900/65"
+          : "border-emerald-900/40 border-l-emerald-500/70 bg-slate-900/65";
+    const actionClass = plan.tone === "danger"
+      ? "border-slate-800/70 border-l-rose-500/80 bg-slate-950/25"
+      : plan.tone === "warning"
+        ? "border-slate-800/70 border-l-amber-500/80 bg-slate-950/25"
+        : "border-slate-800/70 border-l-emerald-500/70 bg-slate-950/20";
+    const compactStats = [
+      {
+        label: "现价",
+        value: formatPrice(position.currentPrice),
+        valueClass: "text-slate-100"
+      },
+      {
+        label: "MA5 / 偏离",
+        value: hasMa5 ? `${formatPrice(position.ma5)} / ${formatPercent(position.deviation5)}` : "待补K线",
+        valueClass: position.deviation5 < 0 ? "text-emerald-400" : "text-cyan-300"
+      },
+      {
+        label: "浮盈亏",
+        value: `${signedCurrency(position.floatingPnL)} (${formatPercent(position.floatingPnLPct, true)})`,
+        valueClass: pnlClass
+      },
+      {
+        label: "可卖 / 跌破",
+        value: `${position.availableQuantity}股 / ${Math.max(0, Math.floor(Number(position.belowMa5Days) || 0))}天`,
+        valueClass: "text-slate-100"
+      }
+    ];
 
     return (
-      <div key={position.code} className={`rounded-lg border p-3 ${plan.cardClass}`}>
-        <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(180px,1fr)_1.7fr_auto] lg:items-center">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-[10px] font-black text-slate-300">
-                {index + 1}
-              </span>
-              <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${plan.dotClass}`}></span>
-              <div className="min-w-0">
-                <div className="truncate text-sm font-black text-slate-100">{position.name}</div>
-                <div className="font-mono text-[11px] font-semibold text-slate-400">{position.code} · {holdingTimeLabel(position)}</div>
+      <div key={position.code} className={`rounded-lg border border-l-2 p-2.5 sm:p-3 ${cardToneClass}`}>
+        <div className="grid grid-cols-1 gap-2 xl:grid-cols-[250px_minmax(360px,460px)_minmax(380px,1fr)] xl:items-center xl:gap-3">
+          <div className="flex min-w-0 items-center gap-3 xl:border-r xl:border-slate-800/50 xl:pr-3">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-[10px] font-black text-slate-300">
+              {index + 1}
+            </span>
+            <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${plan.dotClass}`}></span>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-black text-slate-100">{position.name}</div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[11px] font-semibold text-slate-400">
+                <span>{position.code}</span>
+                <span>{holdingTimeLabel(position)}</span>
               </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
-              <span className="block text-[10px] font-bold text-slate-500">现价</span>
-              <span className="font-mono text-sm font-black text-slate-100">{formatPrice(position.currentPrice)}</span>
-            </div>
-            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
-              <span className="block text-[10px] font-bold text-slate-500">MA5/偏离</span>
-              <span className={`font-mono text-sm font-black ${position.deviation5 < 0 ? "text-emerald-400" : "text-cyan-300"}`}>
-                {hasMa5 ? `${formatPrice(position.ma5)} / ${formatPercent(position.deviation5)}` : "待补K线"}
-              </span>
-            </div>
-            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
-              <span className="block text-[10px] font-bold text-slate-500">浮盈亏</span>
-              <span className={`font-mono text-sm font-black ${pnlClass}`}>
-                {signedCurrency(position.floatingPnL)} ({formatPercent(position.floatingPnLPct, true)})
-              </span>
-            </div>
-            <div className="rounded border border-slate-800/60 bg-slate-950/35 px-2.5 py-2">
-              <span className="block text-[10px] font-bold text-slate-500">可卖/跌破</span>
-              <span className="font-mono text-sm font-black text-slate-100">
-                {position.availableQuantity}股 / {Math.max(0, Math.floor(Number(position.belowMa5Days) || 0))}天
-              </span>
-            </div>
+          <div className="grid min-w-0 grid-cols-2 gap-1.5">
+            {compactStats.map(stat => (
+              <div key={stat.label} className="flex min-h-[52px] min-w-0 flex-col justify-center rounded border border-slate-800/55 bg-slate-950/25 px-2.5 py-1.5">
+                <span className="block text-[10px] font-bold text-slate-500">{stat.label}</span>
+                <span className={`mt-0.5 break-words font-mono text-[12px] font-black leading-tight ${stat.valueClass}`}>
+                  {stat.value}
+                </span>
+              </div>
+            ))}
           </div>
 
-          <div className={`rounded border px-3 py-2 ${actionClass}`}>
-            <div className="mb-1 flex items-center justify-between gap-2">
+          <div className={`rounded border border-l-2 px-3 py-2 xl:ml-10 ${actionClass}`}>
+            <div className="mb-1.5 flex items-center justify-between gap-2">
               <span className={`rounded px-2 py-0.5 text-[10px] font-black ${plan.badgeClass}`}>{plan.statusLabel}</span>
+              <button
+                onClick={() => openSellModal(position)}
+                disabled={!canSellToday}
+                className={`shrink-0 rounded px-2.5 py-1 text-[11px] font-black text-white transition ${
+                  canSellToday ? "bg-emerald-600 hover:bg-emerald-500" : "bg-slate-800 text-slate-500 cursor-not-allowed"
+                }`}
+              >
+                {plan.buttonLabel}
+              </button>
             </div>
-            <div className="text-sm font-black text-slate-100">{plan.title}</div>
-            <CardText className="mt-1 line-clamp-2 max-w-xl text-[11px] font-semibold leading-normal text-slate-300">{plan.primaryAction}</CardText>
-            <button
-              onClick={() => openSellModal(position)}
-              disabled={!canSellToday}
-              className={`mt-2 w-full rounded px-3 py-1.5 text-xs font-black text-white transition ${
-                canSellToday ? "bg-emerald-600 hover:bg-emerald-500" : "bg-slate-800 text-slate-500 cursor-not-allowed"
-              }`}
-            >
-              {plan.buttonLabel}
-            </button>
+            <div className="text-sm font-black leading-tight text-slate-50">{plan.title}</div>
+            <CardText className="mt-1 line-clamp-2 text-[11px] font-semibold leading-snug text-slate-300">{plan.primaryAction}</CardText>
           </div>
         </div>
       </div>
@@ -2610,7 +2626,7 @@ export default function App() {
         value: takeProfitWatchLine,
         text: hasMa5 ? lineDistanceLabel(position.currentPrice, takeProfitWatchLine, "target") : "等待MA5",
         active: plan.triggerKey === "take-profit",
-        activeClass: "border-amber-700/70 bg-amber-950/20",
+        activeClass: "border-amber-800/60 border-l-amber-400/80 bg-slate-950/30",
         labelClass: "text-amber-300"
       },
       {
@@ -2619,7 +2635,7 @@ export default function App() {
         value: takeProfitPriorityLine,
         text: hasMa5 ? lineDistanceLabel(position.currentPrice, takeProfitPriorityLine, "target") : "等待MA5",
         active: plan.triggerKey === "take-profit" && position.deviation5 > tradingRules.takeProfit.priorityDeviationPct,
-        activeClass: "border-amber-700/70 bg-amber-950/20",
+        activeClass: "border-amber-800/60 border-l-amber-400/80 bg-slate-950/30",
         labelClass: "text-amber-300"
       },
       {
@@ -2628,7 +2644,7 @@ export default function App() {
         value: hasMa5 ? position.ma5 : 0,
         text: ma5DistanceText,
         active: plan.triggerKey === "ma5-risk" || plan.triggerKey === "clear",
-        activeClass: "border-rose-700/70 bg-rose-950/20",
+        activeClass: "border-rose-800/60 border-l-rose-400/80 bg-slate-950/30",
         labelClass: "text-rose-300"
       },
       {
@@ -2637,7 +2653,7 @@ export default function App() {
         value: maxLossLine,
         text: maxLossLine > 0 ? `当前浮亏 ${currentLossAmount.toFixed(2)} / ${maxLossAmount.toFixed(2)} 元` : "等待成本",
         active: maxLossAmount > 0 && currentLossAmount >= maxLossAmount,
-        activeClass: "border-red-700/70 bg-red-950/20",
+        activeClass: "border-red-800/60 border-l-red-400/80 bg-slate-950/30",
         labelClass: "text-red-300"
       }
     ];
@@ -2648,7 +2664,7 @@ export default function App() {
         title: "10点前不强就走",
         text: plan.nextMorningRule,
         active: plan.triggerKey === "next-day",
-        className: "border-cyan-800/50 bg-cyan-950/10 text-cyan-200"
+        className: "border-cyan-800/55 border-l-cyan-400/80 bg-slate-950/30 text-cyan-200"
       },
       {
         key: "take-profit",
@@ -2656,7 +2672,7 @@ export default function App() {
         title: "远离5日线锁利润",
         text: plan.takeProfitRule,
         active: plan.triggerKey === "take-profit",
-        className: "border-amber-800/50 bg-amber-950/10 text-amber-200"
+        className: "border-amber-800/55 border-l-amber-400/80 bg-slate-950/30 text-amber-200"
       },
       {
         key: "risk",
@@ -2664,89 +2680,141 @@ export default function App() {
         title: "跌破5日线控风险",
         text: plan.ma5RiskRule,
         active: plan.triggerKey === "ma5-risk" || plan.triggerKey === "clear",
-        className: "border-rose-800/50 bg-rose-950/10 text-rose-200"
+        className: "border-rose-800/55 border-l-rose-400/80 bg-slate-950/30 text-rose-200"
+      }
+    ];
+    const decisionClass = plan.tone === "danger"
+      ? "border-rose-800/65 border-l-rose-500/90 bg-slate-950/30"
+      : plan.tone === "warning"
+        ? "border-amber-800/65 border-l-amber-500/90 bg-slate-950/30"
+        : plan.tone === "neutral"
+          ? "border-slate-800/75 border-l-slate-600 bg-slate-950/25"
+          : "border-emerald-800/55 border-l-emerald-500/75 bg-slate-950/25";
+    const coreStats = [
+      {
+        label: "实时现价",
+        value: formatPrice(position.currentPrice),
+        valueClass: "text-slate-100"
+      },
+      {
+        label: "持仓均价",
+        value: formatPrice(position.avgCost),
+        valueClass: "text-slate-100"
+      },
+      {
+        label: "MA5 / 偏离",
+        value: hasMa5 ? `${formatPrice(position.ma5)} / ${signedPercent(position.deviation5)}` : "待补K线",
+        valueClass: position.deviation5 < 0 ? "text-emerald-400" : "text-rose-400"
+      },
+      {
+        label: "浮动盈亏",
+        value: `${signedCurrency(position.floatingPnL)} (${signedPercent(position.floatingPnLPct)})`,
+        valueClass: priceClass
+      },
+      {
+        label: "持仓数量",
+        value: `${position.quantity} 股`,
+        valueClass: "text-slate-100"
+      },
+      {
+        label: "可卖数量",
+        value: `${position.availableQuantity} 股`,
+        valueClass: canSellToday ? "text-cyan-300" : "text-slate-500"
       }
     ];
 
     return (
-      <div key={position.code} className={`border rounded-lg p-4 space-y-4 ${plan.cardClass}`}>
-        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 border-b border-slate-800/40 pb-2.5">
-          <div className="flex items-start gap-3">
-            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-slate-700 bg-slate-950/50 text-[10px] font-black text-slate-300">
+      <div key={position.code} className={`rounded-lg border p-3 ${plan.cardClass}`}>
+        <div className="mb-3 flex flex-col gap-2 border-b border-slate-800/50 pb-2.5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-[10px] font-black text-slate-300">
               {index + 1}
             </span>
-            <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <span className={`h-2.5 w-2.5 rounded-full ${plan.dotClass}`}></span>
-                <span className="font-mono text-xs font-bold text-slate-100">
-                  {position.name} ({position.code})
-                </span>
+            <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${plan.dotClass}`}></span>
+            <div className="min-w-0">
+              <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+                <span className="truncate text-sm font-black text-slate-100">{position.name}</span>
+                <span className="font-mono text-xs font-bold text-slate-400">{position.code}</span>
               </div>
-              <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-400 font-mono">
+              <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[10px] text-slate-400">
                 <span>{position.buyDate || "买入日期待补"}</span>
                 <span>{holdingTimeLabel(position)}</span>
                 <span>可卖 {position.availableQuantity} 股</span>
               </div>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+          <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
             <span className="text-[10px] font-mono text-slate-500">按卖点优先级排序</span>
-            <span className={`text-[10px] font-extrabold tracking-widest px-2.5 py-1 rounded ${plan.badgeClass}`}>
+            <span className={`rounded px-2.5 py-1 text-[10px] font-extrabold tracking-widest ${plan.badgeClass}`}>
               {plan.statusLabel}
             </span>
           </div>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-2 text-center text-[10px] font-mono">
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
-            <span className="text-slate-500 block mb-0.5">持仓天数</span>
-            <span className="font-bold text-slate-100">{holdingTimeLabel(position)}</span>
+        <div className="grid grid-cols-1 gap-2 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">
+          <div className={`rounded-lg border border-l-2 p-3 ${decisionClass}`}>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+              <div className="min-w-0">
+                <div className="mb-1.5 flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] font-black uppercase tracking-wider text-slate-500">自动卖点判定</span>
+                  <span className="font-mono text-[10px] font-semibold text-slate-500">
+                    跌破MA5 {Math.max(0, Math.floor(Number(position.belowMa5Days) || 0))} 天
+                  </span>
+                </div>
+                <span className={`rounded px-2.5 py-1 text-[10px] font-black ${plan.badgeClass}`}>{plan.statusLabel}</span>
+                <h4 className="mt-2 text-lg font-black leading-tight text-slate-50">{plan.title}</h4>
+                <CardText className="mt-1.5 text-xs font-semibold leading-snug text-slate-200">
+                  {plan.primaryAction}
+                </CardText>
+                <CardText as="span" className="mt-2 block text-[10px] font-semibold leading-snug text-slate-500">
+                  {position.advice || plan.sizingRule}
+                </CardText>
+              </div>
+              <button
+                onClick={() => openSellModal(position)}
+                disabled={!canSellToday}
+                className={`min-h-[34px] shrink-0 rounded px-4 py-2 text-xs font-black text-white shadow transition lg:min-w-[96px] ${
+                  canSellToday ? "bg-emerald-600 hover:bg-emerald-500" : "bg-slate-800 text-slate-500 cursor-not-allowed"
+                }`}
+              >
+                {plan.buttonLabel}
+              </button>
+            </div>
           </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
-            <span className="text-slate-500 block mb-0.5">当前持股</span>
-            <span className="font-bold text-slate-100">{position.quantity} 股</span>
-          </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
-            <span className="text-slate-500 block mb-0.5">持仓均价</span>
-            <span className="font-bold text-slate-100">¥{position.avgCost.toFixed(2)}</span>
-          </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
-            <span className="text-slate-500 block mb-0.5">实时现价</span>
-            <span className="font-bold text-slate-100">¥{position.currentPrice.toFixed(2)}</span>
-          </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
-            <span className="text-slate-500 block mb-0.5">MA5 / 偏离</span>
-            <span className={`font-bold ${position.deviation5 < 0 ? "text-emerald-400" : "text-rose-400"}`}>
-              {hasMa5 ? `${formatPrice(position.ma5)} / ${signedPercent(position.deviation5)}` : "待补K线"}
-            </span>
-          </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2 col-span-2 md:col-span-1">
-            <span className="text-slate-500 block mb-0.5">浮动盈亏</span>
-            <span className={`font-bold ${priceClass}`}>
-              {position.floatingPnL >= 0 ? "+" : ""}{position.floatingPnL.toFixed(2)} ({signedPercent(position.floatingPnLPct)})
-            </span>
+
+          <div className="grid grid-cols-2 gap-1.5">
+            {coreStats.map(stat => (
+              <div key={stat.label} className="flex min-h-[58px] min-w-0 flex-col justify-center rounded border border-slate-800/50 bg-slate-950/25 px-2.5 py-1.5">
+                <span className="text-[10px] font-bold text-slate-500">{stat.label}</span>
+                <span className={`mt-0.5 break-words font-mono text-[12px] font-black leading-tight ${stat.valueClass}`}>
+                  {stat.value}
+                </span>
+              </div>
+            ))}
           </div>
         </div>
 
         {tradeLink && (
-          <div className="rounded border border-slate-800/50 bg-slate-950/25 p-3 space-y-2">
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">交易联动</span>
-              <span className={`w-fit text-[10px] font-bold px-2 py-0.5 rounded ${
-                tradeLink.hasComplianceIssue ? "bg-amber-950 text-amber-300" : "bg-emerald-950 text-emerald-300"
-              }`}>
-                {tradeLink.hasComplianceIssue ? "有审计标签" : "流水合规"}
-              </span>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[10px] text-slate-400">
-              <CardText as="span">最近买入：{tradeLink.lastBuy ? `${tradeLink.lastBuy.date || ""} ${formatPrice(Number(tradeLink.lastBuy.price) || 0)}` : "无"}</CardText>
-              <CardText as="span">最近卖出：{tradeLink.lastSell ? `${tradeLink.lastSell.date || ""} ${formatPrice(Number(tradeLink.lastSell.price) || 0)}` : "无"}</CardText>
-              <CardText as="span">今日流水：{tradeLink.todayTrades?.length || 0} 笔</CardText>
+          <div className="mt-2 rounded border border-slate-800/50 bg-slate-950/20 p-2.5">
+            <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">交易联动</span>
+                <span className={`w-fit rounded px-2 py-0.5 text-[10px] font-bold ${
+                  tradeLink.hasComplianceIssue ? "bg-amber-950 text-amber-300" : "bg-emerald-950 text-emerald-300"
+                }`}>
+                  {tradeLink.hasComplianceIssue ? "有审计标签" : "流水合规"}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 gap-2 text-[10px] text-slate-400 md:grid-cols-3 lg:min-w-[640px]">
+                <CardText as="span">最近买入：{tradeLink.lastBuy ? `${tradeLink.lastBuy.date || ""} ${formatPrice(Number(tradeLink.lastBuy.price) || 0)}` : "无"}</CardText>
+                <CardText as="span">最近卖出：{tradeLink.lastSell ? `${tradeLink.lastSell.date || ""} ${formatPrice(Number(tradeLink.lastSell.price) || 0)}` : "无"}</CardText>
+                <CardText as="span">今日流水：{tradeLink.todayTrades?.length || 0} 笔</CardText>
+              </div>
             </div>
             {Boolean(tradeLink.complianceTags?.length) && (
-              <div className="flex flex-wrap gap-1">
+              <div className="mt-2 flex flex-wrap gap-1">
                 {tradeLink.complianceTags?.map(tag => (
-                  <span key={tag} className="text-[9px] bg-rose-950/40 text-rose-300 px-1.5 py-0.5 rounded">
+                  <span key={tag} className="rounded bg-rose-950/40 px-1.5 py-0.5 text-[9px] text-rose-300">
                     {tag}
                   </span>
                 ))}
@@ -2755,75 +2823,46 @@ export default function App() {
           </div>
         )}
 
-        <div className="bg-slate-950/35 border border-slate-800/50 rounded p-3 space-y-2">
-          <div className="flex items-center justify-between gap-3">
-            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">自动卖点判定</span>
-            <span className="text-[10px] text-slate-500 font-mono shrink-0">
-              跌破MA5 {Math.max(0, Math.floor(Number(position.belowMa5Days) || 0))} 天
-            </span>
-          </div>
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-            <h4 className="text-sm font-extrabold text-slate-100">{plan.title}</h4>
-            <span className={`w-fit text-[10px] font-bold px-2 py-0.5 rounded ${plan.badgeClass}`}>{plan.statusLabel}</span>
-          </div>
-          <CardText className="text-xs leading-relaxed text-slate-300">{plan.primaryAction}</CardText>
-        </div>
-
-        <div className="space-y-2">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+        <div className="mt-3 space-y-2">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
             <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">止盈 / 止损线</span>
-            <span className="text-[10px] text-slate-500 font-mono">
+            <span className="font-mono text-[10px] text-slate-500">
               当前价 {formatPrice(position.currentPrice)} · 单笔亏损上限 {maxLossAmount.toFixed(2)} 元
             </span>
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
             {sellLineRows.map(line => (
               <div
                 key={line.label}
-                className={`rounded border p-3 ${line.active ? line.activeClass : "border-slate-800/50 bg-slate-950/30"}`}
+                className={`min-h-[66px] rounded border p-2.5 ${line.active ? `${line.activeClass} border-l-2` : "border-slate-800/50 bg-slate-950/25"}`}
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className={`text-[11px] font-bold ${line.labelClass}`}>{line.label}</span>
-                  <span className="text-[10px] text-slate-500 font-mono">{line.formula}</span>
+                  <span className="font-mono text-[10px] text-slate-500">{line.formula}</span>
                 </div>
                 <div className="mt-1 flex items-end justify-between gap-2">
-                  <span className="text-sm font-black font-mono text-slate-100">{formatPrice(line.value)}</span>
-                  <span className="text-[10px] font-mono text-slate-400 text-right">{line.text}</span>
+                  <span className="font-mono text-sm font-black text-slate-100">{formatPrice(line.value)}</span>
+                  <span className="text-right font-mono text-[10px] text-slate-400">{line.text}</span>
                 </div>
               </div>
             ))}
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 text-[11px] leading-relaxed">
+        <div className="mt-3 grid grid-cols-1 gap-2 text-[11px] leading-snug lg:grid-cols-3">
           {sellLayers.map(layer => (
             <div
               key={layer.key}
-              className={`rounded border p-2.5 ${layer.active ? layer.className : "bg-slate-950/25 border-slate-800/40 text-slate-400"}`}
+              className={`rounded border border-l-2 p-2.5 ${layer.active ? layer.className : "border-slate-800/40 border-l-slate-800 bg-slate-950/20 text-slate-400"}`}
             >
-              <div className="flex items-center justify-between gap-2 mb-1">
+              <div className="mb-1 flex items-center justify-between gap-2">
                 <span className="font-bold">{layer.label}</span>
                 {layer.active && <span className="text-[9px] font-black uppercase tracking-wider">当前触发</span>}
               </div>
-              <span className="font-bold block text-slate-200 mb-1">{layer.title}</span>
+              <span className="mb-1 block font-bold text-slate-200">{layer.title}</span>
               <CardText as="span" className={layer.active ? "text-slate-200" : "text-slate-400"}>{layer.text}</CardText>
             </div>
           ))}
-        </div>
-
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-t border-slate-800/40 pt-2.5">
-          <CardText as="span" className="text-[10px] text-slate-500">
-            系统提醒：{position.advice || plan.sizingRule}
-          </CardText>
-          <button
-            onClick={() => openSellModal(position)}
-            disabled={!canSellToday}
-            className={`px-3 py-1.5 text-white font-bold text-xs rounded transition shadow shrink-0 ${
-              canSellToday ? "bg-emerald-600 hover:bg-emerald-500" : "bg-slate-800 text-slate-500 cursor-not-allowed"
-            }`}
-          >
-            {plan.buttonLabel}
-          </button>
         </div>
       </div>
     );

@@ -6,7 +6,7 @@ PROJECT_DIR="/Users/lulu/Desktop/touzi"
 BACKEND_URL="http://127.0.0.1:8000"
 BACKEND_PORT="8000"
 FRONTEND_URL="http://127.0.0.1:5173"
-BACKEND_REQUIRED_CONTRACT="trade-link-v5"
+BACKEND_REQUIRED_CONTRACT="trade-link-v6"
 BACKEND_REQUIRED_ROUTES=(
   "/api/watchlist/scan-turnover-changes"
   "/api/watchlist/include-turnover-stock"
@@ -113,6 +113,8 @@ if /usr/bin/curl --silent --fail "$BACKEND_URL/api/health" >/dev/null 2>&1; then
     start_backend
   fi
 else
+  echo "Python 后端未响应，正在清理旧后端并重新启动..."
+  stop_project_backend
   start_backend
 fi
 

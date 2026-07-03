@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time as time_module
 import urllib.parse
 import urllib.request
 from datetime import datetime, time
@@ -217,9 +218,9 @@ def _eastmoney_clist_request(host: str, page: int, page_size: int, timeout: int)
         return json.loads(response.read().decode("utf-8"))
 
 
-def _eastmoney_turnover_rank_request(host: str, page_size: int, timeout: int) -> dict:
+def _eastmoney_turnover_rank_request(host: str, page: int, page_size: int, timeout: int) -> dict:
     params = {
-        "pn": "1",
+        "pn": str(page),
         "pz": str(page_size),
         "po": "1",
         "np": "1",
@@ -235,11 +236,23 @@ def _eastmoney_turnover_rank_request(host: str, page_size: int, timeout: int) ->
         url,
         headers={
             "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
             "Referer": "https://quote.eastmoney.com/",
+            "Connection": "close",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time_module.sleep(0.25 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    return {}
 
 
 def _eastmoney_ulist_request(host: str, secids: list[str], timeout: int) -> dict:
@@ -287,20 +300,90 @@ def _standardize_eastmoney_rows(rows: list[dict]) -> pd.DataFrame:
     return frame[QUOTE_COLUMNS].drop_duplicates("代码", keep="first").reset_index(drop=True)
 
 
-def fetch_turnover_rank_quotes_eastmoney(limit: int = 30, timeout: int = 8, page_size: int = 240) -> pd.DataFrame:
+def _pool_candidates_from_quotes(quotes: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if quotes.empty:
+        return pd.DataFrame()
+    pool = quotes.copy()
+    pool["代码"] = pool["代码"].map(clean_code)
+    pool["名称"] = pool["名称"].fillna("").astype(str).str.strip()
+    for column in ["最新价", "涨跌幅%", "成交额"]:
+        pool[column] = pd.to_numeric(pool[column], errors="coerce")
+
+    passed = pool.apply(
+        lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
+        axis=1,
+    )
+    return (
+        pool[passed]
+        .dropna(subset=["成交额"])
+        .sort_values("成交额", ascending=False)
+        .head(limit)
+    )
+
+
+def fetch_turnover_rank_quotes_eastmoney(
+    limit: int = 30,
+    timeout: int = 8,
+    page_size: int = 100,
+    max_pages: int = 12,
+) -> pd.DataFrame:
     errors: list[str] = []
     safe_limit = max(int(limit or 30), 30)
-    safe_page_size = max(int(page_size or 240), safe_limit)
+    safe_page_size = min(max(int(page_size or 100), 30), 100)
+    safe_max_pages = max(int(max_pages or 1), 1)
+    best_frame = pd.DataFrame()
+    best_candidate_count = 0
+    best_message = ""
+
     for host in EASTMONEY_SPOT_HOSTS:
-        try:
-            payload = _eastmoney_turnover_rank_request(host, page_size=safe_page_size, timeout=timeout)
-            rows = (payload.get("data") or {}).get("diff") or []
-            frame = _standardize_eastmoney_rows(rows)
-            if not frame.empty:
-                return _with_status(frame, "东方财富", f"{host} 成交额榜已更新")
-            errors.append(frame.attrs.get("message", f"{host} 成交额榜返回空数据"))
-        except Exception as exc:
-            errors.append(f"{host}: {_short_error(exc)}")
+        host_rows: list[dict] = []
+        host_errors: list[str] = []
+        total = 0
+
+        for page in range(1, safe_max_pages + 1):
+            try:
+                payload = _eastmoney_turnover_rank_request(
+                    host,
+                    page=page,
+                    page_size=safe_page_size,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                host_errors.append(f"{host} 第{page}页: {_short_error(exc)}")
+                break
+
+            data = payload.get("data") or {}
+            rows = data.get("diff") or []
+            if not rows:
+                host_errors.append(f"{host} 第{page}页返回空数据")
+                break
+            host_rows.extend(rows)
+            if not total:
+                parsed_total = pd.to_numeric(data.get("total"), errors="coerce")
+                total = int(parsed_total) if pd.notna(parsed_total) else 0
+
+            frame = _standardize_eastmoney_rows(host_rows)
+            candidate_count = len(_pool_candidates_from_quotes(frame, safe_limit))
+            if candidate_count > best_candidate_count:
+                best_frame = frame
+                best_candidate_count = candidate_count
+                best_message = f"{host} 成交额榜分页扫描 {len(host_rows)} 条，主板候选 {candidate_count} 只"
+            if candidate_count >= safe_limit:
+                return _with_status(frame, "东方财富", f"{host} 成交额榜分页扫描 {len(host_rows)} 条，已获取主板前{safe_limit}")
+            if len(rows) < safe_page_size or (total and page * safe_page_size >= total):
+                break
+
+        if host_errors:
+            errors.extend(host_errors)
+        elif not host_rows:
+            errors.append(f"{host}: 成交额榜返回空数据")
+
+    if not best_frame.empty:
+        message = best_message
+        if errors:
+            message += "；部分页失败: " + "；".join(errors[:2])
+        return _with_status(best_frame, "东方财富", message)
+
     return _empty_full_quotes("；".join(errors), "东方财富")
 
 
@@ -455,40 +538,56 @@ def fetch_realtime_quotes_akshare(wanted: set[str]) -> pd.DataFrame:
 
 def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.DataFrame:
     """Generate a main-board stock pool ranked by turnover amount."""
+    safe_limit = max(int(limit or 30), 1)
     rank_quotes = pd.DataFrame()
+    attempted_rank_quotes = False
     if source in {"自动切换", "东方财富"}:
-        rank_quotes = fetch_turnover_rank_quotes_eastmoney(limit=max(limit * 20, 600))
-    quotes = rank_quotes if not rank_quotes.empty else fetch_full_market_quotes(source)
+        attempted_rank_quotes = True
+        rank_quotes = fetch_turnover_rank_quotes_eastmoney(limit=safe_limit)
+
+    quotes = rank_quotes
+    if quotes.empty:
+        if source == "自动切换":
+            quotes = fetch_full_market_quotes_akshare()
+            if quotes.empty:
+                return _with_status(
+                    pd.DataFrame(),
+                    "自动切换",
+                    "东方财富成交额榜: "
+                    + rank_quotes.attrs.get("message", "失败")
+                    + "；AKShare: "
+                    + quotes.attrs.get("message", "失败"),
+                )
+        elif source == "AKShare":
+            quotes = fetch_full_market_quotes_akshare()
+        elif source == "东方财富":
+            return _with_status(
+                pd.DataFrame(),
+                rank_quotes.attrs.get("source", source),
+                rank_quotes.attrs.get("message", "东方财富成交额榜未返回数据"),
+            )
+        else:
+            quotes = fetch_full_market_quotes(source)
+
     if quotes.empty:
         return _with_status(pd.DataFrame(), quotes.attrs.get("source", source), quotes.attrs.get("message", "自动股票池行情为空"))
 
-    pool = quotes.copy()
-    pool["代码"] = pool["代码"].map(clean_code)
-    pool["名称"] = pool["名称"].fillna("").astype(str).str.strip()
-    for column in ["最新价", "涨跌幅%", "成交额"]:
-        pool[column] = pd.to_numeric(pool[column], errors="coerce")
-
-    passed = pool.apply(
-        lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
-        axis=1,
-    )
-    pool = pool[passed].dropna(subset=["成交额"]).sort_values("成交额", ascending=False).head(limit)
-    if len(pool) < limit and not rank_quotes.empty and source not in {"自动切换", "东方财富"}:
-        full_quotes = fetch_full_market_quotes(source)
-        if not full_quotes.empty:
-            pool = full_quotes.copy()
-            pool["代码"] = pool["代码"].map(clean_code)
-            pool["名称"] = pool["名称"].fillna("").astype(str).str.strip()
-            for column in ["最新价", "涨跌幅%", "成交额"]:
-                pool[column] = pd.to_numeric(pool[column], errors="coerce")
-            passed = pool.apply(
-                lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
-                axis=1,
-            )
-            pool = pool[passed].dropna(subset=["成交额"]).sort_values("成交额", ascending=False).head(limit)
-            quotes = full_quotes
+    pool = _pool_candidates_from_quotes(quotes, safe_limit)
     if pool.empty:
         return _with_status(pd.DataFrame(), quotes.attrs.get("source", source), "全市场数据中没有符合主板过滤条件的股票")
+    if len(pool) < safe_limit:
+        if source == "自动切换" and attempted_rank_quotes:
+            fallback_quotes = fetch_full_market_quotes_akshare()
+            fallback_pool = _pool_candidates_from_quotes(fallback_quotes, safe_limit)
+            if len(fallback_pool) >= safe_limit:
+                quotes = fallback_quotes
+                pool = fallback_pool
+        if len(pool) < safe_limit:
+            return _with_status(
+                pd.DataFrame(),
+                quotes.attrs.get("source", source),
+                f"只获取到 {len(pool)}/{safe_limit} 只主板成交额候选，为避免覆盖为不完整名单，已停止生成",
+            )
 
     result = pd.DataFrame({
         "代码": pool["代码"],
