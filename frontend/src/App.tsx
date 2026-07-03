@@ -29,17 +29,46 @@ import {
   Clock3
 } from "lucide-react";
 import KLineChart from "./components/KLineChart";
-import { Stock, TradeLog, StockGroup, StockViewGroup, StockStage, Position, AccountState, ReviewReport, TurnoverChanges, TurnoverChangeStock, ReviewScreenedStock, SelfDiagnosisItem } from "./types";
+import { Stock, TradeLog, StockGroup, StockViewGroup, StockStage, Position, AccountState, ReviewReport, TurnoverChanges, TurnoverChangeStock, ReviewScreenedStock, SelfDiagnosisItem, TradingRulesConfig } from "./types";
 
 const QUOTE_AUTO_REFRESH_SECONDS = 30;
 const TURNOVER_AUTO_SCAN_SECONDS = 180;
 const REVIEW_SCREEN_LIMIT = 50;
-const BUY_ZONE_MAX_DEVIATION_PCT = 2.5;
-const OBSERVE_ZONE_MAX_DEVIATION_PCT = 5;
-const HIGH_ZONE_MAX_DEVIATION_PCT = 7;
-const TAKE_PROFIT_WATCH_DEVIATION_PCT = 5;
-const TAKE_PROFIT_PRIORITY_DEVIATION_PCT = 7;
-const MAX_SINGLE_TRADE_RISK_PCT = 0.02;
+const DEFAULT_TRADING_RULES: TradingRulesConfig = {
+  lotSize: 100,
+  simulationCapital: 10000,
+  realCapital: 5000,
+  turnoverTopN: 30,
+  bigCandleLookbackDays: 20,
+  bigCandleThresholdPct: 5,
+  buyZone: {
+    minDeviationPct: 0,
+    maxDeviationPct: 2.5
+  },
+  observeZone: {
+    maxDeviationPct: 5
+  },
+  highZone: {
+    maxDeviationPct: 7
+  },
+  singleTradeRisk: {
+    maxPct: 0.02,
+    steadyPct: 0.01
+  },
+  ma5Risk: {
+    effectiveBreakPct: 0,
+    stopPriceBufferPct: 0.01
+  },
+  takeProfit: {
+    watchDeviationPct: 5,
+    priorityDeviationPct: 7
+  },
+  buyWindows: [
+    { start: "09:35", end: "10:00" },
+    { start: "14:30", end: "14:55" }
+  ],
+  riskCheckTime: "14:50"
+};
 const CARD_TEXT_ENDING_PERIOD = /([。．]|(?<!\.)\.)([”’"'）)\]】》]*)\s*$/u;
 type AccountMode = "simulation" | "real";
 type QuoteRefreshTrigger = "manual" | "auto";
@@ -220,6 +249,21 @@ function feeSettingsFromApi(settings: any): FeeSettings {
   };
 }
 
+function rulesFromApi(config: Partial<TradingRulesConfig> | undefined): TradingRulesConfig {
+  const incoming = config || {};
+  return {
+    ...DEFAULT_TRADING_RULES,
+    ...incoming,
+    buyZone: { ...DEFAULT_TRADING_RULES.buyZone, ...(incoming.buyZone || {}) },
+    observeZone: { ...DEFAULT_TRADING_RULES.observeZone, ...(incoming.observeZone || {}) },
+    highZone: { ...DEFAULT_TRADING_RULES.highZone, ...(incoming.highZone || {}) },
+    singleTradeRisk: { ...DEFAULT_TRADING_RULES.singleTradeRisk, ...(incoming.singleTradeRisk || {}) },
+    ma5Risk: { ...DEFAULT_TRADING_RULES.ma5Risk, ...(incoming.ma5Risk || {}) },
+    takeProfit: { ...DEFAULT_TRADING_RULES.takeProfit, ...(incoming.takeProfit || {}) },
+    buyWindows: incoming.buyWindows?.length ? incoming.buyWindows : DEFAULT_TRADING_RULES.buyWindows
+  };
+}
+
 function localDateString(date = new Date()): string {
   const localTime = date.getTime() - date.getTimezoneOffset() * 60_000;
   return new Date(localTime).toISOString().slice(0, 10);
@@ -347,16 +391,30 @@ function percentDistance(currentPrice: number, linePrice: number): number | null
   return ((currentPrice - linePrice) / linePrice) * 100;
 }
 
-function isAllowedBuyWindow(value: Date): boolean {
+function minutesFromClock(value: string): number | null {
+  const [hour, minute] = value.split(":").map(Number);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  return hour * 60 + minute;
+}
+
+function isAllowedBuyWindow(value: Date, rules: TradingRulesConfig = DEFAULT_TRADING_RULES): boolean {
   const day = value.getDay();
   if (day < 1 || day > 5) return false;
   const minutes = value.getHours() * 60 + value.getMinutes();
-  const morning = minutes >= 9 * 60 + 35 && minutes <= 10 * 60;
-  const afternoon = minutes >= 14 * 60 + 30 && minutes <= 14 * 60 + 55;
-  return morning || afternoon;
+  return rules.buyWindows.some(window => {
+    const start = minutesFromClock(window.start);
+    const end = minutesFromClock(window.end);
+    return start !== null && end !== null && minutes >= start && minutes <= end;
+  });
 }
 
-function estimateBuyRiskAmount(price: number, quantity: number, ma5: number, estimatedSellFee = 0): {
+function estimateBuyRiskAmount(
+  price: number,
+  quantity: number,
+  ma5: number,
+  estimatedSellFee = 0,
+  rules: TradingRulesConfig = DEFAULT_TRADING_RULES
+): {
   stopPrice: number;
   riskAmount: number;
   riskPct: number;
@@ -367,7 +425,7 @@ function estimateBuyRiskAmount(price: number, quantity: number, ma5: number, est
   if (!Number.isFinite(safePrice) || !Number.isFinite(safeQuantity) || !Number.isFinite(safeMa5) || safeMa5 <= 0 || safeQuantity <= 0) {
     return { stopPrice: 0, riskAmount: 0, riskPct: 0 };
   }
-  const stopPrice = safeMa5 * 0.99;
+  const stopPrice = safeMa5 * (1 - rules.ma5Risk.stopPriceBufferPct);
   const riskAmount = Math.max(0, safePrice - stopPrice) * safeQuantity + Math.max(0, estimatedSellFee);
   return {
     stopPrice,
@@ -385,12 +443,12 @@ function lineDistanceLabel(currentPrice: number, linePrice: number, mode: "targe
   return distance >= 0 ? `安全垫 ${distance.toFixed(2)}%` : `已跌破 ${Math.abs(distance).toFixed(2)}%`;
 }
 
-function buildPositionSellPlan(position: Position): PositionSellPlan {
+function buildPositionSellPlan(position: Position, rules: TradingRulesConfig = DEFAULT_TRADING_RULES): PositionSellPlan {
   const deviation = Number.isFinite(position.deviation5) ? position.deviation5 : 0;
   const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
   const belowMa5 = hasMa5 && deviation < 0;
-  const takeProfitWatch = hasMa5 && deviation >= TAKE_PROFIT_WATCH_DEVIATION_PCT;
-  const farFromMa5 = hasMa5 && deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT;
+  const takeProfitWatch = hasMa5 && deviation >= rules.takeProfit.watchDeviationPct;
+  const farFromMa5 = hasMa5 && deviation > rules.takeProfit.priorityDeviationPct;
   const belowDays = Math.max(0, Math.floor(Number(position.belowMa5Days) || 0));
   const availableQuantity = Math.max(0, Math.floor(Number(position.availableQuantity) || 0));
   const t1Locked = availableQuantity <= 0;
@@ -593,10 +651,10 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   };
 }
 
-function sortedPositionsByExitPriority(positions: Position[]): Position[] {
+function sortedPositionsByExitPriority(positions: Position[], rules: TradingRulesConfig = DEFAULT_TRADING_RULES): Position[] {
   return [...positions].sort((a, b) => {
-    const planA = buildPositionSellPlan(a);
-    const planB = buildPositionSellPlan(b);
+    const planA = buildPositionSellPlan(a, rules);
+    const planB = buildPositionSellPlan(b, rules);
     if (planA.priority !== planB.priority) return planA.priority - planB.priority;
 
     const belowDaysDiff = (Number(b.belowMa5Days) || 0) - (Number(a.belowMa5Days) || 0);
@@ -689,6 +747,7 @@ export default function App() {
 
   // 交易费用配置 state
   const [feeSettings, setFeeSettings] = useState<FeeSettings>(DEFAULT_FEE_SETTINGS);
+  const [tradingRules, setTradingRules] = useState<TradingRulesConfig>(DEFAULT_TRADING_RULES);
 
   // 5个复盘视图状态与聚合数据 state
   const [activeReviewSubTab, setActiveReviewSubTab] = useState<"today" | "market" | "sector" | "stock" | "action">("today");
@@ -993,6 +1052,18 @@ export default function App() {
     setFeeSettings(feeSettingsFromApi(settings));
   };
 
+  const loadRulesConfig = async () => {
+    try {
+      const res = await fetch("/api/rules/config");
+      if (res.ok) {
+        const data = await res.json();
+        setTradingRules(rulesFromApi(data.config));
+      }
+    } catch (err) {
+      console.error("加载规则配置失败:", err);
+    }
+  };
+
   // 加载初始设置
   const loadSettings = async () => {
     try {
@@ -1008,6 +1079,7 @@ export default function App() {
 
   useEffect(() => {
     loadSettings();
+    loadRulesConfig();
   }, []);
 
   // 切换运行模式
@@ -1390,7 +1462,7 @@ export default function App() {
       return;
     }
     const matched = watchlist.find(s => s.code === pos.code);
-    const sellPlan = buildPositionSellPlan(pos);
+    const sellPlan = buildPositionSellPlan(pos, tradingRules);
     setTradeTarget(matched || {
       code: pos.code,
       name: pos.name,
@@ -1540,7 +1612,7 @@ export default function App() {
     const portfolioRisk = positions.filter(p => p.riskLevel === "danger").length > 0 ? "高风险 (部分持仓已破5日线)" : "正常 (持仓均在5日线上方)";
     const autoTomorrowPlan = positions.length === 0
       ? "无持仓；若无0%~2.5%待买且市场/板块不强，明日保持空仓。"
-      : positions.map(pos => `${pos.name} ${pos.code}: ${buildPositionSellPlan(pos).primaryAction}`).join("\n");
+      : positions.map(pos => `${pos.name} ${pos.code}: ${buildPositionSellPlan(pos, tradingRules).primaryAction}`).join("\n");
     const stockScreening = {
       step1: {
         title: "当前成交额前30初筛池复查",
@@ -1764,23 +1836,23 @@ export default function App() {
 
   const est = calculateEstimateFees();
   const estimatedSellFees = calculateFeeBreakdown("SELL", tradePrice, tradeQuantity);
-  const buyRiskEstimate = estimateBuyRiskAmount(tradePrice, tradeQuantity, tradeTarget?.ma5 || 0, estimatedSellFees.total);
+  const buyRiskEstimate = estimateBuyRiskAmount(tradePrice, tradeQuantity, tradeTarget?.ma5 || 0, estimatedSellFees.total, tradingRules);
   const buyRiskAmount = buyRiskEstimate.riskAmount;
-  const maxAllowedRiskAmount = accountState.initialCash * MAX_SINGLE_TRADE_RISK_PCT;
+  const maxAllowedRiskAmount = accountState.initialCash * tradingRules.singleTradeRisk.maxPct;
   const buyRiskPct = accountState.initialCash > 0 ? (buyRiskAmount / accountState.initialCash) * 100 : 0;
   const activeTradePosition = tradeTarget ? positions.find(pos => pos.code === tradeTarget.code) : null;
   const activeAvailableQuantity = activeTradePosition ? Math.max(0, Math.floor(Number(activeTradePosition.availableQuantity) || 0)) : 0;
-  const currentInBuyWindow = isAllowedBuyWindow(currentTime);
+  const currentInBuyWindow = isAllowedBuyWindow(currentTime, tradingRules);
   const activeMarketRisk = systemicRisk || tradeTarget?.marketTradeAllowed === false || tradeTarget?.marketRisk === true;
   const tradeDeviationAtPrice = tradeTarget?.ma5 ? ((tradePrice - tradeTarget.ma5) / tradeTarget.ma5) * 100 : Number.NaN;
   const buyFormHasHardRisk = tradeType === "BUY" && (
     !tradeTarget?.canBuy ||
     !currentInBuyWindow ||
     activeMarketRisk ||
-    tradeQuantity < 100 ||
-    accountState.availableCash < tradePrice * 100 ||
-    tradeDeviationAtPrice < 0 ||
-    tradeDeviationAtPrice > BUY_ZONE_MAX_DEVIATION_PCT ||
+    tradeQuantity < tradingRules.lotSize ||
+    accountState.availableCash < tradePrice * tradingRules.lotSize ||
+    tradeDeviationAtPrice < tradingRules.buyZone.minDeviationPct ||
+    tradeDeviationAtPrice > tradingRules.buyZone.maxDeviationPct ||
     buyRiskAmount <= 0 ||
     buyRiskAmount > maxAllowedRiskAmount
   );
@@ -1932,9 +2004,9 @@ export default function App() {
   const observationStages: StockStage[] = ["强势确认", "继续观察", "偏高不追", "远离不追", "待买观察"];
   const observationStageForStock = (stock: Stock): StockStage | null => {
     if (hasStrongStartSignal(stock) && hasValidMa5(stock) && stock.deviation5 >= 0) {
-      if (stock.deviation5 <= BUY_ZONE_MAX_DEVIATION_PCT) return "待买观察";
-      if (stock.deviation5 <= OBSERVE_ZONE_MAX_DEVIATION_PCT) return "继续观察";
-      if (stock.deviation5 <= HIGH_ZONE_MAX_DEVIATION_PCT) return "偏高不追";
+      if (stock.deviation5 <= tradingRules.buyZone.maxDeviationPct) return "待买观察";
+      if (stock.deviation5 <= tradingRules.observeZone.maxDeviationPct) return "继续观察";
+      if (stock.deviation5 <= tradingRules.highZone.maxDeviationPct) return "偏高不追";
       return "远离不追";
     }
     return observationStages.includes(stock.stage) ? stock.stage : null;
@@ -1956,12 +2028,12 @@ export default function App() {
   const stocksForGroup = (list: Stock[], group: StockViewGroup) => (
     list.filter(stock => stockBelongsToGroup(stock, group))
   );
-  const sortedPositions = sortedPositionsByExitPriority(positions);
+  const sortedPositions = sortedPositionsByExitPriority(positions, tradingRules);
   const marketInstructions = getMarketLinkedInstructions();
   const marketIsTrading = isAStockTradingTime();
   const currentTimeLabel = currentTime.toLocaleTimeString("zh-CN", { hour12: false });
   const isPortfolioRiskWindow = marketInstructions.phase.includes("尾盘持仓风控");
-  const urgentPositionCount = sortedPositions.filter(position => buildPositionSellPlan(position).priority <= 1).length;
+  const urgentPositionCount = sortedPositions.filter(position => buildPositionSellPlan(position, tradingRules).priority <= 1).length;
 
   const firstStockForGroup = (list: Stock[], group: StockViewGroup) => (
     stocksForGroup(list, group)[0] || list[0]
@@ -2335,7 +2407,7 @@ export default function App() {
   );
 
   const renderPositionDashboardCard = (position: Position, index: number) => {
-    const plan = buildPositionSellPlan(position);
+    const plan = buildPositionSellPlan(position, tradingRules);
     const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
     const canSellToday = Math.max(0, Math.floor(Number(position.availableQuantity) || 0)) > 0;
     const pnlClass = position.floatingPnL >= 0 ? "text-rose-400" : "text-emerald-400";
@@ -2520,16 +2592,16 @@ export default function App() {
   );
 
   const renderPositionSellCard = (position: Position, index: number) => {
-    const plan = buildPositionSellPlan(position);
+    const plan = buildPositionSellPlan(position, tradingRules);
     const priceClass = position.floatingPnL >= 0 ? "text-rose-400" : "text-emerald-400";
     const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
     const canSellToday = Math.max(0, Math.floor(Number(position.availableQuantity) || 0)) > 0;
     const tradeLink = position.tradeLink;
-    const maxLossAmount = Number(position.maxLossAmount) > 0 ? Number(position.maxLossAmount) : accountState.initialCash * MAX_SINGLE_TRADE_RISK_PCT;
+    const maxLossAmount = Number(position.maxLossAmount) > 0 ? Number(position.maxLossAmount) : accountState.initialCash * tradingRules.singleTradeRisk.maxPct;
     const currentLossAmount = Number(position.currentLossAmount) || Math.max(0, (position.avgCost - position.currentPrice) * position.quantity);
     const maxLossLine = position.quantity > 0 ? position.avgCost - (maxLossAmount / position.quantity) : 0;
-    const takeProfitWatchLine = hasMa5 ? position.ma5 * (1 + TAKE_PROFIT_WATCH_DEVIATION_PCT / 100) : 0;
-    const takeProfitPriorityLine = hasMa5 ? position.ma5 * (1 + TAKE_PROFIT_PRIORITY_DEVIATION_PCT / 100) : 0;
+    const takeProfitWatchLine = hasMa5 ? position.ma5 * (1 + tradingRules.takeProfit.watchDeviationPct / 100) : 0;
+    const takeProfitPriorityLine = hasMa5 ? position.ma5 * (1 + tradingRules.takeProfit.priorityDeviationPct / 100) : 0;
     const ma5DistanceText = hasMa5 ? lineDistanceLabel(position.currentPrice, position.ma5, "floor") : "等待MA5";
     const sellLineRows = [
       {
@@ -2546,7 +2618,7 @@ export default function App() {
         formula: "MA5 +7%",
         value: takeProfitPriorityLine,
         text: hasMa5 ? lineDistanceLabel(position.currentPrice, takeProfitPriorityLine, "target") : "等待MA5",
-        active: plan.triggerKey === "take-profit" && position.deviation5 > TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
+        active: plan.triggerKey === "take-profit" && position.deviation5 > tradingRules.takeProfit.priorityDeviationPct,
         activeClass: "border-amber-700/70 bg-amber-950/20",
         labelClass: "text-amber-300"
       },
@@ -3590,7 +3662,7 @@ export default function App() {
                                 <td className="p-3 text-right font-mono text-slate-400">
                                   {s.volume > 0 ? (s.volume / 10000).toLocaleString(undefined, { maximumFractionDigits: 0 }) : "0"}
                                 </td>
-                                <td className={`p-3 text-right font-mono font-bold ${s.deviation5 < 0 ? "text-emerald-500" : s.deviation5 <= BUY_ZONE_MAX_DEVIATION_PCT ? "text-cyan-400 underline decoration-cyan-500" : "text-rose-400"}`}>
+                                <td className={`p-3 text-right font-mono font-bold ${s.deviation5 < 0 ? "text-emerald-500" : s.deviation5 <= tradingRules.buyZone.maxDeviationPct ? "text-cyan-400 underline decoration-cyan-500" : "text-rose-400"}`}>
                                   {s.deviation5}%
                                 </td>
                                 <td className="p-3 text-right font-mono text-slate-400">
@@ -5011,16 +5083,16 @@ export default function App() {
                     <span className="text-slate-400">MA5向上: {tradeTarget.ma5Upward ? "满足" : "不符"}</span>
                   </div>
                   <div className="flex items-center space-x-1.5">
-                    <span className={`h-2 w-2 rounded-full ${tradeDeviationAtPrice >= 0 && tradeDeviationAtPrice <= BUY_ZONE_MAX_DEVIATION_PCT ? "bg-rose-500" : "bg-emerald-500"}`}></span>
-                    <span className="text-slate-400">0%~2.5%偏离: {tradeDeviationAtPrice >= 0 && tradeDeviationAtPrice <= BUY_ZONE_MAX_DEVIATION_PCT ? "满足" : "不符"}</span>
+                    <span className={`h-2 w-2 rounded-full ${tradeDeviationAtPrice >= tradingRules.buyZone.minDeviationPct && tradeDeviationAtPrice <= tradingRules.buyZone.maxDeviationPct ? "bg-rose-500" : "bg-emerald-500"}`}></span>
+                    <span className="text-slate-400">{tradingRules.buyZone.minDeviationPct}%~{tradingRules.buyZone.maxDeviationPct}%偏离: {tradeDeviationAtPrice >= tradingRules.buyZone.minDeviationPct && tradeDeviationAtPrice <= tradingRules.buyZone.maxDeviationPct ? "满足" : "不符"}</span>
                   </div>
                   <div className="flex items-center space-x-1.5">
                     <span className={`h-2 w-2 rounded-full ${currentInBuyWindow ? "bg-rose-500" : "bg-emerald-500"}`}></span>
                     <span className="text-slate-400">买入窗口: {currentInBuyWindow ? "允许" : "不在窗口"}</span>
                   </div>
                   <div className="flex items-center space-x-1.5">
-                    <span className={`h-2 w-2 rounded-full ${accountState.availableCash >= tradePrice * 100 ? "bg-rose-500" : "bg-emerald-500"}`}></span>
-                    <span className="text-slate-400">资金一手: {accountState.availableCash >= tradePrice * 100 ? "满足" : "不足"}</span>
+                    <span className={`h-2 w-2 rounded-full ${accountState.availableCash >= tradePrice * tradingRules.lotSize ? "bg-rose-500" : "bg-emerald-500"}`}></span>
+                    <span className="text-slate-400">资金一手: {accountState.availableCash >= tradePrice * tradingRules.lotSize ? "满足" : "不足"}</span>
                   </div>
                   <div className="flex items-center space-x-1.5">
                     <span className={`h-2 w-2 rounded-full ${buyRiskAmount > 0 && buyRiskAmount <= maxAllowedRiskAmount ? "bg-rose-500" : "bg-emerald-500"}`}></span>

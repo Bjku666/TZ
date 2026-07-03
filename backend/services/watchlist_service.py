@@ -9,9 +9,7 @@ from src.data import (
     archive_import_file,
     assign_pool_batch,
     enrich_watchlist,
-    filter_trades_by_account_mode,
     load_holdings,
-    load_trades,
     load_watchlist,
     save_watchlist,
     standardize_import_file,
@@ -26,13 +24,14 @@ from src.realtime import (
 from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
 from src.storage import load_quote_snapshot, save_quote_snapshot
 
-from backend.services.risk_service import annotate_watchlist_risk
-from backend.services.settings_service import account_mode_name, get_settings, initial_cash
+from backend.services.risk_service import annotate_watchlist_risk, refresh_external_market_context
+from backend.services.settings_service import account_mode_name, current_mode, get_settings, initial_cash
 from backend.storage.csv_adapter import (
     FRONTEND_GROUP_TO_STAGE,
     ensure_watchlist_frame,
     watchlist_to_api,
 )
+from backend.storage import trade_repository
 
 PINNED_GROUPS = {"观察", "待买", "持仓"}
 
@@ -54,7 +53,9 @@ def _held_codes(watchlist: pd.DataFrame) -> set[str]:
     codes: set[str] = set()
     try:
         legacy_holdings = load_holdings()
-        trades = load_trades()
+        active_mode = current_mode()
+        account_mode = account_mode_name(active_mode)
+        trades = trade_repository.load_trade_frame(active_mode, account_mode)
         positions = build_positions_from_trades(trades, watchlist, legacy_holdings)
         if not positions.empty and "代码" in positions:
             codes.update(clean_code(value) for value in positions["代码"].dropna().astype(str))
@@ -71,9 +72,10 @@ def _held_codes(watchlist: pd.DataFrame) -> set[str]:
 
 
 def _account_cash_for_watchlist(frame: pd.DataFrame) -> tuple[float, float]:
-    account_mode = account_mode_name()
+    active_mode = current_mode()
+    account_mode = account_mode_name(active_mode)
     capital = initial_cash()
-    trades = filter_trades_by_account_mode(load_trades(), account_mode)
+    trades = trade_repository.load_trade_frame(active_mode, account_mode)
     legacy_holdings = load_holdings()
     positions = build_positions_from_trades(trades, frame, legacy_holdings)
     state = account_state_from_trades(trades, positions, capital, account_mode)
@@ -147,10 +149,15 @@ def generate_watchlist() -> dict[str, Any]:
 
     frame = recompute_watchlist(frame)
     save_watchlist(frame)
+    market_context = refresh_external_market_context()
     batch_id = str(frame["pool_batch_id"].dropna().iloc[0]) if "pool_batch_id" in frame and not frame.empty else ""
     return {
         "success": True,
         "message": f"已生成并锁定今日初筛池 {len(frame)} 只，批次 {batch_id}",
+        "marketContext": {
+            "success": bool(market_context.get("success")),
+            "message": market_context.get("message", ""),
+        },
         "list": _watchlist_api(frame),
     }
 
@@ -216,7 +223,16 @@ def refresh_quotes() -> dict[str, Any]:
     merged = merge_quotes_into_watchlist(frame, quotes)
     merged = recompute_watchlist(merged)
     save_watchlist(merged)
-    return {"success": True, "message": message, "list": _watchlist_api(merged)}
+    market_context = refresh_external_market_context()
+    return {
+        "success": True,
+        "message": message,
+        "marketContext": {
+            "success": bool(market_context.get("success")),
+            "message": market_context.get("message", ""),
+        },
+        "list": _watchlist_api(merged),
+    }
 
 
 def scan_turnover_changes() -> dict[str, Any]:

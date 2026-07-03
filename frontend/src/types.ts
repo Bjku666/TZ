@@ -128,6 +128,42 @@ export interface TradeRuleSnapshot {
   positionBeforeTrade?: Partial<Position>;
 }
 
+export interface TradingRulesConfig {
+  lotSize: number;
+  simulationCapital: number;
+  realCapital: number;
+  turnoverTopN: number;
+  bigCandleLookbackDays: number;
+  bigCandleThresholdPct: number;
+  buyZone: {
+    minDeviationPct: number;
+    maxDeviationPct: number;
+  };
+  observeZone: {
+    maxDeviationPct: number;
+  };
+  highZone: {
+    maxDeviationPct: number;
+  };
+  singleTradeRisk: {
+    maxPct: number;
+    steadyPct: number;
+  };
+  ma5Risk: {
+    effectiveBreakPct: number;
+    stopPriceBufferPct: number;
+  };
+  takeProfit: {
+    watchDeviationPct: number;
+    priorityDeviationPct: number;
+  };
+  buyWindows: Array<{
+    start: string;
+    end: string;
+  }>;
+  riskCheckTime: string;
+}
+
 export interface TradeLog {
   id: string;
   code: string;

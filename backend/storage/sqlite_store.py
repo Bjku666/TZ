@@ -70,6 +70,39 @@ def init_db() -> None:
         )
 
 
+def _trade_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "accountMode": row["mode"],
+        "code": row["code"],
+        "name": row["name"],
+        "type": "SELL" if row["side"] == "卖出" else "BUY",
+        "date": row["trade_date"],
+        "time": row["trade_time"] or "",
+        "price": float(row["price"] or 0),
+        "quantity": float(row["quantity"] or 0),
+        "amount": float(row["amount"] or 0),
+        "commission": float(row["commission"] or 0),
+        "stampDuty": float(row["stamp_tax"] or 0),
+        "transferFee": float(row["transfer_fee"] or 0),
+        "totalFee": float(row["total_fee"] or 0),
+        "reason": row["reason"] or "",
+        "remark": row["remark"] or "",
+        "snapshot": _json_value(row["rule_snapshot"], {}),
+        "rulesConclusion": row["rule_conclusion"] or "",
+        "violationTags": _json_value(row["violation_tags"], []),
+    }
+
+
+def _json_value(raw: Any, default: Any) -> Any:
+    if raw is None:
+        return default
+    try:
+        return json.loads(str(raw))
+    except json.JSONDecodeError:
+        return default
+
+
 def save_kv(key: str, value: Any) -> None:
     with connect() as conn:
         conn.execute(
@@ -116,6 +149,88 @@ def replace_trades(mode: str, trades: list[dict[str, Any]]) -> None:
         )
 
 
+def list_trades(mode: str) -> list[dict[str, Any]]:
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM trades
+            WHERE mode = ?
+            ORDER BY trade_date, COALESCE(trade_time, ''), rowid
+            """,
+            (mode,),
+        ).fetchall()
+    return [_trade_row(row) for row in rows]
+
+
+def has_trades(mode: str) -> bool:
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM trades WHERE mode = ? LIMIT 1", (mode,)).fetchone()
+    return row is not None
+
+
+def next_trade_id(mode: str) -> str:
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM trades WHERE mode = ?", (mode,)).fetchone()
+    return f"T{int(row['count']) + 1:06d}"
+
+
+def upsert_trade(mode: str, trade: dict[str, Any]) -> None:
+    init_db()
+    row = {**trade, "mode": mode}
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO trades(
+                id, mode, code, name, side, trade_date, trade_time, price, quantity,
+                amount, commission, stamp_tax, transfer_fee, total_fee, reason,
+                remark, rule_snapshot, rule_conclusion, violation_tags, updated_at
+            )
+            VALUES (
+                :id, :mode, :code, :name, :side, :trade_date, :trade_time, :price,
+                :quantity, :amount, :commission, :stamp_tax, :transfer_fee,
+                :total_fee, :reason, :remark, :rule_snapshot, :rule_conclusion,
+                :violation_tags, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(id, mode) DO UPDATE SET
+                code = excluded.code,
+                name = excluded.name,
+                side = excluded.side,
+                trade_date = excluded.trade_date,
+                trade_time = excluded.trade_time,
+                price = excluded.price,
+                quantity = excluded.quantity,
+                amount = excluded.amount,
+                commission = excluded.commission,
+                stamp_tax = excluded.stamp_tax,
+                transfer_fee = excluded.transfer_fee,
+                total_fee = excluded.total_fee,
+                reason = excluded.reason,
+                remark = excluded.remark,
+                rule_snapshot = excluded.rule_snapshot,
+                rule_conclusion = excluded.rule_conclusion,
+                violation_tags = excluded.violation_tags,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            row,
+        )
+
+
+def delete_trade(mode: str, trade_id: str) -> None:
+    init_db()
+    with connect() as conn:
+        conn.execute("DELETE FROM trades WHERE mode = ? AND id = ?", (mode, trade_id))
+
+
+def delete_trades(mode: str) -> None:
+    init_db()
+    with connect() as conn:
+        conn.execute("DELETE FROM trades WHERE mode = ?", (mode,))
+
+
 def register_report(report_id: str, report_type: str, report_date: str, json_path: Path, md_path: Path) -> None:
     with connect() as conn:
         conn.execute(
@@ -131,4 +246,3 @@ def register_report(report_id: str, report_type: str, report_date: str, json_pat
             """,
             (report_id, report_type, report_date, str(json_path), str(md_path)),
         )
-

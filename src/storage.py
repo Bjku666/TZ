@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +22,7 @@ DATA_DIR = ROOT / "data"
 BACKUP_DIR = DATA_DIR / "backups"
 RUNTIME_DIR = DATA_DIR / "runtime"
 QUOTE_SNAPSHOT_FILE = RUNTIME_DIR / "quote_snapshot.csv"
+MARKET_CONTEXT_FILE = RUNTIME_DIR / "market_context.json"
 LAST_REFRESH_FILE = RUNTIME_DIR / "last_refresh.json"
 
 QUOTE_SNAPSHOT_COLUMNS = [
@@ -52,14 +55,33 @@ def file_write_lock(path: Path) -> Iterator[None]:
     ensure_storage_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f".{path.name}.lock")
-    with lock_path.open("a", encoding="utf-8") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    if fcntl is None:
+        deadline = time.monotonic() + 10
+        fd: int | None = None
+        while fd is None:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            except FileExistsError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"等待文件锁超时: {lock_path}")
+                time.sleep(0.05)
         try:
             yield
         finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if fd is not None:
+                os.close(fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+        return
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def backup_file(path: Path, *, label: str = "backup") -> Path | None:
@@ -154,3 +176,18 @@ def load_last_refresh() -> dict[str, object]:
 
 def save_last_refresh(info: dict[str, object]) -> None:
     safe_write_text(LAST_REFRESH_FILE, json.dumps(info, ensure_ascii=False, indent=2), backup=False)
+
+
+def load_market_context() -> dict[str, object]:
+    ensure_storage_dirs()
+    if not MARKET_CONTEXT_FILE.exists():
+        return {}
+    try:
+        return json.loads(MARKET_CONTEXT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        backup_file(MARKET_CONTEXT_FILE, label="bad")
+        return {}
+
+
+def save_market_context(context: dict[str, object]) -> None:
+    safe_write_text(MARKET_CONTEXT_FILE, json.dumps(context, ensure_ascii=False, indent=2), backup=False)

@@ -35,6 +35,49 @@ BUY_WINDOWS = [
 RISK_CHECK_TIME = time(14, 50)
 
 
+def _time_label(value: time) -> str:
+    return value.strftime("%H:%M")
+
+
+def trading_rules_config() -> dict[str, Any]:
+    """Return the canonical trading-rule configuration for API/UI consumers."""
+    return {
+        "lotSize": LOT_SIZE,
+        "simulationCapital": SIMULATION_CAPITAL,
+        "realCapital": REAL_CAPITAL,
+        "turnoverTopN": TURNOVER_TOP_N,
+        "bigCandleLookbackDays": BIG_CANDLE_LOOKBACK_DAYS,
+        "bigCandleThresholdPct": BIG_CANDLE_THRESHOLD_PCT,
+        "buyZone": {
+            "minDeviationPct": BUY_ZONE_MIN_DEVIATION_PCT,
+            "maxDeviationPct": BUY_ZONE_MAX_DEVIATION_PCT,
+        },
+        "observeZone": {
+            "maxDeviationPct": OBSERVE_ZONE_MAX_DEVIATION_PCT,
+        },
+        "highZone": {
+            "maxDeviationPct": HIGH_ZONE_MAX_DEVIATION_PCT,
+        },
+        "singleTradeRisk": {
+            "maxPct": MAX_SINGLE_TRADE_RISK_PCT,
+            "steadyPct": STEADY_SINGLE_TRADE_RISK_PCT,
+        },
+        "ma5Risk": {
+            "effectiveBreakPct": MA5_EFFECTIVE_BREAK_PCT,
+            "stopPriceBufferPct": STOP_PRICE_MA5_BUFFER_PCT,
+        },
+        "takeProfit": {
+            "watchDeviationPct": TAKE_PROFIT_WATCH_DEVIATION_PCT,
+            "priorityDeviationPct": TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
+        },
+        "buyWindows": [
+            {"start": _time_label(start), "end": _time_label(end)}
+            for start, end in BUY_WINDOWS
+        ],
+        "riskCheckTime": _time_label(RISK_CHECK_TIME),
+    }
+
+
 def is_allowed_buy_window(value: datetime | None) -> bool:
     if value is None or value.weekday() >= 5:
         return False

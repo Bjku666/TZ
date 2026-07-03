@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api import market, portfolio, review, settings, trades, watchlist
+from backend.api import market, portfolio, review, rules, settings, trades, watchlist
 from backend.storage.sqlite_store import init_db
 from src.data import ensure_data_dir
 
@@ -29,6 +29,7 @@ def create_app() -> FastAPI:
     app.include_router(trades.router)
     app.include_router(portfolio.router)
     app.include_router(review.router)
+    app.include_router(rules.router)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

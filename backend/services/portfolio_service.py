@@ -6,7 +6,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.data import DATA_DIR, filter_trades_by_account_mode, load_holdings, load_trades, load_watchlist, save_holdings
+from src.data import DATA_DIR, load_holdings, load_watchlist, save_holdings
 from src.history import load_cached_history
 from src.portfolio import (
     account_state_from_trades,
@@ -21,8 +21,9 @@ from src.trading_rules_config import (
 )
 from src.storage import load_last_refresh, load_quote_snapshot
 
-from backend.services.settings_service import account_mode_name, initial_cash
+from backend.services.settings_service import account_mode_name, current_mode, initial_cash
 from backend.storage.csv_adapter import number, trades_to_api
+from backend.storage import trade_repository
 
 
 def _risk_level(advice: str, deviation: float) -> str:
@@ -280,7 +281,8 @@ def portfolio_snapshot(
     persist_risk_state: bool = False,
 ) -> dict[str, Any]:
     account_mode = account_mode_name(mode)
-    trades = filter_trades_by_account_mode(load_trades(), account_mode)
+    active_mode = mode or current_mode()
+    trades = trade_repository.load_trade_frame(active_mode, account_mode)
     watchlist = load_watchlist()
     legacy_holdings = load_holdings()
     positions = build_positions_from_trades(

@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
 
 from src.data import (
-    filter_trades_by_account_mode,
-    load_trades,
     load_watchlist,
-    save_trades,
-    trade_account_mode_name,
 )
 from src.portfolio import calculate_trade_fees
 from src.realtime import china_now, is_a_share_trading_time
@@ -22,7 +18,6 @@ from src.trading_rules_config import (
     BUY_ZONE_MIN_DEVIATION_PCT,
     LOT_SIZE,
     MAX_SINGLE_TRADE_RISK_PCT,
-    OBSERVE_ZONE_MAX_DEVIATION_PCT,
     TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
     TAKE_PROFIT_WATCH_DEVIATION_PCT,
     estimate_single_trade_risk,
@@ -31,45 +26,34 @@ from src.trading_rules_config import (
 
 from backend.services.portfolio_service import portfolio_snapshot
 from backend.services.risk_service import market_trade_filter
-from backend.services.settings_service import account_mode_name, initial_cash, trade_fee_settings
+from backend.services.settings_service import account_mode_name, current_mode, initial_cash, trade_fee_settings
 from backend.storage import sqlite_store
 from backend.storage.csv_adapter import (
     api_trade_id,
     api_trades_for_sqlite,
-    ensure_trade_frame,
     number,
     parse_tags,
     trade_index_from_id,
     trades_to_api,
     watchlist_to_api,
 )
+from backend.storage import trade_repository
 
 
 def list_trades(mode: str | None = None) -> dict[str, Any]:
-    frame = filter_trades_by_account_mode(load_trades(), account_mode_name(mode))
-    api_trades = trades_to_api(frame)
-    sqlite_store.replace_trades(mode or "default", api_trades_for_sqlite(api_trades))
+    active_mode = mode or current_mode()
+    api_trades = trade_repository.list_api_trades(active_mode, account_mode_name(mode))
+    sqlite_store.replace_trades(active_mode, api_trades_for_sqlite(api_trades))
     return {"list": api_trades}
 
 
-def _mode_row_indices(frame: pd.DataFrame, mode: str | None) -> list[int]:
-    mode_name = account_mode_name(mode)
-    normalized = ensure_trade_frame(frame)
-    return [
-        int(index)
-        for index, value in normalized["账户模式"].items()
-        if trade_account_mode_name(value) == mode_name
-    ]
-
-
-def _source_index_for_trade_id(frame: pd.DataFrame, trade_id: str, mode: str | None) -> int:
+def _source_index_for_trade_id(frame: pd.DataFrame, trade_id: str) -> int:
     index = trade_index_from_id(trade_id)
     if index is None:
         raise ValueError("交易流水ID无效")
-    mode_indices = _mode_row_indices(frame, mode)
-    if index < 0 or index >= len(mode_indices):
+    if index < 0 or index >= len(frame):
         raise ValueError("未找到该笔交易记录")
-    return mode_indices[index]
+    return index
 
 
 def _current_stock(code: str) -> dict[str, Any] | None:
@@ -298,7 +282,9 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
     else:
         conclusion, tags = _audit_sell(position, quantity, str(payload.get("reason") or ""), account_initial_cash)
 
-    frame = ensure_trade_frame(load_trades())
+    active_mode_key = active_mode or current_mode()
+    active_mode_name = account_mode_name(active_mode)
+    trade_id = trade_repository.next_trade_id(active_mode_key, active_mode_name)
     new_row = {
         "账户模式": account_mode_name(active_mode),
         "代码": code,
@@ -319,35 +305,31 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
         "规则结论": conclusion,
         "违规标签": json.dumps(tags, ensure_ascii=False),
     }
-    updated = pd.concat([frame, pd.DataFrame([new_row])], ignore_index=True)
-    save_trades(updated)
+    trade = trades_to_api(pd.DataFrame([new_row]))[0]
+    trade["id"] = trade_id
+    trade_repository.append_api_trade(active_mode_key, active_mode_name, trade)
     _sync_after_trade(active_mode)
-    trade = trades_to_api(updated.iloc[[-1]])[0]
-    trade["id"] = api_trade_id(len(updated) - 1)
     return {"success": True, "trade": trade}
 
 
 def delete_trade(trade_id: str, mode: str | None = None) -> dict[str, Any]:
-    active_mode = mode
-    index = trade_index_from_id(trade_id)
-    frame = ensure_trade_frame(load_trades()).reset_index(drop=True)
+    active_mode = mode or current_mode()
+    active_mode_name = account_mode_name(mode)
     if str(trade_id or "").upper() == "ALL":
-        drop_indices = _mode_row_indices(frame, active_mode)
-        updated = frame.drop(index=drop_indices).reset_index(drop=True)
+        trade_repository.delete_all_api_trades(active_mode, active_mode_name)
     else:
-        if index is None:
+        if trade_index_from_id(trade_id) is None:
             raise ValueError("交易流水ID无效")
-        source_index = _source_index_for_trade_id(frame, trade_id, active_mode)
-        updated = frame.drop(index=source_index).reset_index(drop=True)
-    save_trades(updated)
-    _sync_after_trade(active_mode)
+        trade_repository.delete_api_trade(active_mode, active_mode_name, trade_id)
+    _sync_after_trade(mode)
     return {"success": True}
 
 
 def update_trade(trade_id: str, payload: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
-    active_mode = mode
-    frame = ensure_trade_frame(load_trades()).reset_index(drop=True)
-    index = _source_index_for_trade_id(frame, trade_id, active_mode)
+    active_mode = mode or current_mode()
+    active_mode_name = account_mode_name(mode)
+    frame = trade_repository.load_trade_frame(active_mode, active_mode_name).reset_index(drop=True)
+    index = _source_index_for_trade_id(frame, trade_id)
 
     column_map = {
         "code": "代码",
@@ -385,11 +367,10 @@ def update_trade(trade_id: str, payload: dict[str, Any], mode: str | None = None
             + number(frame.loc[index, "印花税"])
             + number(frame.loc[index, "过户费"])
         )
-    save_trades(frame)
-    _sync_after_trade(active_mode)
-    mode_frame = filter_trades_by_account_mode(frame, account_mode_name(active_mode))
-    mode_indices = _mode_row_indices(frame, active_mode)
-    mode_index = mode_indices.index(index)
-    trade = trades_to_api(mode_frame.iloc[[mode_index]])[0]
-    trade["id"] = api_trade_id(mode_index)
+    api_trades = trades_to_api(frame)
+    for item_index, item in enumerate(api_trades):
+        item["id"] = api_trade_id(item_index)
+    trade_repository.save_api_trades(active_mode, active_mode_name, api_trades)
+    _sync_after_trade(mode)
+    trade = api_trades[index]
     return {"success": True, "trade": trade}
