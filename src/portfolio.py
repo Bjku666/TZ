@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date
+import json
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -8,6 +10,9 @@ import pandas as pd
 from src.data import HOLDING_COLUMNS
 from src.history import load_cached_history
 from src.rules import clean_code, holding_advice, ma5_deviation
+
+ROOT = Path(__file__).resolve().parents[1]
+BELOW_MA5_STATE_FILE = ROOT / "data" / "runtime" / "below_ma5_state.json"
 
 POSITION_COLUMNS = [
     "代码",
@@ -58,6 +63,71 @@ CLOSED_TRADE_COLUMNS = [
 def number_or(value: object, default: float = 0.0) -> float:
     numeric = pd.to_numeric(value, errors="coerce")
     return float(numeric) if pd.notna(numeric) else float(default)
+
+
+def _load_below_ma5_state() -> dict[str, dict[str, Any]]:
+    if not BELOW_MA5_STATE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(BELOW_MA5_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {clean_code(code): value for code, value in raw.items() if clean_code(code) and isinstance(value, dict)}
+
+
+def _save_below_ma5_state(state: dict[str, dict[str, Any]], active_codes: set[str]) -> None:
+    BELOW_MA5_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = {
+        code: value
+        for code, value in state.items()
+        if code in active_codes and int(number_or(value.get("below_ma5_days"), 0)) > 0
+    }
+    tmp = BELOW_MA5_STATE_FILE.with_name(f".{BELOW_MA5_STATE_FILE.name}.tmp")
+    tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(BELOW_MA5_STATE_FILE)
+
+
+def _below_ma5_days_for_snapshot(
+    code: str,
+    deviation: float | None,
+    context_days: Any,
+    today: pd.Timestamp,
+    state: dict[str, dict[str, Any]],
+    persist: bool,
+) -> int:
+    context_count = int(number_or(context_days, 0))
+    if deviation is None:
+        return context_count
+    if not persist:
+        return max(1, context_count) if deviation < 0 else 0
+
+    today_text = today.date().isoformat()
+    previous = state.get(code) or {}
+    previous_days = int(number_or(previous.get("below_ma5_days"), 0))
+    previous_last_check = str(previous.get("last_check_date") or "")
+
+    if deviation < 0:
+        if previous_last_check == today_text and previous_days > 0:
+            days = max(1, previous_days, context_count)
+        elif previous_days > 0:
+            days = max(previous_days + 1, context_count, 1)
+        else:
+            days = max(1, context_count)
+        state[code] = {
+            "below_ma5_start_date": previous.get("below_ma5_start_date") or today_text,
+            "below_ma5_days": int(days),
+            "last_check_date": today_text,
+        }
+        return int(days)
+
+    state[code] = {
+        "below_ma5_start_date": None,
+        "below_ma5_days": 0,
+        "last_check_date": today_text,
+    }
+    return 0
 
 
 def calculate_trade_fees(
@@ -177,6 +247,7 @@ def build_positions_from_trades(
     trades: pd.DataFrame,
     watchlist: pd.DataFrame | None = None,
     legacy_holdings: pd.DataFrame | None = None,
+    persist_below_ma5_state: bool = False,
 ) -> pd.DataFrame:
     flow = ensure_trade_columns(trades)
     if flow.empty:
@@ -229,10 +300,13 @@ def build_positions_from_trades(
                 state["成本总额"] = 0.0
 
     rows: list[dict[str, Any]] = []
+    below_ma5_state = _load_below_ma5_state() if persist_below_ma5_state else {}
+    active_codes: set[str] = set()
     for code, state in states.items():
         qty = number_or(state.get("数量"))
         if qty <= 0:
             continue
+        active_codes.add(code)
         today_buy_qty = number_or(state.get("今日买入数量"))
         available_qty = max(0, min(qty, qty - today_buy_qty))
         avg_cost = state["成本总额"] / qty if qty else 0
@@ -245,9 +319,14 @@ def build_positions_from_trades(
         floating_pnl = (current_price - avg_cost) * qty
         floating_pct = floating_pnl / (avg_cost * qty) * 100 if avg_cost and qty else 0
         deviation = ma5_deviation(current_price, ma5)
-        below_ma5_days = int(number_or(context.get("跌破MA5天数"), 0))
-        if deviation is not None:
-            below_ma5_days = max(1, below_ma5_days) if deviation < 0 else 0
+        below_ma5_days = _below_ma5_days_for_snapshot(
+            code,
+            deviation,
+            context.get("跌破MA5天数"),
+            today,
+            below_ma5_state,
+            persist_below_ma5_state,
+        )
         buy_date = date_or_today(state.get("买入日期"))
         holding_days = max(0, int((today - buy_date.normalize()).days))
         rows.append({
@@ -267,6 +346,8 @@ def build_positions_from_trades(
             "操作提醒": holding_advice(current_price, ma5, qty, below_ma5_days, available_qty, holding_days),
             "买入日期": buy_date.date().isoformat(),
         })
+    if persist_below_ma5_state:
+        _save_below_ma5_state(below_ma5_state, active_codes)
     return pd.DataFrame(rows, columns=POSITION_COLUMNS)
 
 

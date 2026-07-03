@@ -40,7 +40,12 @@ export interface Stock {
   deviation5: number;   // 5日线偏离率 (%)
   bigCandlePct: number; // 最近20日内最大阳线涨幅 (%)
   ma5Upward: boolean;   // 5日线是否向上，仅作参考
-  canBuy: boolean;      // 是否满足待买观察条件 (MA5偏离率0%-2%且未放量跌破MA5)
+  canBuy: boolean;      // 是否满足待买观察条件 (MA5偏离率0%-2.5%、资金与风险约束通过)
+  lotCost?: number;
+  stopPrice?: number;
+  riskAmount?: number;
+  maxRiskAmount?: number;
+  riskPct?: number;
   group: StockGroup;
   stage: StockStage;
   riskLevel: RiskLevel;
@@ -81,6 +86,9 @@ export interface Position {
   marketValue: number;       // 市值
   floatingPnL: number;       // 浮动盈亏
   floatingPnLPct: number;    // 浮动盈亏比例 (%)
+  currentLossAmount?: number; // 当前浮亏金额，仅亏损时为正
+  maxLossAmount?: number;     // 单笔最大允许亏损金额
+  lossRiskPct?: number;       // 当前亏损占本金比例
   ma5: number;
   deviation5: number;        // 5日线偏离度
   holdDays: number;          // 持股天数
@@ -100,6 +108,14 @@ export interface TradeRuleSnapshot {
   ma5Upward: boolean;
   cashSufficient: boolean;
   inTradingTime: boolean;
+  inBuyWindow?: boolean;
+  marketRisk?: boolean;
+  stopPrice?: number;
+  riskAmount?: number;
+  maxRiskAmount?: number;
+  riskPct?: number;
+  riskLimitPct?: number;
+  buyWindow?: string;
   positionBeforeTrade?: Partial<Position>;
 }
 
@@ -174,6 +190,7 @@ export interface ReviewScreenedStock {
   volume: number;
   rank?: number;
   volRatio?: number;
+  volRatioSource?: string;
   confidence?: number;
   stars?: string;
   reason?: string;
@@ -181,6 +198,7 @@ export interface ReviewScreenedStock {
   group?: StockGroup;
   deviation5?: number;
   concept?: string;
+  conceptSource?: string;
   limitHeight?: string;
 }
 

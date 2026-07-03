@@ -4,9 +4,22 @@ import math
 import re
 from typing import Any
 
+from src.trading_rules_config import (
+    BIG_CANDLE_LOOKBACK_DAYS,
+    BIG_CANDLE_THRESHOLD_PCT,
+    BUY_ZONE_MAX_DEVIATION_PCT,
+    BUY_ZONE_MIN_DEVIATION_PCT,
+    HIGH_ZONE_MAX_DEVIATION_PCT,
+    LOT_SIZE,
+    MAX_SINGLE_TRADE_RISK_PCT,
+    OBSERVE_ZONE_MAX_DEVIATION_PCT,
+    TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
+    TAKE_PROFIT_WATCH_DEVIATION_PCT,
+    TURNOVER_TOP_N,
+    estimate_single_trade_risk,
+)
+
 ALLOWED_PREFIXES = ("600", "601", "603", "605", "000", "001", "002")
-BIG_CANDLE_LOOKBACK_DAYS = 20
-BIG_CANDLE_THRESHOLD_PCT = 5.0
 PIPELINE_STAGES = [
     "初筛通过",
     "强势确认",
@@ -91,13 +104,13 @@ def ma5_deviation(price: Any, ma5: Any) -> float | None:
 def buy_signal(deviation: float | None) -> str:
     if deviation is None:
         return "待补充MA5"
-    if deviation < 0:
+    if deviation < BUY_ZONE_MIN_DEVIATION_PCT:
         return "跌破MA5"
-    if deviation <= 2:
+    if deviation <= BUY_ZONE_MAX_DEVIATION_PCT:
         return "待买观察"
-    if deviation <= 5:
+    if deviation <= OBSERVE_ZONE_MAX_DEVIATION_PCT:
         return "继续观察"
-    if deviation <= 7:
+    if deviation <= HIGH_ZONE_MAX_DEVIATION_PCT:
         return "偏高不追"
     return "远离不追"
 
@@ -105,7 +118,7 @@ def buy_signal(deviation: float | None) -> str:
 def affordability(price: Any, capital: float = 10000) -> tuple[bool, float | None]:
     if not is_number(price):
         return False, None
-    lot_cost = float(price) * 100
+    lot_cost = float(price) * LOT_SIZE
     return lot_cost <= capital, lot_cost
 
 
@@ -186,7 +199,7 @@ def recent_big_candle_pct(history: Any, lookback: int = BIG_CANDLE_LOOKBACK_DAYS
 
 def rank_top_30(row: dict[str, Any]) -> bool:
     rank = pool_generation_rank(row)
-    return is_number(rank) and float(rank) <= 30
+    return is_number(rank) and float(rank) <= TURNOVER_TOP_N
 
 
 def valid_history(row: dict[str, Any]) -> bool:
@@ -212,7 +225,7 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
         return "淘汰", reason, reason
 
     if not rank_top_30(row):
-        return "淘汰", "成交额未进入前30", "不在今日成交额前30，暂不参与"
+        return "淘汰", f"成交额未进入前{TURNOVER_TOP_N}", f"不在今日成交额前{TURNOVER_TOP_N}，暂不参与"
 
     history_status = str(row.get("history_status", "") or "")
     if history_status in {"自动获取失败", "缺少历史K线"}:
@@ -238,13 +251,13 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
         return "未达规则", "等待MA5偏离率", "无法计算MA5偏离率，暂不进入观察池"
 
     deviation_f = float(deviation)
-    if deviation_f < 0:
+    if deviation_f < BUY_ZONE_MIN_DEVIATION_PCT:
         return "跌破MA5", "跌破MA5", "当前价跌破MA5，不进入待买"
-    if deviation_f <= 2:
-        return "待买观察", "MA5偏离率0%-2%", "接近5日线，盘中重点观察是否回踩不破。"
-    if deviation_f <= 5:
-        return "继续观察", "MA5偏离率2%-5%", "趋势仍强，等待回踩到MA5附近。"
-    if deviation_f <= 7:
+    if deviation_f <= BUY_ZONE_MAX_DEVIATION_PCT:
+        return "待买观察", "MA5偏离率0%-2.5%", "接近5日线，盘中重点观察是否回踩不破。"
+    if deviation_f <= OBSERVE_ZONE_MAX_DEVIATION_PCT:
+        return "继续观察", "MA5偏离率2.5%-5%", "趋势仍强，等待回踩到MA5附近。"
+    if deviation_f <= HIGH_ZONE_MAX_DEVIATION_PCT:
         return "偏高不追", "MA5偏离率5%-7%", "位置偏高，不追，继续观察。"
     return "远离不追", "MA5偏离率>7%", "远离5日线，不追，等后续回踩。"
 
@@ -256,13 +269,38 @@ def evaluate_stock(row: dict[str, Any]) -> dict[str, Any]:
     """
     stage, reason, reminder = stock_stage_result(row)
     group = stage_to_group(stage)
-    can_buy = stage == "待买观察" and not truthy(row.get("放量跌破MA5"))
+    price = row.get("现价")
+    available_cash = row.get("当前可用资金", row.get("当前本金", 10000))
+    initial_cash = row.get("当前本金", available_cash)
+    lot_ok, one_lot_cost = affordability(price, float(available_cash) if is_number(available_cash) else 10000)
+    risk_info = estimate_single_trade_risk(price, LOT_SIZE, row.get("MA5"))
+    risk_amount = risk_info.get("risk_amount")
+    max_risk_amount = (
+        float(initial_cash) * MAX_SINGLE_TRADE_RISK_PCT
+        if is_number(initial_cash)
+        else None
+    )
+    risk_ok = risk_amount is not None and max_risk_amount is not None and risk_amount <= max_risk_amount
+    can_buy = (
+        stage == "待买观察"
+        and not truthy(row.get("放量跌破MA5"))
+        and lot_ok
+        and risk_ok
+    )
     if stage == "淘汰":
         risk_level = "danger"
     elif stage in {"未达规则", "风险排除", "跌破MA5"}:
         risk_level = "warning"
+    elif stage == "待买观察" and not can_buy:
+        risk_level = "warning"
     else:
         risk_level = "normal"
+    if stage == "待买观察" and not lot_ok:
+        reason = "一手金额超过当前可用资金"
+        reminder = "满足形态但资金不足一手，不能进入实际买入。"
+    elif stage == "待买观察" and not risk_ok:
+        reason = "单笔风险超过本金2%"
+        reminder = "满足形态但预估止损亏损超过本金2%，不能买入。"
     return {
         "code": clean_code(row.get("代码", "")),
         "group": group,
@@ -271,6 +309,10 @@ def evaluate_stock(row: dict[str, Any]) -> dict[str, Any]:
         "risk_level": risk_level,
         "reason": reason,
         "reminder": reminder,
+        "lot_cost": one_lot_cost,
+        "risk_amount": risk_amount,
+        "max_risk_amount": max_risk_amount,
+        "stop_price": risk_info.get("stop_price"),
     }
 
 
@@ -293,7 +335,7 @@ def holding_advice(
             return "今日建仓T+1不可卖，先补当前价和MA5"
         if deviation < 0 or days >= 3:
             return "今日建仓T+1不可卖，记录跌破MA5，明日优先处理"
-        if deviation > 7:
+        if deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT:
             return "今日建仓T+1不可卖，远离MA5先记录止盈计划"
         return "今日建仓T+1不可卖，明日10:00看强弱"
     if days >= 3:
@@ -302,9 +344,11 @@ def holding_advice(
         return "补充当前价和MA5"
     if deviation < 0:
         return "14:50仍跌破MA5，考虑全卖" if available_qty < 200 else "14:50仍跌破MA5，减仓或卖出"
-    if deviation > 7:
+    if deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT:
         return "远离MA5，考虑全卖" if available_qty < 200 else "远离MA5，考虑卖出一半"
-    if deviation <= 2:
+    if deviation >= TAKE_PROFIT_WATCH_DEVIATION_PCT:
+        return "偏离MA5 5%-7%，进入止盈观察，不新增仓"
+    if deviation <= BUY_ZONE_MAX_DEVIATION_PCT:
         return "回踩MA5未破，继续持有"
     return "趋势未破，持有观察"
 
@@ -328,7 +372,7 @@ def can_be_watchlist_candidate(
     - 有历史K线
     - 最近有5%阳线
     - 当前价在MA5上方 (偏离率 >= 0)
-    - MA5偏离率在0%-2%，当前价未有效跌破MA5
+    - MA5偏离率在0%-2.5%，当前价未有效跌破MA5
 
     Returns:
         (qualifies, reason)
@@ -346,11 +390,14 @@ def can_be_watchlist_candidate(
     if deviation is None:
         return False, "无法计算MA5偏离率"
 
-    if deviation < 0:
+    if deviation < BUY_ZONE_MIN_DEVIATION_PCT:
         return False, "当前价在MA5下方"
 
-    if deviation > 2:
-        return False, "偏离MA5超过2%"
+    if deviation > BUY_ZONE_MAX_DEVIATION_PCT:
+        return False, "偏离MA5超过2.5%"
+
+    if not affordable:
+        return False, "一手金额超过当前可用资金"
 
     return True, "符合待买条件"
 
@@ -377,7 +424,7 @@ def can_be_observation_candidate(
     if deviation is None:
         return False, "无法计算MA5偏离率"
 
-    if deviation < 0:
+    if deviation < BUY_ZONE_MIN_DEVIATION_PCT:
         return False, "当前价在MA5下方"
 
     return True, "符合观察规则"
@@ -395,7 +442,7 @@ def determine_group(
 ) -> str:
     """Backward-compatible group classifier."""
     qualifies, _ = can_be_watchlist_candidate(
-        code, name, has_history, has_big_line, ma5_up, deviation, True
+        code, name, has_history, has_big_line, ma5_up, deviation, affordable
     )
     if qualifies:
         return "待买观察"
@@ -404,19 +451,19 @@ def determine_group(
         code, name, has_history, has_big_line, ma5_up, deviation
     )
     if observation_ok:
-        if deviation is not None and is_number(deviation) and 0 <= float(deviation) <= 2:
+        if deviation is not None and is_number(deviation) and BUY_ZONE_MIN_DEVIATION_PCT <= float(deviation) <= BUY_ZONE_MAX_DEVIATION_PCT:
             return "待买观察"
-        if deviation is not None and is_number(deviation) and float(deviation) <= 5:
+        if deviation is not None and is_number(deviation) and float(deviation) <= OBSERVE_ZONE_MAX_DEVIATION_PCT:
             return "继续观察"
-        if deviation is not None and is_number(deviation) and float(deviation) <= 7:
+        if deviation is not None and is_number(deviation) and float(deviation) <= HIGH_ZONE_MAX_DEVIATION_PCT:
             return "偏高不追"
-        if deviation is not None and is_number(deviation) and float(deviation) > 7:
+        if deviation is not None and is_number(deviation) and float(deviation) > HIGH_ZONE_MAX_DEVIATION_PCT:
             return "远离不追"
         return "强势确认"
 
     if not has_history:
         return "未达规则"
-    if deviation is not None and is_number(deviation) and float(deviation) < 0:
+    if deviation is not None and is_number(deviation) and float(deviation) < BUY_ZONE_MIN_DEVIATION_PCT:
         return "跌破MA5"
     return "未达规则"
 
@@ -427,10 +474,10 @@ def 提醒_level_for_deviation(deviation: float | None, has_5pct_candle: bool) -
         return "purple"  # 缺少数据
     if deviation < 0:
         return "red"
-    if deviation <= 2:
+    if deviation <= BUY_ZONE_MAX_DEVIATION_PCT:
         return "blue"
-    if deviation <= 5:
+    if deviation <= OBSERVE_ZONE_MAX_DEVIATION_PCT:
         return "amber"
-    if deviation <= 7:
+    if deviation <= HIGH_ZONE_MAX_DEVIATION_PCT:
         return "orange"
     return "red"  # > 7% or has no big candle

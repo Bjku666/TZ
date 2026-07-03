@@ -18,6 +18,10 @@ from src.rules import (
     stage_to_group,
 )
 from src.storage import backup_file, safe_write_csv
+from src.trading_rules_config import (
+    MAX_SINGLE_TRADE_RISK_PCT,
+    estimate_single_trade_risk,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -54,6 +58,10 @@ WATCHLIST_COLUMNS = [
     "当前本金",
     "当前可用资金",
     "本金是否可买",
+    "预估止损价",
+    "预估亏损金额",
+    "最大允许亏损",
+    "单笔风险%",
     "history_status",
     "history_rows",
     "history_last_date",
@@ -501,10 +509,12 @@ def merge_candidates(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataF
 def enrich_watchlist(
     df: pd.DataFrame,
     available_cash: float = 10000,
+    initial_capital: float | None = None,
     max_position_ratio: float = 1.0,
     lot_size: int = 100,
 ) -> pd.DataFrame:
     out = df.copy()
+    initial_cash = available_cash if initial_capital is None else initial_capital
     out["MA5偏离率%"] = [
         ma5_deviation(price, ma5) for price, ma5 in zip(out["现价"], out["MA5"])
     ]
@@ -512,9 +522,22 @@ def enrich_watchlist(
 
     # Affordability
     out["一手金额"] = (pd.to_numeric(out["现价"], errors="coerce").fillna(0) * lot_size).round(2)
-    out["当前本金"] = available_cash
+    out["当前本金"] = initial_cash
     out["本金是否可买"] = out["一手金额"].apply(lambda x: "可以买" if x <= available_cash else "资金不足")
     out["当前可用资金"] = available_cash
+
+    risk_rows = [
+        estimate_single_trade_risk(price, lot_size, ma5)
+        for price, ma5 in zip(out["现价"], out["MA5"])
+    ]
+    out["预估止损价"] = [row.get("stop_price") for row in risk_rows]
+    out["预估亏损金额"] = [row.get("risk_amount") for row in risk_rows]
+    out["最大允许亏损"] = round(float(initial_cash) * MAX_SINGLE_TRADE_RISK_PCT, 2) if initial_cash else pd.NA
+    out["单笔风险%"] = (
+        pd.to_numeric(out["预估亏损金额"], errors="coerce") / float(initial_cash) * 100
+        if initial_cash
+        else pd.NA
+    )
 
     # Budget calculations
     numeric_price = pd.to_numeric(out["现价"], errors="coerce")

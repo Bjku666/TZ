@@ -332,7 +332,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
 
       <div className="mt-2 text-center text-[10px] text-slate-500 flex justify-center items-center space-x-1 font-mono">
         <TrendingUp className="h-3 w-3 text-rose-400" />
-        <span>支持鼠标悬停移动查看每根日K线细节与偏离指标。5日均线回踩区间在0%~2%最优。</span>
+        <span>支持鼠标悬停移动查看每根日K线细节与偏离指标。5日均线回踩区间在0%~2.5%最优。</span>
       </div>
     </div>
   );

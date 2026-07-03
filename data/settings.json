@@ -1,7 +1,7 @@
 {
   "account_mode": "模拟训练",
   "simulation_capital": 10000,
-  "live_capital": 10000,
+  "live_capital": 5000,
   "lot_size": 100,
   "max_position_pct": 100,
   "allow_high_price": false,

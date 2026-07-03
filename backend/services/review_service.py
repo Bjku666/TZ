@@ -220,7 +220,7 @@ def _stock_screening(report: dict[str, Any]) -> dict[str, Any]:
     screening = report.get("stockScreening") or {}
     return {
         "step1": screening.get("step1")
-        or {"title": "成交额前200扫描", "reviewed": stock.get("top200Reviewed"), "stocks": stock.get("step1Screened") or []},
+        or {"title": "当前成交额前30初筛池复查", "reviewed": stock.get("top200Reviewed"), "stocks": stock.get("step1Screened") or []},
         "step2": screening.get("step2")
         or {"title": "量比前50且成交额10-20亿", "reviewed": stock.get("volRatioReviewed"), "stocks": stock.get("step2Screened") or []},
         "step3": screening.get("step3")
@@ -247,6 +247,9 @@ def report_markdown(report: dict[str, Any]) -> str:
     buy_count = stats.get("buyCount", report.get("buyCount", 0))
     sell_count = stats.get("sellCount", report.get("sellCount", 0))
     compliance = stats.get("ruleComplianceRate", report.get("ruleComplianceRate", 100))
+    buy_compliance = stats.get("buyComplianceRate", report.get("buyComplianceRate", compliance))
+    sell_compliance = stats.get("sellComplianceRate", report.get("sellComplianceRate", compliance))
+    trade_compliance = stats.get("tradeComplianceRate", report.get("tradeComplianceRate", compliance))
     realized_pnl = stats.get("realizedPnL", report.get("realizedPnL", 0))
     portfolio_risk = stats.get("portfolioRisk", report.get("portfolioRisk", ""))
 
@@ -256,7 +259,9 @@ def report_markdown(report: dict[str, Any]) -> str:
         "## 一、账户与交易结果",
         f"- 买入次数: {buy_count}",
         f"- 卖出次数: {sell_count}",
-        f"- 规则符合率: {compliance}%",
+        f"- 买入规则符合率: {buy_compliance}%",
+        f"- 卖出规则符合率: {sell_compliance}%",
+        f"- 总交易符合率: {trade_compliance}%",
         f"- 已实现盈亏: {_fmt_money(realized_pnl)}",
         f"- 持仓风险: {_clean_text(portfolio_risk)}",
         f"- 今日交易流水: {len(trades)} 条",
@@ -281,7 +286,7 @@ def report_markdown(report: dict[str, Any]) -> str:
     ]
 
     for step_key, fallback_title in [
-        ("step1", "成交额前200扫描"),
+        ("step1", "当前成交额前30初筛池复查"),
         ("step2", "量比前50且成交额10-20亿"),
         ("step3", "涨跌停板与情绪高度核查"),
     ]:
@@ -297,8 +302,10 @@ def report_markdown(report: dict[str, Any]) -> str:
             name = _clean_text(item.get("name"), "")
             code = _clean_text(item.get("code"), "")
             reason = _clean_text(item.get("reason"), "")
+            source_note = _clean_text(item.get("volRatioSource") or item.get("conceptSource"), "")
             lines.append(
                 f"- {name} {code} | 涨跌 {_fmt_pct(item.get('pct'))} | 成交 {_fmt_amount_yi(item.get('volume'))} | {reason}"
+                + (f" | {source_note}" if source_note != "未填写" else "")
             )
 
     lines.extend(["", "## 五、我的自我诊断记录"])

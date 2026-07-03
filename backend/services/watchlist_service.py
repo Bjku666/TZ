@@ -9,6 +9,7 @@ from src.data import (
     archive_import_file,
     assign_pool_batch,
     enrich_watchlist,
+    filter_trades_by_account_mode,
     load_holdings,
     load_trades,
     load_watchlist,
@@ -16,7 +17,7 @@ from src.data import (
     standardize_import_file,
 )
 from src.history import compute_all_reminders, diagnose_history, fetch_and_cache
-from src.portfolio import build_positions_from_trades
+from src.portfolio import account_state_from_trades, build_positions_from_trades
 from src.realtime import (
     fetch_auto_stock_pool,
     fetch_realtime_quotes,
@@ -25,7 +26,7 @@ from src.realtime import (
 from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
 from src.storage import load_quote_snapshot, save_quote_snapshot
 
-from backend.services.settings_service import get_settings, initial_cash
+from backend.services.settings_service import account_mode_name, get_settings, initial_cash
 from backend.storage.csv_adapter import (
     FRONTEND_GROUP_TO_STAGE,
     ensure_watchlist_frame,
@@ -64,16 +65,26 @@ def _held_codes(watchlist: pd.DataFrame) -> set[str]:
     return {code for code in codes if code}
 
 
+def _account_cash_for_watchlist(frame: pd.DataFrame) -> tuple[float, float]:
+    account_mode = account_mode_name()
+    capital = initial_cash()
+    trades = filter_trades_by_account_mode(load_trades(), account_mode)
+    legacy_holdings = load_holdings()
+    positions = build_positions_from_trades(trades, frame, legacy_holdings)
+    state = account_state_from_trades(trades, positions, capital, account_mode)
+    return float(state.get("当前现金") or capital), capital
+
+
 def recompute_watchlist(frame: pd.DataFrame, cash: float | None = None) -> pd.DataFrame:
     if frame.empty:
         return ensure_watchlist_frame(frame)
-    available_cash = initial_cash() if cash is None else cash
+    available_cash, capital = _account_cash_for_watchlist(frame) if cash is None else (cash, initial_cash())
     out = ensure_watchlist_frame(frame)
     reminders = compute_all_reminders(out, available_cash)
     for column in reminders.columns:
         if column in out.columns and len(reminders) == len(out):
             out[column] = reminders[column].values
-    enriched = enrich_watchlist(out, available_cash)
+    enriched = enrich_watchlist(out, available_cash, initial_capital=capital)
     for column in enriched.columns:
         if column in out.columns and len(enriched) == len(out):
             out[column] = enriched[column].values
@@ -94,7 +105,7 @@ def recompute_watchlist(frame: pd.DataFrame, cash: float | None = None) -> pd.Da
 
 
 def list_watchlist() -> dict[str, Any]:
-    frame = load_watchlist()
+    frame = recompute_watchlist(load_watchlist())
     return {"list": watchlist_to_api(frame)}
 
 

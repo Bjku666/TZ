@@ -15,6 +15,10 @@ from src.portfolio import (
     portfolio_to_legacy_holdings,
 )
 from src.rules import clean_code
+from src.trading_rules_config import (
+    MAX_SINGLE_TRADE_RISK_PCT,
+    TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
+)
 from src.storage import load_last_refresh, load_quote_snapshot
 
 from backend.services.settings_service import account_mode_name, initial_cash
@@ -25,7 +29,7 @@ def _risk_level(advice: str, deviation: float) -> str:
     text = str(advice or "")
     if "清仓" in text or "卖出" in text or "跌破" in text:
         return "danger"
-    if deviation > 7:
+    if deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT:
         return "warning"
     return "normal"
 
@@ -275,7 +279,12 @@ def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> di
     trades = filter_trades_by_account_mode(load_trades(), account_mode)
     watchlist = load_watchlist()
     legacy_holdings = load_holdings()
-    positions = build_positions_from_trades(trades, watchlist, legacy_holdings)
+    positions = build_positions_from_trades(
+        trades,
+        watchlist,
+        legacy_holdings,
+        persist_below_ma5_state=sync_legacy,
+    )
     if sync_legacy:
         save_holdings(portfolio_to_legacy_holdings(positions))
 
@@ -290,14 +299,19 @@ def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> di
         deviation = number(row.get("MA5偏离率%"))
         advice = str(row.get("操作提醒") or "")
         code = str(row.get("代码") or "")
+        avg_cost = number(row.get("平均成本"))
+        current_price = number(row.get("当前价"))
+        quantity = int(number(row.get("数量")))
+        current_loss_amount = max(0.0, (avg_cost - current_price) * quantity)
+        max_loss_amount = number(state.get("初始本金")) * MAX_SINGLE_TRADE_RISK_PCT
         api_positions.append(
             {
                 "code": code,
                 "name": str(row.get("名称") or ""),
-                "quantity": int(number(row.get("数量"))),
+                "quantity": quantity,
                 "availableQuantity": int(number(row.get("可卖数量"))),
-                "avgCost": number(row.get("平均成本")),
-                "currentPrice": number(row.get("当前价")),
+                "avgCost": avg_cost,
+                "currentPrice": current_price,
                 "marketValue": market_value,
                 "floatingPnL": number(row.get("浮动盈亏")),
                 "floatingPnLPct": number(row.get("浮动盈亏%")),
@@ -308,6 +322,11 @@ def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> di
                 "buyDate": str(row.get("买入日期") or ""),
                 "advice": advice,
                 "riskLevel": _risk_level(advice, deviation),
+                "currentLossAmount": round(current_loss_amount, 2),
+                "maxLossAmount": round(max_loss_amount, 2),
+                "lossRiskPct": round(current_loss_amount / number(state.get("初始本金")) * 100, 2)
+                if number(state.get("初始本金")) > 0
+                else 0,
                 "tradeLink": _position_trade_link(code, grouped_trades, today),
             }
         )

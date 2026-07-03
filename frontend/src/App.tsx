@@ -34,6 +34,12 @@ import { Stock, TradeLog, StockGroup, StockViewGroup, StockStage, Position, Acco
 const QUOTE_AUTO_REFRESH_SECONDS = 30;
 const TURNOVER_AUTO_SCAN_SECONDS = 180;
 const REVIEW_SCREEN_LIMIT = 50;
+const BUY_ZONE_MAX_DEVIATION_PCT = 2.5;
+const OBSERVE_ZONE_MAX_DEVIATION_PCT = 5;
+const HIGH_ZONE_MAX_DEVIATION_PCT = 7;
+const TAKE_PROFIT_WATCH_DEVIATION_PCT = 5;
+const TAKE_PROFIT_PRIORITY_DEVIATION_PCT = 7;
+const MAX_SINGLE_TRADE_RISK_PCT = 0.02;
 const CARD_TEXT_ENDING_PERIOD = /([。．]|(?<!\.)\.)([”’"'）)\]】》]*)\s*$/u;
 type AccountMode = "simulation" | "real";
 type QuoteRefreshTrigger = "manual" | "auto";
@@ -341,6 +347,35 @@ function percentDistance(currentPrice: number, linePrice: number): number | null
   return ((currentPrice - linePrice) / linePrice) * 100;
 }
 
+function isAllowedBuyWindow(value: Date): boolean {
+  const day = value.getDay();
+  if (day < 1 || day > 5) return false;
+  const minutes = value.getHours() * 60 + value.getMinutes();
+  const morning = minutes >= 9 * 60 + 35 && minutes <= 10 * 60;
+  const afternoon = minutes >= 14 * 60 + 30 && minutes <= 14 * 60 + 55;
+  return morning || afternoon;
+}
+
+function estimateBuyRiskAmount(price: number, quantity: number, ma5: number, estimatedSellFee = 0): {
+  stopPrice: number;
+  riskAmount: number;
+  riskPct: number;
+} {
+  const safePrice = Number(price);
+  const safeQuantity = Number(quantity);
+  const safeMa5 = Number(ma5);
+  if (!Number.isFinite(safePrice) || !Number.isFinite(safeQuantity) || !Number.isFinite(safeMa5) || safeMa5 <= 0 || safeQuantity <= 0) {
+    return { stopPrice: 0, riskAmount: 0, riskPct: 0 };
+  }
+  const stopPrice = safeMa5 * 0.99;
+  const riskAmount = Math.max(0, safePrice - stopPrice) * safeQuantity + Math.max(0, estimatedSellFee);
+  return {
+    stopPrice,
+    riskAmount,
+    riskPct: 0
+  };
+}
+
 function lineDistanceLabel(currentPrice: number, linePrice: number, mode: "target" | "floor"): string {
   const distance = percentDistance(currentPrice, linePrice);
   if (distance === null) return "缺少价格";
@@ -354,7 +389,8 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   const deviation = Number.isFinite(position.deviation5) ? position.deviation5 : 0;
   const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
   const belowMa5 = hasMa5 && deviation < 0;
-  const farFromMa5 = hasMa5 && deviation > 7;
+  const takeProfitWatch = hasMa5 && deviation >= TAKE_PROFIT_WATCH_DEVIATION_PCT;
+  const farFromMa5 = hasMa5 && deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT;
   const belowDays = Math.max(0, Math.floor(Number(position.belowMa5Days) || 0));
   const availableQuantity = Math.max(0, Math.floor(Number(position.availableQuantity) || 0));
   const t1Locked = availableQuantity <= 0;
@@ -374,9 +410,11 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   const takeProfitRule = !hasMa5
     ? "缺少MA5，先补齐K线后再判断是否远离5日线。"
     : t1Locked && farFromMa5
-      ? `当前偏离MA5 ${signedPercent(deviation)}，但今日仓T+1不可卖；先写好明日止盈计划。`
+        ? `当前偏离MA5 ${signedPercent(deviation)}，但今日仓T+1不可卖；先写好明日止盈计划。`
     : farFromMa5
       ? `当前偏离MA5 ${signedPercent(deviation)}，已进入远离5日线止盈层。${sizingRule}`
+      : takeProfitWatch
+        ? `当前偏离MA5 ${signedPercent(deviation)}，进入5%-7%止盈观察层，不新增仓。`
       : `当前偏离MA5 ${signedPercent(deviation)}，尚未明显远离5日线；不因普通上涨随意卖飞。`;
   const ma5RiskRule = !hasMa5
     ? "缺少MA5，暂不能执行5日线风控判断。"
@@ -496,11 +534,31 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
     };
   }
 
+  if (takeProfitWatch) {
+    return {
+      tone: "warning",
+      triggerKey: "take-profit",
+      priority: 3,
+      statusLabel: "止盈观察",
+      title: "偏离MA5 5%-7%，进入止盈观察",
+      primaryAction: "趋势还没坏，但已经明显偏离5日线；不新增仓，观察是否冲高回落或继续远离。",
+      nextMorningRule,
+      takeProfitRule,
+      ma5RiskRule,
+      sizingRule,
+      sellReason: "偏离5日线5%-7%，进入止盈观察后主动减仓或止盈",
+      buttonLabel: "记录止盈",
+      cardClass: "bg-slate-900/70 border-amber-900/70 text-slate-200",
+      dotClass: "bg-amber-500",
+      badgeClass: "bg-amber-950 text-amber-300 border border-amber-700/60"
+    };
+  }
+
   if (position.holdDays <= 1) {
     return {
       tone: "warning",
       triggerKey: "next-day",
-      priority: 3,
+      priority: 4,
       statusLabel: "次日观察",
       title: "隔日短线，10点前看强不强",
       primaryAction: "新仓或隔日仓的核心是强度。10点前不继续上攻，就冲高卖出或退出。",
@@ -560,10 +618,10 @@ export default function App() {
   // 核心应用状态
   const [activeTab, setActiveTab] = useState<"dashboard" | "watchlist" | "intraday" | "trades" | "review" | "settings">("dashboard");
   const [accountState, setAccountState] = useState<AccountState>({
-    initialCash: 100000,
-    availableCash: 100000,
+    initialCash: 10000,
+    availableCash: 10000,
     holdingValue: 0,
-    totalAssets: 100000,
+    totalAssets: 10000,
     realizedPnL: 0,
     floatingPnL: 0,
     totalPnL: 0,
@@ -687,14 +745,11 @@ export default function App() {
   };
 
   const enrichScreenedStock = (stock: Stock, step: "step1" | "step2" | "step3", index: number): ReviewScreenedStock => {
-    const hash = stockHash(stock.code);
-    const volRatio = Number(((hash % 18) / 10 + 1.5).toFixed(1));
-    const concepts = ["数字经济 / 金融科技", "华为生态 / 国产替代", "固态电池 / 新能源车", "低空经济 / 卫星导航", "AI算力 / 模型应用"];
-    const concept = concepts[hash % concepts.length];
-
     let confidence = Math.max(58, 88 - Math.min(index, 30));
     let reason = "高成交活跃票，流动性足够，适合纳入拉网复盘观察。";
     let limitHeight = "";
+    const volRatioSource = "未接入真实量比，不作为交易依据";
+    const conceptSource = "未接入真实题材，需要手动核查";
 
     if (step === "step1") {
       if (stock.canBuy) {
@@ -710,8 +765,8 @@ export default function App() {
     }
 
     if (step === "step2") {
-      confidence = Math.min(96, Math.round(72 + volRatio * 6 + Math.min(Math.abs(stock.pct), 6)));
-      reason = `量比估算 ${volRatio} 倍，成交额 ${(stock.volume / 100000000).toFixed(1)} 亿，属于放量异动复查对象。`;
+      confidence = Math.min(90, Math.round(72 + Math.min(Math.abs(stock.pct), 8) * 2));
+      reason = `未接入真实量比；当前仅按成交额 ${(stock.volume / 100000000).toFixed(1)} 亿和涨跌幅复查放量异动线索。`;
       if (stock.pct > 2 && stock.canBuy) {
         reason = "放量突破后仍贴近纪律买点，多头承接和回踩位置都需要重点核查。";
       } else if (stock.pct < 0 && stock.deviation5 >= 0 && stock.deviation5 <= 3) {
@@ -720,16 +775,17 @@ export default function App() {
     }
 
     if (step === "step3") {
+      const hash = stockHash(stock.code);
       const isLimitUp = stock.pct >= 9.5;
       const isLimitDown = stock.pct <= -9.5;
       limitHeight = isLimitUp ? (hash % 2 === 0 ? "首板强势" : "连板高度") : isLimitDown ? "跌停风险" : "强趋势票";
       confidence = isLimitUp ? 94 : isLimitDown ? 30 : Math.min(90, 75 + Math.max(stock.pct, 0));
       if (isLimitUp) {
-        reason = `涨停或接近涨停，题材归属[${concept}]，需核查封板质量和次日溢价风险。`;
+        reason = "涨停或接近涨停，需手动核查真实题材、封板质量和次日溢价风险。";
       } else if (isLimitDown) {
         reason = "跌停或接近跌停，情绪退潮明显，只做风险记录，不做抄底幻想。";
       } else {
-        reason = `强趋势涨幅 ${stock.pct.toFixed(2)}%，题材归属[${concept}]，复查是否具备回踩后的二波条件。`;
+        reason = `强趋势涨幅 ${stock.pct.toFixed(2)}%，需手动核查真实题材后再判断是否具备回踩二波条件。`;
       }
     }
 
@@ -740,14 +796,14 @@ export default function App() {
       pct: stock.pct,
       volume: stock.volume,
       rank: stock.rank,
-      volRatio,
+      volRatioSource,
       confidence,
       stars: confidenceStars(confidence),
       reason,
       stage: stock.stage,
       group: stock.group,
       deviation5: stock.deviation5,
-      concept,
+      conceptSource,
       limitHeight
     };
   };
@@ -1370,7 +1426,8 @@ export default function App() {
           quantity: Number(tradeQuantity),
           reason: tradeReason,
           remark: tradeRemark,
-          mode: currentMode
+          mode: currentMode,
+          systemicRisk
         })
       });
 
@@ -1471,12 +1528,21 @@ export default function App() {
     const todayRealizedPnL = calculateRealizedPnLByDate(trades, reportDate);
     const buyCount = reportTrades.filter(t => t.type === "BUY").length;
     const sellCount = reportTrades.filter(t => t.type === "SELL").length;
+    const reportBuys = reportTrades.filter(t => t.type === "BUY");
+    const reportSells = reportTrades.filter(t => t.type === "SELL");
     const compliantCount = reportTrades.filter(t => t.rulesConclusion === "符合规则").length;
+    const compliantBuyCount = reportBuys.filter(t => t.rulesConclusion === "符合规则").length;
+    const compliantSellCount = reportSells.filter(t => t.rulesConclusion === "符合规则").length;
     const complianceRate = reportTrades.length > 0 ? Number(((compliantCount / reportTrades.length) * 100).toFixed(2)) : 100;
+    const buyComplianceRate = reportBuys.length > 0 ? Number(((compliantBuyCount / reportBuys.length) * 100).toFixed(2)) : 100;
+    const sellComplianceRate = reportSells.length > 0 ? Number(((compliantSellCount / reportSells.length) * 100).toFixed(2)) : 100;
     const portfolioRisk = positions.filter(p => p.riskLevel === "danger").length > 0 ? "高风险 (部分持仓已破5日线)" : "正常 (持仓均在5日线上方)";
+    const autoTomorrowPlan = positions.length === 0
+      ? "无持仓；若无0%~2.5%待买且市场/板块不强，明日保持空仓。"
+      : positions.map(pos => `${pos.name} ${pos.code}: ${buildPositionSellPlan(pos).primaryAction}`).join("\n");
     const stockScreening = {
       step1: {
-        title: "成交额前200扫描",
+        title: "当前成交额前30初筛池复查",
         reviewed: top200Reviewed,
         stocks: step1Screened
       },
@@ -1505,6 +1571,9 @@ export default function App() {
         buyCount,
         sellCount,
         ruleComplianceRate: complianceRate,
+        buyComplianceRate,
+        sellComplianceRate,
+        tradeComplianceRate: complianceRate,
         realizedPnL: Number(todayRealizedPnL.toFixed(2)),
         portfolioRisk
       },
@@ -1515,7 +1584,7 @@ export default function App() {
       realizedPnL: Number(todayRealizedPnL.toFixed(2)),
       portfolioRisk,
       summary: reportSummary,
-      tomorrowPlan: reportPlan,
+      tomorrowPlan: reportPlan || autoTomorrowPlan,
       createdTime: new Date().toLocaleString(),
       marketAnalysis: {
         shTrend,
@@ -1556,7 +1625,7 @@ export default function App() {
       },
       reflection: {
         summary: reportSummary,
-        tomorrowPlan: reportPlan
+        tomorrowPlan: reportPlan || autoTomorrowPlan
       }
     };
 
@@ -1693,8 +1762,26 @@ export default function App() {
   const calculateEstimateFees = () => calculateFeeBreakdown(tradeType, tradePrice, tradeQuantity);
 
   const est = calculateEstimateFees();
+  const estimatedSellFees = calculateFeeBreakdown("SELL", tradePrice, tradeQuantity);
+  const buyRiskEstimate = estimateBuyRiskAmount(tradePrice, tradeQuantity, tradeTarget?.ma5 || 0, estimatedSellFees.total);
+  const buyRiskAmount = buyRiskEstimate.riskAmount;
+  const maxAllowedRiskAmount = accountState.initialCash * MAX_SINGLE_TRADE_RISK_PCT;
+  const buyRiskPct = accountState.initialCash > 0 ? (buyRiskAmount / accountState.initialCash) * 100 : 0;
   const activeTradePosition = tradeTarget ? positions.find(pos => pos.code === tradeTarget.code) : null;
   const activeAvailableQuantity = activeTradePosition ? Math.max(0, Math.floor(Number(activeTradePosition.availableQuantity) || 0)) : 0;
+  const currentInBuyWindow = isAllowedBuyWindow(currentTime);
+  const tradeDeviationAtPrice = tradeTarget?.ma5 ? ((tradePrice - tradeTarget.ma5) / tradeTarget.ma5) * 100 : Number.NaN;
+  const buyFormHasHardRisk = tradeType === "BUY" && (
+    !tradeTarget?.canBuy ||
+    !currentInBuyWindow ||
+    systemicRisk ||
+    tradeQuantity < 100 ||
+    accountState.availableCash < tradePrice * 100 ||
+    tradeDeviationAtPrice < 0 ||
+    tradeDeviationAtPrice > BUY_ZONE_MAX_DEVIATION_PCT ||
+    buyRiskAmount <= 0 ||
+    buyRiskAmount > maxAllowedRiskAmount
+  );
 
   // 判断 A股交易时间段 (9:30-11:30, 13:00-15:00)
   const isAStockTradingTime = () => {
@@ -1721,7 +1808,7 @@ export default function App() {
         action: "收盘写快照与周复盘",
         color: "text-slate-400",
         guidelines: [
-          "💡 自我审计：进入「交易记录审计」和「复盘笔记归档」，总结本周的所有交易操作是否严格执行买入偏离度（0%~2%）和卖出（跌破MA5）纪律。",
+          "💡 自我审计：进入「交易记录审计」和「复盘笔记归档」，总结本周的所有交易操作是否严格执行买入偏离度（0%~2.5%）和卖出（跌破MA5）纪律。",
           "💡 模拟训练备战：切换到「模拟训练」模式，点击「清空交易流水」并重新设定模拟本金进行超短线操盘练习，巩固对回踩均线低吸的认知。"
         ]
       };
@@ -1758,7 +1845,7 @@ export default function App() {
         color: "text-emerald-400",
         guidelines: [
           "✅ 符合铁律买入期：此时间段主力拉升或踩支撑意图已初步明晰。立即核对「继续观察」和「待买」列表！",
-          "📈 黄金偏离率买入：若看好个股出现回踩5日线，偏离度在 0% ~ 2% 且未有效跌破MA5，符合低吸纪律，可轻仓/按批次记录买入。"
+          "📈 黄金偏离率买入：若看好个股出现回踩5日线，偏离度在 0% ~ 2.5% 且未有效跌破MA5，符合低吸纪律，可轻仓/按批次记录买入。"
         ]
       };
     } else if (tot > 10 * 60 && tot < 13 * 60) {
@@ -1791,7 +1878,7 @@ export default function App() {
         color: "text-emerald-400",
         guidelines: [
           "✅ 尾盘安全买入期：由于收盘临近，5日线支撑是否有效已得到基本确认，是判定大阳股回踩低吸最为安全的防诱多买点时点！",
-          "📈 支撑校验：若股价平稳落在5日线附近，偏离度在 0% ~ 2% 且5日线未跌破，可分批补录建仓，锁定低吸机会。"
+          "📈 支撑校验：若股价平稳落在5日线附近，偏离度在 0% ~ 2.5% 且5日线未跌破，可分批补录建仓，锁定低吸机会。"
         ]
       };
     } else if (tot >= 14 * 60 + 50 && tot <= 14 * 60 + 55) {
@@ -1843,9 +1930,9 @@ export default function App() {
   const observationStages: StockStage[] = ["强势确认", "继续观察", "偏高不追", "远离不追", "待买观察"];
   const observationStageForStock = (stock: Stock): StockStage | null => {
     if (hasStrongStartSignal(stock) && hasValidMa5(stock) && stock.deviation5 >= 0) {
-      if (stock.deviation5 <= 2) return "待买观察";
-      if (stock.deviation5 <= 5) return "继续观察";
-      if (stock.deviation5 <= 7) return "偏高不追";
+      if (stock.deviation5 <= BUY_ZONE_MAX_DEVIATION_PCT) return "待买观察";
+      if (stock.deviation5 <= OBSERVE_ZONE_MAX_DEVIATION_PCT) return "继续观察";
+      if (stock.deviation5 <= HIGH_ZONE_MAX_DEVIATION_PCT) return "偏高不追";
       return "远离不追";
     }
     return observationStages.includes(stock.stage) ? stock.stage : null;
@@ -2029,8 +2116,8 @@ export default function App() {
     text += `- 市场结论：${marketConclusion || "未填写"}\n`;
     text += `- 热点板块：${hotSectors || "未填写"}\n\n`;
     text += `三、全市场扫描\n`;
-    text += `- 步骤1 成交额扫描：${top200Reviewed ? "已复查" : "未确认"}，保存 ${step1Screened.length} 只。\n`;
-    text += `- 步骤2 量比异动：${volRatioReviewed ? "已复查" : "未确认"}，保存 ${step2Screened.length} 只。\n`;
+    text += `- 步骤1 当前前30初筛池复查：${top200Reviewed ? "已复查" : "未确认"}，保存 ${step1Screened.length} 只。\n`;
+    text += `- 步骤2 放量异动线索：${volRatioReviewed ? "已复查" : "未确认"}，保存 ${step2Screened.length} 只。\n`;
     text += `- 步骤3 情绪高度：${limitUpReviewed ? "已复查" : "未确认"}，保存 ${step3Screened.length} 只。\n\n`;
     text += `四、自我诊断\n`;
     if (diagnosedHoldings.length === 0) {
@@ -2195,13 +2282,14 @@ export default function App() {
         </div>
         <button
           onClick={() => openBuyModal(stock)}
-          className="shrink-0 rounded bg-rose-600 px-3 py-1.5 text-xs font-black text-white shadow-sm transition hover:bg-rose-500"
+          disabled={!stock.canBuy || !currentInBuyWindow || systemicRisk}
+          className="shrink-0 rounded bg-rose-600 px-3 py-1.5 text-xs font-black text-white shadow-sm transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500"
         >
           盘中确认
         </button>
       </div>
       <CardText className="mt-2 line-clamp-1 text-[11px] font-semibold text-slate-300">
-        {stock.reason || stock.reminder || "MA5偏离率0%~2%，等待盘中确认"}
+        {stock.reason || stock.reminder || "MA5偏离率0%~2.5%，等待盘中确认"}
       </CardText>
     </div>
   );
@@ -2225,7 +2313,7 @@ export default function App() {
       </div>
       {buyReadyStocks.length === 0 ? (
         <CardText as="div" className="rounded-lg border border-dashed border-slate-800 bg-slate-950/50 p-4 text-center text-xs font-semibold text-slate-500">
-          暂无待买观察。刷新行情后，这里只显示进入 MA5 0%~2% 低吸区的股票
+          暂无待买观察。刷新行情后，这里只显示进入 MA5 0%~2.5% 低吸区且通过资金/风险约束的股票
         </CardText>
       ) : (
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -2356,7 +2444,8 @@ export default function App() {
                   </div>
                   <div className="mt-1 flex flex-wrap items-center gap-2 text-[9px] text-slate-500">
                     <span>成交 {(stock.volume / 100000000).toFixed(1)}亿</span>
-                    {stock.volRatio !== undefined && <span>量比 {stock.volRatio}</span>}
+                    {stock.volRatioSource && <span>{stock.volRatioSource}</span>}
+                    {stock.conceptSource && <span>{stock.conceptSource}</span>}
                     {stock.limitHeight && <span className="text-amber-400">{stock.limitHeight}</span>}
                   </div>
                 </div>
@@ -2434,17 +2523,28 @@ export default function App() {
     const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
     const canSellToday = Math.max(0, Math.floor(Number(position.availableQuantity) || 0)) > 0;
     const tradeLink = position.tradeLink;
-    const stopLossPct = systemicRisk ? 7 : 9;
-    const hardStopLine = position.avgCost > 0 ? position.avgCost * (1 - stopLossPct / 100) : 0;
-    const takeProfitLine = hasMa5 ? position.ma5 * 1.07 : 0;
+    const maxLossAmount = Number(position.maxLossAmount) > 0 ? Number(position.maxLossAmount) : accountState.initialCash * MAX_SINGLE_TRADE_RISK_PCT;
+    const currentLossAmount = Number(position.currentLossAmount) || Math.max(0, (position.avgCost - position.currentPrice) * position.quantity);
+    const maxLossLine = position.quantity > 0 ? position.avgCost - (maxLossAmount / position.quantity) : 0;
+    const takeProfitWatchLine = hasMa5 ? position.ma5 * (1 + TAKE_PROFIT_WATCH_DEVIATION_PCT / 100) : 0;
+    const takeProfitPriorityLine = hasMa5 ? position.ma5 * (1 + TAKE_PROFIT_PRIORITY_DEVIATION_PCT / 100) : 0;
     const ma5DistanceText = hasMa5 ? lineDistanceLabel(position.currentPrice, position.ma5, "floor") : "等待MA5";
     const sellLineRows = [
       {
         label: "止盈观察线",
-        formula: "MA5 +7%",
-        value: takeProfitLine,
-        text: hasMa5 ? lineDistanceLabel(position.currentPrice, takeProfitLine, "target") : "等待MA5",
+        formula: "MA5 +5%",
+        value: takeProfitWatchLine,
+        text: hasMa5 ? lineDistanceLabel(position.currentPrice, takeProfitWatchLine, "target") : "等待MA5",
         active: plan.triggerKey === "take-profit",
+        activeClass: "border-amber-700/70 bg-amber-950/20",
+        labelClass: "text-amber-300"
+      },
+      {
+        label: "优先止盈线",
+        formula: "MA5 +7%",
+        value: takeProfitPriorityLine,
+        text: hasMa5 ? lineDistanceLabel(position.currentPrice, takeProfitPriorityLine, "target") : "等待MA5",
+        active: plan.triggerKey === "take-profit" && position.deviation5 > TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
         activeClass: "border-amber-700/70 bg-amber-950/20",
         labelClass: "text-amber-300"
       },
@@ -2458,11 +2558,11 @@ export default function App() {
         labelClass: "text-rose-300"
       },
       {
-        label: "成本硬止损线",
-        formula: systemicRisk ? "成本 -7%" : "成本 -9%",
-        value: hardStopLine,
-        text: hardStopLine > 0 ? lineDistanceLabel(position.currentPrice, hardStopLine, "floor") : "等待成本",
-        active: hardStopLine > 0 && position.currentPrice <= hardStopLine,
+        label: "单笔亏损线",
+        formula: "本金 -2%",
+        value: maxLossLine,
+        text: maxLossLine > 0 ? `当前浮亏 ${currentLossAmount.toFixed(2)} / ${maxLossAmount.toFixed(2)} 元` : "等待成本",
+        active: maxLossAmount > 0 && currentLossAmount >= maxLossAmount,
         activeClass: "border-red-700/70 bg-red-950/20",
         labelClass: "text-red-300"
       }
@@ -2599,7 +2699,7 @@ export default function App() {
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
             <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">止盈 / 止损线</span>
             <span className="text-[10px] text-slate-500 font-mono">
-              当前价 {formatPrice(position.currentPrice)} · 硬止损{systemicRisk ? "已按系统风险收紧" : "按常规水位"}
+              当前价 {formatPrice(position.currentPrice)} · 单笔亏损上限 {maxLossAmount.toFixed(2)} 元
             </span>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
@@ -2874,7 +2974,7 @@ export default function App() {
                     <Sparkles className="h-4 w-4 text-amber-400 fill-amber-400" />
                     <h3 className="text-sm font-semibold text-slate-200">欢迎使用强势回踩短线交易纪律系统</h3>
                   </div>
-                  <CardText className="text-xs text-slate-400">本系统围绕<b>沪深主板前排股5日均线（0%~2%）回踩低吸</b>交易纪律，约束盘前选股，强化交易存证，阻断乱买冲动。</CardText>
+                  <CardText className="text-xs text-slate-400">本系统围绕<b>沪深主板前排股5日均线（0%~2.5%）回踩低吸</b>交易纪律，约束盘前选股，强化交易存证，阻断乱买冲动。</CardText>
                 </div>
                 <div className="w-full lg:w-[420px] rounded-lg border border-slate-800 bg-slate-950/45 px-3 py-3">
                   <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
@@ -2972,7 +3072,7 @@ export default function App() {
                     <span className="text-3xl font-black text-cyan-300">{pendingBuyCount}</span>
                     <span className="text-xs text-cyan-300 font-bold">重点盯</span>
                   </div>
-                  <CardText className="text-[11px] text-slate-300 mt-2 font-semibold">大阳启动后回踩MA5 0%~2%，未跌破</CardText>
+                  <CardText className="text-[11px] text-slate-300 mt-2 font-semibold">大阳启动后回踩MA5 0%~2.5%，未跌破且通过资金/风险约束</CardText>
                 </div>
               </div>
 
@@ -3086,9 +3186,9 @@ export default function App() {
                         <span className="text-xs font-bold uppercase tracking-wider">买点区间</span>
                       </div>
                       <div className="space-y-1">
-                        <h4 className="text-xs font-extrabold text-slate-200">距 MA5 0% ~ 2% 黄金低吸金区</h4>
+                        <h4 className="text-xs font-extrabold text-slate-200">距 MA5 0% ~ 2.5% 黄金低吸区</h4>
                         <CardText className="text-[11px] text-slate-400 leading-normal">
-                          股价调整回踩至 <b>0%~2%</b> 为待买观察；<b>2%~5%</b> 继续观察；<b>5%~7%</b> 偏高不追；<b>&gt;7%</b> 远离不追；<b>&lt;0%</b> 跌破MA5，不进入待买。
+                          股价调整回踩至 <b>0%~2.5%</b> 为待买观察；<b>2.5%~5%</b> 继续观察；<b>5%~7%</b> 偏高不追；<b>&gt;7%</b> 远离不追；<b>&lt;0%</b> 跌破MA5，不进入待买。
                         </CardText>
                       </div>
                     </div>
@@ -3128,9 +3228,9 @@ export default function App() {
                         <span className="text-xs font-bold uppercase tracking-wider">卖出纪律</span>
                       </div>
                       <div className="space-y-1">
-                        <h4 className="text-xs font-extrabold text-slate-200">5 日线管理仓位 (若大盘风险收紧止损位)</h4>
+                        <h4 className="text-xs font-extrabold text-slate-200">5 日线管理仓位 + 本金2%硬风控</h4>
                         <CardText className="text-[11px] text-slate-400 leading-normal">
-                          次日 10:00 前不强就走（无溢价冲高无力）；远离 MA5 止盈；14:50 跌破看减仓/直接清仓；3日不收回强制淘汰。<b>若大盘见顶或大阴系统性风险，单股止损位由 9~10% 严格上调收紧到 7~8% 铁律！</b>
+                          次日 10:00 前不强就走（无溢价冲高无力）；偏离 MA5 5%~7% 进入止盈观察，&gt;7% 优先止盈；14:50 跌破看减仓/直接清仓；3日不收回强制淘汰。单笔亏损触及本金2%时进入硬风控。
                         </CardText>
                       </div>
                     </div>
@@ -3488,7 +3588,7 @@ export default function App() {
                                 <td className="p-3 text-right font-mono text-slate-400">
                                   {s.volume > 0 ? (s.volume / 10000).toLocaleString(undefined, { maximumFractionDigits: 0 }) : "0"}
                                 </td>
-                                <td className={`p-3 text-right font-mono font-bold ${s.deviation5 < 0 ? "text-emerald-500" : s.deviation5 <= 2.0 ? "text-cyan-400 underline decoration-cyan-500" : "text-rose-400"}`}>
+                                <td className={`p-3 text-right font-mono font-bold ${s.deviation5 < 0 ? "text-emerald-500" : s.deviation5 <= BUY_ZONE_MAX_DEVIATION_PCT ? "text-cyan-400 underline decoration-cyan-500" : "text-rose-400"}`}>
                                   {s.deviation5}%
                                 </td>
                                 <td className="p-3 text-right font-mono text-slate-400">
@@ -3519,7 +3619,8 @@ export default function App() {
                                     {watchlistGroup === "待买" && (
                                       <button
                                         onClick={() => openBuyModal(s)}
-                                        className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[10px] rounded"
+                                        disabled={!s.canBuy || !currentInBuyWindow || systemicRisk}
+                                        className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold text-[10px] rounded"
                                       >
                                         盘中确认
                                       </button>
@@ -3713,13 +3814,13 @@ export default function App() {
                     <h3 className="text-sm font-black text-slate-100">待买观察候选</h3>
                     <span className="rounded bg-cyan-950 px-2 py-0.5 text-xs font-black text-cyan-300">{buyReadyStocks.length} 只</span>
                   </div>
-                  <span className="text-[11px] font-semibold text-slate-400">5日线偏离度 0%~2%，盘中确认后才记录买入</span>
+                  <span className="text-[11px] font-semibold text-slate-400">5日线偏离度 0%~2.5%，盘中确认并通过资金/风险约束后才记录买入</span>
                 </div>
 
                 <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
                   {buyReadyStocks.length === 0 ? (
                     <CardText as="div" className="p-8 text-center text-slate-500 bg-slate-950 rounded-lg border border-slate-800/40 text-xs font-semibold xl:col-span-2">
-                      盘中暂无进入待买观察层（大阳启动后回踩MA5，偏离度0%~2%且未跌破MA5）的主板股。请刷新当前池行情或等待回踩。
+                      盘中暂无进入待买观察层（大阳启动后回踩MA5，偏离度0%~2.5%、未跌破MA5且通过资金/风险约束）的主板股。请刷新当前池行情或等待回踩。
                     </CardText>
                   ) : (
                     buyReadyStocks.map(s => renderBuyReadyCard(s))
@@ -4123,7 +4224,7 @@ export default function App() {
                     <div className="bg-slate-950/70 p-4 rounded-lg border border-slate-800 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                       <div className="space-y-1">
                         <span className="text-xs font-extrabold text-slate-200">🚦 判定今日市场是否遇系统性见顶/大阴大跌风险？</span>
-                        <CardText className="text-[11px] text-slate-400">大盘出现系统性下踩时，必须提高止损警戒水位，收紧底仓浮亏度。</CardText>
+                        <CardText className="text-[11px] text-slate-400">大盘出现系统性下踩时，暂停开新仓，持仓优先按MA5与单笔本金2%亏损线处理。</CardText>
                       </div>
                       <div className="flex items-center space-x-3 shrink-0">
                         <label className="relative inline-flex items-center cursor-pointer">
@@ -4132,7 +4233,7 @@ export default function App() {
                             checked={systemicRisk} 
                             onChange={(e) => {
                               setSystemicRisk(e.target.checked);
-                              logAction(e.target.checked ? "⚠️ 警报：手动确认系统性风险，单股最大止损点自动调高至 7%~8%！" : "✓ 提示：解除系统性风险状态，单股最大止损位恢复至正常的 9%~10%");
+                              logAction(e.target.checked ? "⚠️ 警报：手动确认系统性风险，买入审计将禁止开新仓！" : "✓ 提示：解除系统性风险状态，买入窗口恢复按常规规则审计");
                             }}
                             className="sr-only peer"
                           />
@@ -4151,9 +4252,9 @@ export default function App() {
                         <div>
                           <h4 className="text-xs font-black uppercase text-rose-400">🚨 止损风控铁律升级警报</h4>
                           <CardText className="text-[11px] mt-1 text-rose-300 leading-normal">
-                            当前已手动确认触发系统性大盘风险！依据交易止损与盈利优化策略：<b>单股止损水位由原 9-10% 自动上调收紧至 7-8%！以防范极端踩踏，死守本金！</b>
+                            当前已手动确认触发系统性大盘风险！系统会在买入审计中标记并阻止新开仓；已有持仓按 MA5 跌破、连续3天未收回和单笔本金2%亏损线优先处理。
                           </CardText>
-                          <CardText className="text-[10px] mt-1 text-slate-400 font-medium">请立即核对持仓，如有股票跌破5日线且亏损触及 7%-8%，14:50 前必须无条件清仓！</CardText>
+                          <CardText className="text-[10px] mt-1 text-slate-400 font-medium">请立即核对持仓，如有股票跌破5日线或当前浮亏触及本金2%，14:50 前优先执行风控。</CardText>
                         </div>
                       </div>
                     )}
@@ -4227,7 +4328,7 @@ export default function App() {
                     <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-2">
                       <h4 className="text-xs font-extrabold text-slate-300">上证、深证及创业板复盘硬指标</h4>
                       <CardText className="text-[11px] text-slate-400 leading-normal">
-                        若遇系统性风险（例如主力资金呈断崖式净流出、多指数破位MA5），止损硬限必须从9%-10%上调收紧至7%-8%，以第三方冷静逻辑阻断扛单行为。
+                        若遇系统性风险（例如主力资金呈断崖式净流出、多指数破位MA5），系统暂停新开仓，持仓按跌破MA5、连续3天不收回和单笔本金2%亏损线处理，以第三方冷静逻辑阻断扛单行为。
                       </CardText>
                     </div>
                   </div>
@@ -4373,8 +4474,8 @@ export default function App() {
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       {renderScreenStepCard(
                         "1",
-                        "成交额前200扫描",
-                        "按成交额从大到小精扫前排流动性票，完整结果会落盘到 JSON，日报正文只摘要前10只。",
+                        "当前成交额前30初筛池复查",
+                        "按当前锁定的主板成交额前30基础池复查，完整结果会落盘到 JSON，日报正文只摘要前10只。",
                         top200Reviewed,
                         setTop200Reviewed,
                         step1Screened,
@@ -4382,8 +4483,8 @@ export default function App() {
                       )}
                       {renderScreenStepCard(
                         "2",
-                        "量比前50 + 10-20亿成交额",
-                        "复查放量异动且成交额适中的标的，捕捉主力点火后的回踩观察对象。",
+                        "放量异动线索复查",
+                        "当前未接入真实量比，仅按成交额与涨跌幅保存复查线索；真实量比需手动核查后再作为交易依据。",
                         volRatioReviewed,
                         setVolRatioReviewed,
                         step2Screened,
@@ -4908,15 +5009,27 @@ export default function App() {
                     <span className="text-slate-400">MA5向上: {tradeTarget.ma5Upward ? "满足" : "不符"}</span>
                   </div>
                   <div className="flex items-center space-x-1.5">
-                    <span className={`h-2 w-2 rounded-full ${tradePrice <= (tradeTarget.ma5 * 1.02) && tradePrice >= tradeTarget.ma5 ? "bg-rose-500" : "bg-emerald-500"}`}></span>
-                    <span className="text-slate-400">0%~2%偏离: {tradePrice <= (tradeTarget.ma5 * 1.02) && tradePrice >= tradeTarget.ma5 ? "满足" : "不符"}</span>
+                    <span className={`h-2 w-2 rounded-full ${tradeDeviationAtPrice >= 0 && tradeDeviationAtPrice <= BUY_ZONE_MAX_DEVIATION_PCT ? "bg-rose-500" : "bg-emerald-500"}`}></span>
+                    <span className="text-slate-400">0%~2.5%偏离: {tradeDeviationAtPrice >= 0 && tradeDeviationAtPrice <= BUY_ZONE_MAX_DEVIATION_PCT ? "满足" : "不符"}</span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <span className={`h-2 w-2 rounded-full ${currentInBuyWindow ? "bg-rose-500" : "bg-emerald-500"}`}></span>
+                    <span className="text-slate-400">买入窗口: {currentInBuyWindow ? "允许" : "不在窗口"}</span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <span className={`h-2 w-2 rounded-full ${accountState.availableCash >= tradePrice * 100 ? "bg-rose-500" : "bg-emerald-500"}`}></span>
+                    <span className="text-slate-400">资金一手: {accountState.availableCash >= tradePrice * 100 ? "满足" : "不足"}</span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <span className={`h-2 w-2 rounded-full ${buyRiskAmount > 0 && buyRiskAmount <= maxAllowedRiskAmount ? "bg-rose-500" : "bg-emerald-500"}`}></span>
+                    <span className="text-slate-400">单笔风险: {buyRiskAmount.toFixed(2)} / {maxAllowedRiskAmount.toFixed(2)}</span>
                   </div>
                 </div>
 
                 {/* 违规警告 */}
-                {tradeType === "BUY" && (tradePrice > (tradeTarget.ma5 * 1.02) || tradePrice < tradeTarget.ma5 || tradeTarget.bigCandlePct < 5.0 || !tradeTarget.ma5Upward || !isMainBoard(tradeTarget.code)) && (
+                {buyFormHasHardRisk && (
                   <CardText className="text-[10px] text-amber-500 italic leading-normal border-t border-slate-900 pt-1.5">
-                    ⚠️ 警告：当前录入数据在纪律上存在违规买入风险（无5%阳线启动、MA5未向上、非偏离金区或已跌破MA5）。继续录入将产生红字违规证据，并归档至审计中心。
+                    警告：当前录入数据存在买入纪律风险（买入窗口、资金一手、0%~2.5%偏离、系统性风险或单笔2%本金风险未通过）。继续录入将产生审计标签。
                   </CardText>
                 )}
               </div>
@@ -5005,6 +5118,14 @@ export default function App() {
                   {est.settle.toLocaleString(undefined, { minimumFractionDigits: 2 })} 元
                 </span>
               </div>
+              {tradeType === "BUY" && (
+                <div className="flex justify-between border-t border-slate-900 pt-1 text-slate-400 font-bold">
+                  <span>预估止损亏损 / 本金2%上限:</span>
+                  <span className={buyRiskAmount <= maxAllowedRiskAmount && buyRiskAmount > 0 ? "text-cyan-300" : "text-amber-300"}>
+                    {buyRiskAmount.toFixed(2)} / {maxAllowedRiskAmount.toFixed(2)} 元 ({buyRiskPct.toFixed(2)}%)
+                  </span>
+                </div>
+              )}
             </div>
 
             {/* 强制反思书写 */}
@@ -5035,9 +5156,10 @@ export default function App() {
             {/* 执行 */}
             <button
               onClick={handleExecuteTrade}
-              className="w-full py-2 bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs rounded transition shadow"
+              disabled={buyFormHasHardRisk}
+              className="w-full py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold text-xs rounded transition shadow"
             >
-              确认并录入交易账簿
+              {buyFormHasHardRisk ? "买入硬约束未通过" : "确认并录入交易账簿"}
             </button>
 
           </div>
