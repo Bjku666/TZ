@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.settings import load_settings, save_settings
+from src.settings import load_settings, mode_fee_settings, save_settings
 
 from backend.storage.csv_adapter import frontend_settings, settings_from_frontend
 from backend.storage.sqlite_store import save_kv
@@ -37,3 +37,7 @@ def initial_cash(mode: str | None = None) -> float:
         return float(settings.get("realInitialCash", 5000) or 5000)
     return float(settings.get("initialCash", 10000) or 10000)
 
+
+def trade_fee_settings(mode: str | None = None) -> dict[str, Any]:
+    settings = load_settings()
+    return {**settings, **mode_fee_settings(settings, mode or settings.get("account_mode"))}

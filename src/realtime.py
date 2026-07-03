@@ -167,9 +167,25 @@ def fetch_realtime_quotes_auto(wanted: set[str], timeout: int = 8) -> pd.DataFra
 
 
 def fetch_realtime_quotes_eastmoney(wanted: set[str], timeout: int = 8) -> pd.DataFrame:
-    frame = fetch_full_market_quotes_eastmoney(timeout=timeout)
+    rows: list[dict] = []
+    errors: list[str] = []
+    codes = sorted(clean_code(code) for code in wanted if clean_code(code))
+    if not codes:
+        return empty_quotes("未提供股票代码", "东方财富")
+
+    for chunk in _chunks(codes, 80):
+        secids = [f"{_eastmoney_market(code)}.{code}" for code in chunk]
+        for host in EASTMONEY_SPOT_HOSTS:
+            try:
+                payload = _eastmoney_ulist_request(host, secids=secids, timeout=timeout)
+                rows.extend((payload.get("data") or {}).get("diff") or [])
+                break
+            except Exception as exc:
+                errors.append(f"{host}: {_short_error(exc)}")
+
+    frame = _standardize_eastmoney_rows(rows)
     if frame.empty:
-        return empty_quotes(frame.attrs.get("message", "东方财富行情为空"), "东方财富")
+        return empty_quotes("；".join(errors) or "东方财富未返回指定股票", "东方财富")
     frame = frame[frame["代码"].isin(wanted)].copy()
     if frame.empty:
         return empty_quotes("东方财富未返回指定股票", "东方财富")
@@ -190,6 +206,51 @@ def _eastmoney_clist_request(host: str, page: int, page_size: int, timeout: int)
         "fields": "f12,f14,f2,f3,f6,f17,f18,f15,f16",
     }
     url = f"https://{host}/api/qt/clist/get?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _eastmoney_turnover_rank_request(host: str, page_size: int, timeout: int) -> dict:
+    params = {
+        "pn": "1",
+        "pz": str(page_size),
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f6",
+        "fs": "m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80",
+        "fields": "f12,f14,f2,f3,f6,f17,f18,f15,f16",
+    }
+    url = f"https://{host}/api/qt/clist/get?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _eastmoney_ulist_request(host: str, secids: list[str], timeout: int) -> dict:
+    params = {
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fields": "f12,f14,f2,f3,f6,f17,f18,f15,f16",
+        "secids": ",".join(secids),
+    }
+    url = f"https://{host}/api/qt/ulist.np/get?" + urllib.parse.urlencode(params)
     request = urllib.request.Request(
         url,
         headers={
@@ -224,6 +285,23 @@ def _standardize_eastmoney_rows(rows: list[dict]) -> pd.DataFrame:
     for column in ["最新价", "涨跌幅%", "成交额", "开盘", "昨收", "最高", "最低"]:
         frame[column] = pd.to_numeric(frame[column].map(_clean_numeric), errors="coerce")
     return frame[QUOTE_COLUMNS].drop_duplicates("代码", keep="first").reset_index(drop=True)
+
+
+def fetch_turnover_rank_quotes_eastmoney(limit: int = 30, timeout: int = 8, page_size: int = 240) -> pd.DataFrame:
+    errors: list[str] = []
+    safe_limit = max(int(limit or 30), 30)
+    safe_page_size = max(int(page_size or 240), safe_limit)
+    for host in EASTMONEY_SPOT_HOSTS:
+        try:
+            payload = _eastmoney_turnover_rank_request(host, page_size=safe_page_size, timeout=timeout)
+            rows = (payload.get("data") or {}).get("diff") or []
+            frame = _standardize_eastmoney_rows(rows)
+            if not frame.empty:
+                return _with_status(frame, "东方财富", f"{host} 成交额榜已更新")
+            errors.append(frame.attrs.get("message", f"{host} 成交额榜返回空数据"))
+        except Exception as exc:
+            errors.append(f"{host}: {_short_error(exc)}")
+    return _empty_full_quotes("；".join(errors), "东方财富")
 
 
 def fetch_full_market_quotes_eastmoney(timeout: int = 8) -> pd.DataFrame:
@@ -377,7 +455,10 @@ def fetch_realtime_quotes_akshare(wanted: set[str]) -> pd.DataFrame:
 
 def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.DataFrame:
     """Generate a main-board stock pool ranked by turnover amount."""
-    quotes = fetch_full_market_quotes(source)
+    rank_quotes = pd.DataFrame()
+    if source in {"自动切换", "东方财富"}:
+        rank_quotes = fetch_turnover_rank_quotes_eastmoney(limit=max(limit * 20, 600))
+    quotes = rank_quotes if not rank_quotes.empty else fetch_full_market_quotes(source)
     if quotes.empty:
         return _with_status(pd.DataFrame(), quotes.attrs.get("source", source), quotes.attrs.get("message", "自动股票池行情为空"))
 
@@ -392,6 +473,20 @@ def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.D
         axis=1,
     )
     pool = pool[passed].dropna(subset=["成交额"]).sort_values("成交额", ascending=False).head(limit)
+    if len(pool) < limit and not rank_quotes.empty and source not in {"自动切换", "东方财富"}:
+        full_quotes = fetch_full_market_quotes(source)
+        if not full_quotes.empty:
+            pool = full_quotes.copy()
+            pool["代码"] = pool["代码"].map(clean_code)
+            pool["名称"] = pool["名称"].fillna("").astype(str).str.strip()
+            for column in ["最新价", "涨跌幅%", "成交额"]:
+                pool[column] = pd.to_numeric(pool[column], errors="coerce")
+            passed = pool.apply(
+                lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
+                axis=1,
+            )
+            pool = pool[passed].dropna(subset=["成交额"]).sort_values("成交额", ascending=False).head(limit)
+            quotes = full_quotes
     if pool.empty:
         return _with_status(pd.DataFrame(), quotes.attrs.get("source", source), "全市场数据中没有符合主板过滤条件的股票")
 

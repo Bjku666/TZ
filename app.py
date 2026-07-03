@@ -78,7 +78,7 @@ from src.portfolio import (
     portfolio_to_legacy_holdings,
 )
 from src.reports import load_report_note, report_markdown, save_report_note
-from src.settings import load_settings, save_settings
+from src.settings import fee_prefix_for_mode, load_settings, save_settings
 from src.ui_style import page_css, money_display, percent_display
 
 APP_NAME = "强势回踩短线交易纪律系统"
@@ -160,6 +160,8 @@ def prepare_holdings_view(holdings: pd.DataFrame) -> pd.DataFrame:
             row.get("MA5"),
             row.get("数量"),
             row.get("跌破MA5天数", 0),
+            row.get("可卖数量", row.get("数量")),
+            row.get("持仓天数"),
         ),
         axis=1,
     )
@@ -2411,6 +2413,8 @@ elif page == "持仓监控":
                 row.get("MA5"),
                 row.get("数量"),
                 row.get("跌破MA5天数", 0),
+                row.get("可卖数量", row.get("数量")),
+                row.get("持仓天数"),
             ),
             axis=1,
         )
@@ -2897,6 +2901,7 @@ elif page == "系统设置":
                 st.rerun()
 
         if st.form_submit_button("保存设置", type="primary", use_container_width=True):
+            active_fee_prefix = fee_prefix_for_mode(account_mode)
             settings.update({
                 "lot_size": lot_size,
                 "max_position_pct": max_pos_pct,
@@ -2910,6 +2915,10 @@ elif page == "系统设置":
                 "min_commission": min_commission,
                 "stamp_tax_rate": stamp_tax_rate,
                 "transfer_fee_rate": transfer_fee_rate,
+                f"{active_fee_prefix}_commission_rate": commission_rate,
+                f"{active_fee_prefix}_min_commission": min_commission,
+                f"{active_fee_prefix}_stamp_tax_rate": stamp_tax_rate,
+                f"{active_fee_prefix}_transfer_fee_rate": transfer_fee_rate,
                 "use_min_commission": use_min_commission,
                 "auto_calculate_fees": auto_calculate_fees,
             })

@@ -12,14 +12,14 @@ export default function KLineChart({ code, name }: KLineChartProps) {
   const [klines, setKlines] = useState<KLinePoint[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [hoveredPoint, setHoveredPoint] = useState<KLinePoint | null>(null);
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const chartRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!code) return;
     setLoading(true);
     setError(null);
-    setHoveredPoint(null);
+    setHoveredIndex(null);
 
     fetch(`/api/history/${code}`)
       .then(res => {
@@ -93,8 +93,13 @@ export default function KLineChart({ code, name }: KLineChartProps) {
   const count = klines.length;
   const slotWidth = (svgWidth - padding.left - padding.right) / count;
   const candleWidth = Math.max(2, slotWidth * 0.7);
+  const clampIndex = (index: number) => Math.min(count - 1, Math.max(0, index));
 
   const getX = (index: number) => padding.left + index * slotWidth + slotWidth / 2;
+  const getIndexBySvgX = (svgX: number) => {
+    const rawIndex = Math.round((svgX - padding.left - slotWidth / 2) / slotWidth);
+    return clampIndex(rawIndex);
+  };
   const getY = (val: number) => {
     const ratio = (val - minPrice) / (maxPrice - minPrice);
     return klineSvgHeight - padding.bottom - ratio * (klineSvgHeight - padding.top - padding.bottom);
@@ -107,14 +112,17 @@ export default function KLineChart({ code, name }: KLineChartProps) {
 
   // 生成 MA 路径的辅助方法
   const generateLinePath = (key: 'ma5' | 'ma10' | 'ma20') => {
-    return klines
-      .map((k, i) => {
-        const val = k[key];
-        if (!val || val === 0) return null;
-        return `${i === 0 ? 'M' : 'L'} ${getX(i)} ${getY(val)}`;
-      })
-      .filter(Boolean)
-      .join(" ");
+    let started = false;
+    return klines.reduce<string[]>((path, k, i) => {
+      const val = k[key];
+      if (typeof val !== "number" || !Number.isFinite(val) || val <= 0) {
+        started = false;
+        return path;
+      }
+      path.push(`${started ? "L" : "M"} ${getX(i)} ${getY(val)}`);
+      started = true;
+      return path;
+    }, []).join(" ");
   };
 
   const ma5Path = generateLinePath('ma5');
@@ -122,33 +130,38 @@ export default function KLineChart({ code, name }: KLineChartProps) {
   const ma20Path = generateLinePath('ma20');
 
   // 当前 hover 或最新的点
-  const activePoint = hoveredPoint || klines[klines.length - 1];
-  const activeChangePct = activePoint && klines[klines.indexOf(activePoint) - 1]
-    ? ((activePoint.close - klines[klines.indexOf(activePoint) - 1].close) / klines[klines.indexOf(activePoint) - 1].close * 100)
+  const activeIndex = hoveredIndex === null ? count - 1 : clampIndex(hoveredIndex);
+  const activePoint = klines[activeIndex];
+  const previousPoint = activeIndex > 0 ? klines[activeIndex - 1] : null;
+  const activeChangePct = activePoint && previousPoint
+    ? ((activePoint.close - previousPoint.close) / previousPoint.close * 100)
     : 0;
+  const formatLineValue = (value?: number) => (
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? value.toFixed(2) : "--"
+  );
 
   return (
-    <div className="bg-white border border-slate-200 rounded-lg p-4 font-sans select-none text-slate-850 shadow-sm">
+    <div className="bg-white border border-slate-200 rounded-lg p-4 font-sans select-none text-slate-800 shadow-sm">
       {/* 头部信息 */}
-      <div className="flex flex-wrap items-center justify-between border-b border-slate-100 pb-2 mb-3">
-        <div className="flex items-center space-x-3">
-          <span className="text-base font-bold text-slate-900">{name}</span>
-          <span className="text-xs font-mono text-slate-600 bg-slate-100 px-2 py-0.5 rounded">{code}</span>
-          {activePoint && (
-            <div className="flex items-center space-x-4 ml-4 text-xs font-mono text-slate-600">
-              <span>价格: <strong className={activePoint.close >= activePoint.open ? "text-rose-600" : "text-emerald-600"}>{activePoint.close.toFixed(2)}</strong></span>
-              <span>涨跌幅: <strong className={activeChangePct >= 0 ? "text-rose-600" : "text-emerald-600"}>{activeChangePct >= 0 ? "+" : ""}{activeChangePct.toFixed(2)}%</strong></span>
-              <span>开: {activePoint.open.toFixed(2)}</span>
-              <span>高: {activePoint.high.toFixed(2)}</span>
-              <span>低: {activePoint.low.toFixed(2)}</span>
-              <span>量: {(activePoint.volume / 10000).toFixed(1)}万手</span>
-            </div>
-          )}
+      <div className="border-b border-slate-100 pb-3 mb-3 space-y-2 overflow-hidden">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <span className="shrink-0 whitespace-nowrap text-base font-bold text-slate-900">{name}</span>
+          <span className="shrink-0 whitespace-nowrap rounded bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-600">{code}</span>
         </div>
-        <div className="flex space-x-3 text-xs font-mono text-slate-500">
-          <span className="flex items-center text-amber-600"><span className="w-2.5 h-0.5 bg-amber-500 mr-1"></span>MA5: {activePoint?.ma5?.toFixed(2)}</span>
-          <span className="flex items-center text-cyan-600"><span className="w-2.5 h-0.5 bg-cyan-400 mr-1"></span>MA10: {activePoint?.ma10?.toFixed(2)}</span>
-          <span className="flex items-center text-pink-600"><span className="w-2.5 h-0.5 bg-pink-500 mr-1"></span>MA20: {activePoint?.ma20?.toFixed(2)}</span>
+        {activePoint && (
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-xs text-slate-600 sm:grid-cols-3 xl:grid-cols-6">
+            <span className="whitespace-nowrap">价格: <strong className={activePoint.close >= activePoint.open ? "text-rose-600" : "text-emerald-600"}>{activePoint.close.toFixed(2)}</strong></span>
+            <span className="whitespace-nowrap">涨跌幅: <strong className={activeChangePct >= 0 ? "text-rose-600" : "text-emerald-600"}>{activeChangePct >= 0 ? "+" : ""}{activeChangePct.toFixed(2)}%</strong></span>
+            <span className="whitespace-nowrap">开: {activePoint.open.toFixed(2)}</span>
+            <span className="whitespace-nowrap">高: {activePoint.high.toFixed(2)}</span>
+            <span className="whitespace-nowrap">低: {activePoint.low.toFixed(2)}</span>
+            <span className="whitespace-nowrap">量: {(activePoint.volume / 10000).toFixed(1)}万手</span>
+          </div>
+        )}
+        <div className="grid grid-cols-1 gap-x-3 gap-y-1 font-mono text-xs text-slate-500 sm:grid-cols-3">
+          <span className="flex items-center whitespace-nowrap text-amber-600"><span className="mr-1 h-0.5 w-2.5 bg-amber-500"></span>MA5: {formatLineValue(activePoint?.ma5)}</span>
+          <span className="flex items-center whitespace-nowrap text-cyan-600"><span className="mr-1 h-0.5 w-2.5 bg-cyan-400"></span>MA10: {formatLineValue(activePoint?.ma10)}</span>
+          <span className="flex items-center whitespace-nowrap text-pink-600"><span className="mr-1 h-0.5 w-2.5 bg-pink-500"></span>MA20: {formatLineValue(activePoint?.ma20)}</span>
         </div>
       </div>
 
@@ -156,16 +169,13 @@ export default function KLineChart({ code, name }: KLineChartProps) {
       <div 
         ref={chartRef}
         className="relative overflow-hidden cursor-crosshair"
-        onMouseLeave={() => setHoveredPoint(null)}
+        onMouseLeave={() => setHoveredIndex(null)}
         onMouseMove={(e) => {
           if (!chartRef.current || klines.length === 0) return;
           const rect = chartRef.current.getBoundingClientRect();
-          const mouseX = e.clientX - rect.left - padding.left;
-          const chartDisplayWidth = svgWidth - padding.left - padding.right;
-          let idx = Math.floor((mouseX / chartDisplayWidth) * count);
-          if (idx < 0) idx = 0;
-          if (idx >= count) idx = count - 1;
-          setHoveredPoint(klines[idx]);
+          if (rect.width === 0) return;
+          const svgX = ((e.clientX - rect.left) / rect.width) * svgWidth;
+          setHoveredIndex(getIndexBySvgX(svgX));
         }}
       >
         {/* K线主图 */}
@@ -214,11 +224,11 @@ export default function KLineChart({ code, name }: KLineChartProps) {
           {ma20Path && <path d={ma20Path} fill="none" stroke="#db2777" strokeWidth={1.5} />}
 
           {/* Hover 十字竖线 */}
-          {hoveredPoint && (
+          {hoveredIndex !== null && (
             <line
-              x1={getX(klines.indexOf(hoveredPoint))}
+              x1={getX(activeIndex)}
               y1={padding.top}
-              x2={getX(klines.indexOf(hoveredPoint))}
+              x2={getX(activeIndex)}
               y2={klineSvgHeight - padding.bottom}
               stroke="#94a3b8"
               strokeWidth={0.8}
@@ -270,11 +280,11 @@ export default function KLineChart({ code, name }: KLineChartProps) {
           })}
 
           {/* Hover 十字竖线 */}
-          {hoveredPoint && (
+          {hoveredIndex !== null && (
             <line
-              x1={getX(klines.indexOf(hoveredPoint))}
+              x1={getX(activeIndex)}
               y1={0}
-              x2={getX(klines.indexOf(hoveredPoint))}
+              x2={getX(activeIndex)}
               y2={volSvgHeight - 15}
               stroke="#94a3b8"
               strokeWidth={0.8}

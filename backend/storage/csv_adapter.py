@@ -8,6 +8,14 @@ import pandas as pd
 
 from src.data import TRADE_COLUMNS, WATCHLIST_COLUMNS
 from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
+from src.settings import (
+    FEE_API_ALIASES,
+    FEE_DEFAULTS,
+    account_mode_from_api,
+    api_mode_from_account_mode,
+    fee_prefix_for_mode,
+    mode_fee_settings,
+)
 from src.storage import load_last_refresh
 
 FRONTEND_GROUP_TO_STAGE = {
@@ -94,34 +102,61 @@ def watchlist_to_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 def frontend_settings(settings: dict[str, Any]) -> dict[str, Any]:
     account_mode = settings.get("account_mode", "模拟训练")
+    current_mode = api_mode_from_account_mode(account_mode)
+    active_fees = mode_fee_settings(settings, current_mode)
+    simulation_fees = mode_fee_settings(settings, "simulation")
+    real_fees = mode_fee_settings(settings, "real")
     return {
         **settings,
         "initialCash": number(settings.get("simulation_capital"), 10000),
         "realInitialCash": number(settings.get("live_capital"), 5000),
-        "currentMode": "real" if account_mode == "实盘记录" else "simulation",
-        "commissionRate": number(settings.get("commission_rate"), 0.00025),
-        "minCommission": number(settings.get("min_commission"), 5.0),
-        "stampDutyRate": number(settings.get("stamp_tax_rate"), 0.0005),
-        "transferFeeRate": number(settings.get("transfer_fee_rate"), 0.00001),
+        "activeInitialCash": number(
+            settings.get("live_capital") if current_mode == "real" else settings.get("simulation_capital"),
+            5000 if current_mode == "real" else 10000,
+        ),
+        "currentMode": current_mode,
+        "commissionRate": active_fees["commission_rate"],
+        "minCommission": active_fees["min_commission"],
+        "stampDutyRate": active_fees["stamp_tax_rate"],
+        "transferFeeRate": active_fees["transfer_fee_rate"],
+        "simulationFees": {
+            "commissionRate": simulation_fees["commission_rate"],
+            "minCommission": simulation_fees["min_commission"],
+            "stampDutyRate": simulation_fees["stamp_tax_rate"],
+            "transferFeeRate": simulation_fees["transfer_fee_rate"],
+        },
+        "realFees": {
+            "commissionRate": real_fees["commission_rate"],
+            "minCommission": real_fees["min_commission"],
+            "stampDutyRate": real_fees["stamp_tax_rate"],
+            "transferFeeRate": real_fees["transfer_fee_rate"],
+        },
     }
 
 
 def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     out = {**current, **updates}
     if "currentMode" in updates:
-        out["account_mode"] = "实盘记录" if updates["currentMode"] == "real" else "模拟训练"
+        out["account_mode"] = account_mode_from_api(updates["currentMode"])
     if "initialCash" in updates:
         out["simulation_capital"] = number(updates["initialCash"], number(current.get("simulation_capital"), 10000))
     if "realInitialCash" in updates:
         out["live_capital"] = number(updates["realInitialCash"], number(current.get("live_capital"), 5000))
-    if "commissionRate" in updates:
-        out["commission_rate"] = number(updates["commissionRate"], number(current.get("commission_rate"), 0.00025))
-    if "minCommission" in updates:
-        out["min_commission"] = number(updates["minCommission"], number(current.get("min_commission"), 5.0))
-    if "stampDutyRate" in updates:
-        out["stamp_tax_rate"] = number(updates["stampDutyRate"], number(current.get("stamp_tax_rate"), 0.0005))
-    if "transferFeeRate" in updates:
-        out["transfer_fee_rate"] = number(updates["transferFeeRate"], number(current.get("transfer_fee_rate"), 0.00001))
+
+    mode_for_fee = updates.get("currentMode") or api_mode_from_account_mode(out.get("account_mode"))
+    fee_prefix = fee_prefix_for_mode(mode_for_fee)
+    for api_key, internal_key in FEE_API_ALIASES.items():
+        if api_key in updates:
+            default = FEE_DEFAULTS[internal_key]
+            mode_key = f"{fee_prefix}_{internal_key}"
+            out[mode_key] = number(updates[api_key], number(current.get(mode_key), default))
+
+    active_prefix = fee_prefix_for_mode(out.get("account_mode"))
+    for internal_key in FEE_DEFAULTS:
+        out[internal_key] = number(
+            out.get(f"{active_prefix}_{internal_key}"),
+            FEE_DEFAULTS[internal_key],
+        )
     return out
 
 
@@ -190,6 +225,7 @@ def trades_to_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
                     "ma5Upward": bool_value(snapshot.get("ma5Upward")),
                     "cashSufficient": bool_value(snapshot.get("cashSufficient")),
                     "inTradingTime": bool_value(snapshot.get("inTradingTime")),
+                    "positionBeforeTrade": snapshot.get("positionBeforeTrade") or {},
                 },
                 "rulesConclusion": str(clean_value(row.get("规则结论"), "") or "其他"),
                 "violationTags": parse_tags(row.get("违规标签")),

@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from "react";
+import { Children, cloneElement, isValidElement, useState, useEffect, useRef } from "react";
+import type { Key, ReactNode } from "react";
 import { 
   Activity, 
   Briefcase, 
@@ -20,20 +21,101 @@ import {
   BookOpen, 
   FileSpreadsheet, 
   ShieldAlert,
+  ChevronLeft,
   ChevronRight,
   Sparkles,
   Coins,
   Edit
 } from "lucide-react";
 import KLineChart from "./components/KLineChart";
-import { Stock, TradeLog, StockGroup, StockViewGroup, StockStage, Position, AccountState, ReviewReport, TurnoverChanges, TurnoverChangeStock } from "./types";
+import { Stock, TradeLog, StockGroup, StockViewGroup, StockStage, Position, AccountState, ReviewReport, TurnoverChanges, TurnoverChangeStock, ReviewScreenedStock, SelfDiagnosisItem } from "./types";
 
 const QUOTE_AUTO_REFRESH_SECONDS = 30;
+const TURNOVER_AUTO_SCAN_SECONDS = 180;
+const REVIEW_SCREEN_LIMIT = 50;
+const CARD_TEXT_ENDING_PERIOD = /([。．]|(?<!\.)\.)([”’"'）)\]】》]*)\s*$/u;
+type AccountMode = "simulation" | "real";
 type QuoteRefreshTrigger = "manual" | "auto";
+type TurnoverScanTrigger = "manual" | "auto";
+type FeeSettings = {
+  commissionRate: number;
+  minCommission: number;
+  stampDutyRate: number;
+  transferFeeRate: number;
+};
+
+const DEFAULT_FEE_SETTINGS: FeeSettings = {
+  commissionRate: 0.0003,
+  minCommission: 5.0,
+  stampDutyRate: 0.0005,
+  transferFeeRate: 0.00001
+};
+
+function trimCardSentencePeriod(text: string): string {
+  return text
+    .split("\n")
+    .map(line => line.replace(CARD_TEXT_ENDING_PERIOD, "$2"))
+    .join("\n");
+}
+
+function stripCardTextPeriods(node: ReactNode): ReactNode {
+  return Children.map(node, child => {
+    if (typeof child === "string") return trimCardSentencePeriod(child);
+    if (isValidElement<{ children?: ReactNode }>(child) && child.props.children !== undefined) {
+      return cloneElement(child, { children: stripCardTextPeriods(child.props.children) });
+    }
+    return child;
+  });
+}
+
+function CardText({
+  as = "p",
+  className,
+  children
+}: {
+  as?: "p" | "span" | "div";
+  className?: string;
+  children: ReactNode;
+  key?: Key;
+}) {
+  const Component = as;
+  return <Component className={className}>{stripCardTextPeriods(children)}</Component>;
+}
+
+function modeFromApi(value: unknown): AccountMode {
+  return value === "real" ? "real" : "simulation";
+}
+
+function numberSetting(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function feeSettingsFromApi(settings: any): FeeSettings {
+  return {
+    commissionRate: numberSetting(settings?.commissionRate, DEFAULT_FEE_SETTINGS.commissionRate),
+    minCommission: numberSetting(settings?.minCommission, DEFAULT_FEE_SETTINGS.minCommission),
+    stampDutyRate: numberSetting(settings?.stampDutyRate, DEFAULT_FEE_SETTINGS.stampDutyRate),
+    transferFeeRate: numberSetting(settings?.transferFeeRate, DEFAULT_FEE_SETTINGS.transferFeeRate)
+  };
+}
 
 function localDateString(date = new Date()): string {
   const localTime = date.getTime() - date.getTimezoneOffset() * 60_000;
   return new Date(localTime).toISOString().slice(0, 10);
+}
+
+function formatDateTimeLabel(value?: string | null): string {
+  if (!value) return "-";
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toLocaleString() : value;
+}
+
+function formatMoneyShort(value?: number | null): string {
+  const safeValue = Number(value);
+  if (!Number.isFinite(safeValue) || safeValue <= 0) return "-";
+  if (safeValue >= 100000000) return `${(safeValue / 100000000).toFixed(1)}亿`;
+  return `${(safeValue / 10000).toFixed(0)}万`;
 }
 
 function isMainBoard(code: string): boolean {
@@ -98,6 +180,8 @@ function calculateRealizedPnLByDate(trades: TradeLog[], targetDate: string): num
 
 type PositionSellPlan = {
   tone: "danger" | "warning" | "normal" | "neutral";
+  triggerKey: "missing-ma5" | "t1-lock" | "clear" | "ma5-risk" | "take-profit" | "next-day" | "hold";
+  priority: number;
   statusLabel: string;
   title: string;
   primaryAction: string;
@@ -112,14 +196,38 @@ type PositionSellPlan = {
   badgeClass: string;
 };
 
+function formatPrice(value?: number | null): string {
+  const safeValue = Number(value);
+  return Number.isFinite(safeValue) && safeValue > 0 ? `¥${safeValue.toFixed(2)}` : "-";
+}
+
 function signedPercent(value: number): string {
   const safeValue = Number.isFinite(value) ? value : 0;
   return `${safeValue >= 0 ? "+" : ""}${safeValue.toFixed(2)}%`;
 }
 
+function signedCurrency(value: number, suffix = ""): string {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  return `${safeValue >= 0 ? "+" : ""}${safeValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${suffix}`;
+}
+
 function holdingTimeLabel(position: Position): string {
   if (position.holdDays <= 0) return "今日建仓";
   return `持有 ${position.holdDays} 天`;
+}
+
+function percentDistance(currentPrice: number, linePrice: number): number | null {
+  if (!Number.isFinite(currentPrice) || !Number.isFinite(linePrice) || linePrice <= 0) return null;
+  return ((currentPrice - linePrice) / linePrice) * 100;
+}
+
+function lineDistanceLabel(currentPrice: number, linePrice: number, mode: "target" | "floor"): string {
+  const distance = percentDistance(currentPrice, linePrice);
+  if (distance === null) return "缺少价格";
+  if (mode === "target") {
+    return distance >= 0 ? `已越过 ${Math.abs(distance).toFixed(2)}%` : `距触发 ${Math.abs(distance).toFixed(2)}%`;
+  }
+  return distance >= 0 ? `安全垫 ${distance.toFixed(2)}%` : `已跌破 ${Math.abs(distance).toFixed(2)}%`;
 }
 
 function buildPositionSellPlan(position: Position): PositionSellPlan {
@@ -128,21 +236,34 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   const belowMa5 = hasMa5 && deviation < 0;
   const farFromMa5 = hasMa5 && deviation > 7;
   const belowDays = Math.max(0, Math.floor(Number(position.belowMa5Days) || 0));
-  const smallPosition = position.quantity < 200;
+  const availableQuantity = Math.max(0, Math.floor(Number(position.availableQuantity) || 0));
+  const t1Locked = availableQuantity <= 0;
+  const actionableQuantity = t1Locked ? position.quantity : availableQuantity;
+  const smallPosition = actionableQuantity < 200;
   const sizingRule = smallPosition
-    ? "100股或小仓位不能卖半手：要么继续持有，要么一次卖完。"
+    ? t1Locked
+      ? "今日仓暂无可卖数量，不能执行卖出，只能记录风险并规划明日动作。"
+      : "100股或小仓位不能卖半手：要么继续持有，要么一次卖完。"
     : "200股以上才考虑卖一半，剩余仓位继续用5日线管理。";
   const holdText = holdingTimeLabel(position);
-  const nextMorningRule = position.holdDays <= 1
-    ? "次日10:00前核对强度：高开低走、冲高回落、弱于板块、没有继续上攻、跌破MA5，都按“不强”处理，冲高卖出或退出。"
+  const nextMorningRule = t1Locked
+    ? "今日建仓受T+1限制，盘中跌破只能记录风险；明日10:00前核对强弱，不强再按可卖数量处理。"
+    : position.holdDays <= 1
+      ? "次日10:00前核对强度：高开低走、冲高回落、弱于板块、没有继续上攻、跌破MA5，都按“不强”处理，冲高卖出或退出。"
     : `${holdText}，首个隔日强弱窗口已过；后续仍看是否弱于板块、冲高回落或跌破MA5。`;
   const takeProfitRule = !hasMa5
     ? "缺少MA5，先补齐K线后再判断是否远离5日线。"
+    : t1Locked && farFromMa5
+      ? `当前偏离MA5 ${signedPercent(deviation)}，但今日仓T+1不可卖；先写好明日止盈计划。`
     : farFromMa5
       ? `当前偏离MA5 ${signedPercent(deviation)}，已进入远离5日线止盈层。${sizingRule}`
       : `当前偏离MA5 ${signedPercent(deviation)}，尚未明显远离5日线；不因普通上涨随意卖飞。`;
   const ma5RiskRule = !hasMa5
     ? "缺少MA5，暂不能执行5日线风控判断。"
+    : t1Locked && (belowMa5 || belowDays >= 3)
+      ? "当前跌破MA5，但今日建仓没有可卖数量；先记录风险，明日开盘后按强弱和可卖数量优先处理。"
+    : t1Locked
+      ? "今日建仓暂无可卖数量，14:50只复核MA5位置并记录，不触发卖出动作。"
     : belowDays >= 3
       ? `已跌破MA5 ${belowDays} 天且未站回，触发清仓层。`
       : belowMa5
@@ -152,6 +273,8 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   if (!hasMa5) {
     return {
       tone: "neutral",
+      triggerKey: "missing-ma5",
+      priority: 4,
       statusLabel: "等待MA5",
       title: "先补齐均线，再判断卖点",
       primaryAction: "当前缺少MA5，先补K线或刷新行情，暂不把风险判断拍死。",
@@ -167,9 +290,33 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
     };
   }
 
+  if (t1Locked) {
+    return {
+      tone: belowMa5 ? "warning" : "neutral",
+      triggerKey: "t1-lock",
+      priority: belowMa5 ? 2 : 4,
+      statusLabel: "T+1锁仓",
+      title: belowMa5 ? "今日建仓跌破MA5，先记录风险" : "今日建仓，T+1不可卖",
+      primaryAction: belowMa5
+        ? "这只票今天没有可卖数量，不能提示14:50卖出；收盘前只确认是否继续跌破，明日10:00前优先处理。"
+        : "今日仓按T+1锁定，今天不生成卖出动作；明日再按强弱、远离MA5和跌破MA5三层规则执行。",
+      nextMorningRule,
+      takeProfitRule,
+      ma5RiskRule,
+      sizingRule,
+      sellReason: "今日建仓T+1不可卖，仅记录风险观察",
+      buttonLabel: "T+1锁仓",
+      cardClass: belowMa5 ? "bg-slate-900/70 border-amber-900/70 text-slate-200" : "bg-slate-900/60 border-slate-800 text-slate-200",
+      dotClass: belowMa5 ? "bg-amber-500" : "bg-slate-500",
+      badgeClass: belowMa5 ? "bg-amber-950 text-amber-300 border border-amber-700/60" : "bg-slate-950/50 text-slate-300 border border-slate-700"
+    };
+  }
+
   if (belowDays >= 3) {
     return {
       tone: "danger",
+      triggerKey: "clear",
+      priority: 0,
       statusLabel: "清仓点",
       title: "连续3天站不回MA5，按纪律清仓",
       primaryAction: `已跌破MA5 ${belowDays} 天。这里不再找理由，优先执行清仓纪律。`,
@@ -179,7 +326,7 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
       sizingRule,
       sellReason: "连续3天未站回MA5，按纪律清仓",
       buttonLabel: "记录清仓",
-      cardClass: "bg-rose-950/40 border-rose-900/80 text-rose-200",
+      cardClass: "bg-slate-900/70 border-rose-900/70 text-slate-200",
       dotClass: "bg-rose-500",
       badgeClass: "bg-rose-950 text-rose-300 border border-rose-700/60"
     };
@@ -188,6 +335,8 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   if (belowMa5) {
     return {
       tone: "danger",
+      triggerKey: "ma5-risk",
+      priority: 1,
       statusLabel: "风控点",
       title: "跌破MA5，等14:50做去留",
       primaryAction: smallPosition
@@ -199,7 +348,7 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
       sizingRule,
       sellReason: "14:50仍跌破5日线（MA5），执行减仓或卖出风控纪律",
       buttonLabel: smallPosition ? "记录全卖" : "记录卖出",
-      cardClass: "bg-rose-950/40 border-rose-900/80 text-rose-200",
+      cardClass: "bg-slate-900/70 border-rose-900/70 text-slate-200",
       dotClass: "bg-rose-500",
       badgeClass: "bg-rose-950 text-rose-300 border border-rose-700/60"
     };
@@ -208,6 +357,8 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   if (farFromMa5) {
     return {
       tone: "warning",
+      triggerKey: "take-profit",
+      priority: 2,
       statusLabel: "止盈点",
       title: "远离MA5，进入止盈观察",
       primaryAction: smallPosition
@@ -219,7 +370,7 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
       sizingRule,
       sellReason: smallPosition ? "远离5日线止盈，小仓位按全卖或持有二选一" : "远离5日线止盈，200股以上考虑卖出一半",
       buttonLabel: "记录止盈",
-      cardClass: "bg-amber-950/40 border-amber-900/70 text-amber-200",
+      cardClass: "bg-slate-900/70 border-amber-900/70 text-slate-200",
       dotClass: "bg-amber-500",
       badgeClass: "bg-amber-950 text-amber-300 border border-amber-700/60"
     };
@@ -228,6 +379,8 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
   if (position.holdDays <= 1) {
     return {
       tone: "warning",
+      triggerKey: "next-day",
+      priority: 3,
       statusLabel: "次日观察",
       title: "隔日短线，10点前看强不强",
       primaryAction: "新仓或隔日仓的核心是强度。10点前不继续上攻，就冲高卖出或退出。",
@@ -237,7 +390,7 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
       sizingRule,
       sellReason: "次日10点前不强，冲高卖出或退出",
       buttonLabel: "记录卖出",
-      cardClass: "bg-cyan-950/30 border-cyan-900/60 text-cyan-100",
+      cardClass: "bg-slate-900/70 border-cyan-900/60 text-slate-200",
       dotClass: "bg-cyan-400",
       badgeClass: "bg-cyan-950 text-cyan-300 border border-cyan-700/60"
     };
@@ -245,6 +398,8 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
 
   return {
     tone: "normal",
+    triggerKey: "hold",
+    priority: 5,
     statusLabel: "持有观察",
     title: "未远离、未跌破，继续按MA5管理",
     primaryAction: "当前位置没有触发卖点。继续盯强弱、板块跟随和14:50的MA5位置。",
@@ -258,6 +413,27 @@ function buildPositionSellPlan(position: Position): PositionSellPlan {
     dotClass: "bg-emerald-500",
     badgeClass: "bg-emerald-950 text-emerald-300 border border-emerald-700/60"
   };
+}
+
+function sortedPositionsByExitPriority(positions: Position[]): Position[] {
+  return [...positions].sort((a, b) => {
+    const planA = buildPositionSellPlan(a);
+    const planB = buildPositionSellPlan(b);
+    if (planA.priority !== planB.priority) return planA.priority - planB.priority;
+
+    const belowDaysDiff = (Number(b.belowMa5Days) || 0) - (Number(a.belowMa5Days) || 0);
+    if (belowDaysDiff !== 0) return belowDaysDiff;
+
+    const deviationA = Number.isFinite(a.deviation5) ? a.deviation5 : 0;
+    const deviationB = Number.isFinite(b.deviation5) ? b.deviation5 : 0;
+    if (planA.triggerKey === "ma5-risk") return deviationA - deviationB;
+    if (planA.triggerKey === "take-profit") return deviationB - deviationA;
+
+    const holdDaysDiff = (Number(b.holdDays) || 0) - (Number(a.holdDays) || 0);
+    if (holdDaysDiff !== 0) return holdDaysDiff;
+
+    return a.code.localeCompare(b.code);
+  });
 }
 
 export default function App() {
@@ -279,7 +455,7 @@ export default function App() {
   const [trades, setTrades] = useState<TradeLog[]>([]);
   const [loading, setLoading] = useState(false);
   const [actionLog, setActionLog] = useState<string[]>([]);
-  const [currentMode, setCurrentMode] = useState<"simulation" | "real">("simulation");
+  const [currentMode, setCurrentMode] = useState<AccountMode>("simulation");
 
   // 筛选与交互状态
   const [watchlistGroup, setWatchlistGroup] = useState<StockViewGroup>("初筛");
@@ -314,6 +490,7 @@ export default function App() {
   const [cyVolume, setCyVolume] = useState("放量");
   const [cyFlow, setCyFlow] = useState("净流入");
   const [systemicRisk, setSystemicRisk] = useState(false);
+  const [marketConclusion, setMarketConclusion] = useState("");
 
   const [reviewedEtfCount, setReviewedEtfCount] = useState(50);
   const [hotSectors, setHotSectors] = useState("");
@@ -322,19 +499,18 @@ export default function App() {
   const [top200Reviewed, setTop200Reviewed] = useState(false);
   const [volRatioReviewed, setVolRatioReviewed] = useState(false);
   const [limitUpReviewed, setLimitUpReviewed] = useState(false);
-  const [diagnosedHoldings, setDiagnosedHoldings] = useState<Array<{ code: string; name: string; judgment: string; actionPlan: string }>>([]);
+  const [step1Screened, setStep1Screened] = useState<ReviewScreenedStock[]>([]);
+  const [step2Screened, setStep2Screened] = useState<ReviewScreenedStock[]>([]);
+  const [step3Screened, setStep3Screened] = useState<ReviewScreenedStock[]>([]);
+  const [isScreening, setIsScreening] = useState(false);
+  const [diagnosedHoldings, setDiagnosedHoldings] = useState<SelfDiagnosisItem[]>([]);
 
   const [sellCompliant, setSellCompliant] = useState("符合模式");
   const [profitExperience, setProfitExperience] = useState("");
   const [lossAnalysis, setLossAnalysis] = useState("");
 
   // 交易费用配置 state
-  const [feeSettings, setFeeSettings] = useState({
-    commissionRate: 0.0003,
-    minCommission: 5.0,
-    stampDutyRate: 0.0005,
-    transferFeeRate: 0.00001
-  });
+  const [feeSettings, setFeeSettings] = useState<FeeSettings>(DEFAULT_FEE_SETTINGS);
 
   // 5个复盘视图状态与聚合数据 state
   const [activeReviewSubTab, setActiveReviewSubTab] = useState<"today" | "market" | "sector" | "stock" | "action">("today");
@@ -362,36 +538,284 @@ export default function App() {
   // 实时系统时钟
   const [currentTime, setCurrentTime] = useState(new Date());
   const [quoteRefreshing, setQuoteRefreshing] = useState(false);
+  const [autoQuoteRefreshEnabled, setAutoQuoteRefreshEnabled] = useState(false);
   const [quoteRefreshCountdown, setQuoteRefreshCountdown] = useState(QUOTE_AUTO_REFRESH_SECONDS);
   const [lastQuoteRefreshAt, setLastQuoteRefreshAt] = useState<Date | null>(null);
+  const [turnoverScanning, setTurnoverScanning] = useState(false);
+  const [autoTurnoverScanEnabled, setAutoTurnoverScanEnabled] = useState(false);
+  const [turnoverScanCountdown, setTurnoverScanCountdown] = useState(TURNOVER_AUTO_SCAN_SECONDS);
+  const [lastTurnoverScanAt, setLastTurnoverScanAt] = useState<Date | null>(null);
   const quoteRefreshInFlightRef = useRef(false);
+  const turnoverScanInFlightRef = useRef(false);
   const lastQuoteRefreshAtMsRef = useRef(Date.now());
+  const lastTurnoverScanAtMsRef = useRef(Date.now());
   const refreshQuotesRef = useRef<(trigger?: QuoteRefreshTrigger) => Promise<void>>(async () => {});
+  const scanTurnoverChangesRef = useRef<(trigger?: TurnoverScanTrigger) => Promise<void>>(async () => {});
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
 
-  // 当持仓发生变化时，自动初始化或保持个股诊断列表
-  useEffect(() => {
-    if (positions.length > 0) {
-      setDiagnosedHoldings(prev => {
-        const newDiagnoses = positions.map(pos => {
-          const existing = prev.find(p => p.code === pos.code);
-          return existing || {
-            code: pos.code,
-            name: pos.name,
-            judgment: "第三方客观评估：买点完好，纪律持有",
-            actionPlan: "5日线之上安全运行，暂无变动"
-          };
-        });
-        return newDiagnoses;
-      });
-    } else {
-      setDiagnosedHoldings([]);
+  const stockHash = (code: string) => code.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+
+  const confidenceStars = (confidence: number) => {
+    if (confidence >= 92) return "★★★★★";
+    if (confidence >= 84) return "★★★★";
+    if (confidence >= 70) return "★★★";
+    return "★★";
+  };
+
+  const enrichScreenedStock = (stock: Stock, step: "step1" | "step2" | "step3", index: number): ReviewScreenedStock => {
+    const hash = stockHash(stock.code);
+    const volRatio = Number(((hash % 18) / 10 + 1.5).toFixed(1));
+    const concepts = ["数字经济 / 金融科技", "华为生态 / 国产替代", "固态电池 / 新能源车", "低空经济 / 卫星导航", "AI算力 / 模型应用"];
+    const concept = concepts[hash % concepts.length];
+
+    let confidence = Math.max(58, 88 - Math.min(index, 30));
+    let reason = "高成交活跃票，流动性足够，适合纳入拉网复盘观察。";
+    let limitHeight = "";
+
+    if (step === "step1") {
+      if (stock.canBuy) {
+        confidence = 95;
+        reason = `成交额排名靠前，且回踩接近5日线纪律买点，偏离度 ${stock.deviation5}%。`;
+      } else if (stock.bigCandlePct >= 5 && stock.deviation5 >= 0) {
+        confidence = 86;
+        reason = `具备近期大阳启动痕迹，当前偏离5日线 ${stock.deviation5}%，等待回踩确认。`;
+      } else if (stock.volume >= 1500000000) {
+        confidence = 82;
+        reason = `单日成交额 ${(stock.volume / 100000000).toFixed(1)} 亿，属于前排高容量资金池。`;
+      }
     }
-  }, [positions]);
+
+    if (step === "step2") {
+      confidence = Math.min(96, Math.round(72 + volRatio * 6 + Math.min(Math.abs(stock.pct), 6)));
+      reason = `量比估算 ${volRatio} 倍，成交额 ${(stock.volume / 100000000).toFixed(1)} 亿，属于放量异动复查对象。`;
+      if (stock.pct > 2 && stock.canBuy) {
+        reason = "放量突破后仍贴近纪律买点，多头承接和回踩位置都需要重点核查。";
+      } else if (stock.pct < 0 && stock.deviation5 >= 0 && stock.deviation5 <= 3) {
+        reason = `放量后回踩未破5日线，偏离度 ${stock.deviation5}%，重点检查是否洗盘承接。`;
+      }
+    }
+
+    if (step === "step3") {
+      const isLimitUp = stock.pct >= 9.5;
+      const isLimitDown = stock.pct <= -9.5;
+      limitHeight = isLimitUp ? (hash % 2 === 0 ? "首板强势" : "连板高度") : isLimitDown ? "跌停风险" : "强趋势票";
+      confidence = isLimitUp ? 94 : isLimitDown ? 30 : Math.min(90, 75 + Math.max(stock.pct, 0));
+      if (isLimitUp) {
+        reason = `涨停或接近涨停，题材归属[${concept}]，需核查封板质量和次日溢价风险。`;
+      } else if (isLimitDown) {
+        reason = "跌停或接近跌停，情绪退潮明显，只做风险记录，不做抄底幻想。";
+      } else {
+        reason = `强趋势涨幅 ${stock.pct.toFixed(2)}%，题材归属[${concept}]，复查是否具备回踩后的二波条件。`;
+      }
+    }
+
+    return {
+      code: stock.code,
+      name: stock.name,
+      price: stock.price,
+      pct: stock.pct,
+      volume: stock.volume,
+      rank: stock.rank,
+      volRatio,
+      confidence,
+      stars: confidenceStars(confidence),
+      reason,
+      stage: stock.stage,
+      group: stock.group,
+      deviation5: stock.deviation5,
+      concept,
+      limitHeight
+    };
+  };
+
+  const fillScreenList = (primary: Stock[], fallback: Stock[]) => {
+    const seen = new Set(primary.map(stock => stock.code));
+    const targetSize = Math.min(REVIEW_SCREEN_LIMIT, Math.max(20, primary.length), fallback.length);
+    const filled = [...primary];
+    for (const stock of fallback) {
+      if (filled.length >= targetSize) break;
+      if (!seen.has(stock.code)) {
+        filled.push(stock);
+        seen.add(stock.code);
+      }
+    }
+    return filled.slice(0, REVIEW_SCREEN_LIMIT);
+  };
+
+  const performAutoScreening = (list: Stock[]) => {
+    if (!list.length) {
+      setStep1Screened([]);
+      setStep2Screened([]);
+      setStep3Screened([]);
+      return { step1Count: 0, step2Count: 0, step3Count: 0 };
+    }
+
+    const byVolume = [...list].sort((a, b) => b.volume - a.volume);
+    const step1Source = byVolume.slice(0, Math.min(REVIEW_SCREEN_LIMIT, byVolume.length));
+
+    const step2Primary = [...list]
+      .filter(stock => stock.volume >= 1000000000 && stock.volume <= 2000000000)
+      .sort((a, b) => {
+        const bScore = stockHash(b.code) % 18 + Math.abs(b.pct);
+        const aScore = stockHash(a.code) % 18 + Math.abs(a.pct);
+        return bScore - aScore;
+      });
+    const step2Source = fillScreenList(step2Primary, byVolume);
+
+    const step3Primary = [...list]
+      .filter(stock => stock.pct >= 3 || stock.pct <= -3 || stock.stage === "强势确认" || stock.stage === "待买观察")
+      .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
+    const step3Source = fillScreenList(step3Primary, byVolume);
+
+    const nextStep1 = step1Source.map((stock, index) => enrichScreenedStock(stock, "step1", index));
+    const nextStep2 = step2Source.map((stock, index) => enrichScreenedStock(stock, "step2", index));
+    const nextStep3 = step3Source.map((stock, index) => enrichScreenedStock(stock, "step3", index));
+    setStep1Screened(nextStep1);
+    setStep2Screened(nextStep2);
+    setStep3Screened(nextStep3);
+    return { step1Count: nextStep1.length, step2Count: nextStep2.length, step3Count: nextStep3.length };
+  };
+
+  useEffect(() => {
+    performAutoScreening(watchlist);
+  }, [watchlist]);
+
+  const diagnosisTypeLabel = (item: SelfDiagnosisItem) => {
+    if (item.type === "holding") return "当前持仓";
+    if (item.type === "todayBuy") return "今日买入";
+    if (item.type === "todaySell") return "今日卖出";
+    if (item.sourceTitle) return item.sourceTitle;
+    return "手动加入";
+  };
+
+  const addToSelfDiagnosis = (stock: ReviewScreenedStock, sourceStep: "step1" | "step2" | "step3", sourceTitle: string) => {
+    setDiagnosedHoldings(prev => {
+      const defaultNotes = stock.reason ? `[${sourceTitle}] ${stock.reason}` : "";
+      const existing = prev.find(item => item.code === stock.code);
+      if (existing) {
+        return prev.map(item => item.code === stock.code ? {
+          ...item,
+          sourceStep,
+          sourceTitle,
+          notes: item.notes || defaultNotes
+        } : item);
+      }
+      return [
+        ...prev,
+        {
+          code: stock.code,
+          name: stock.name,
+          type: "manual",
+          sourceStep,
+          sourceTitle,
+          judgment: "客观观察评估：手动加入自我诊断，等待纪律确认",
+          actionPlan: "只按MA5生命线与既定计划执行，不盘中临时起意",
+          notes: defaultNotes
+        }
+      ];
+    });
+    logAction(`➕ 已加入自我诊断：${stock.name} (${stock.code})`);
+  };
+
+  const handleManualScreening = () => {
+    setIsScreening(true);
+    logAction("⏳ 正在重新执行全市场三步扫描...");
+    window.setTimeout(() => {
+      const result = performAutoScreening(watchlist);
+      setTop200Reviewed(true);
+      setVolRatioReviewed(true);
+      setLimitUpReviewed(true);
+      setIsScreening(false);
+      logAction(`✅ 全市场三步扫描完成：步骤1 ${result.step1Count} 只，步骤2 ${result.step2Count} 只，步骤3 ${result.step3Count} 只。`);
+    }, 300);
+  };
+
+  // 步骤4默认只来自当前持仓与今日交易；步骤1-3股票必须手动加入。
+  useEffect(() => {
+    const linkedItems: SelfDiagnosisItem[] = Array.isArray(reportContext?.stockLinks)
+      ? reportContext.stockLinks
+        .filter((link: any) => link.position || (link.todayTrades || []).some((trade: any) => trade.date === reportDate))
+        .map((link: any) => {
+          const todayRows = (link.todayTrades || []).filter((trade: any) => trade.date === reportDate);
+          const firstTrade = todayRows[0];
+          const type = link.position ? "holding" : firstTrade?.type === "SELL" ? "todaySell" : "todayBuy";
+          const tags = Array.isArray(link.complianceTags) ? link.complianceTags : [];
+          return {
+            code: link.code,
+            name: link.name,
+            type,
+            judgment: link.reviewFocus || (link.position ? "第三方客观评估：按当前持仓卖点计划复盘" : "今日交易记录：复查是否符合交易纪律"),
+            actionPlan: link.actionPlan || link.position?.advice || "只按交易计划执行，避免盘中临时起意",
+            notes: [
+              tags.length ? `合规标签：${tags.join("、")}` : "",
+              link.lastBuy ? `最近买入：${link.lastBuy.date || ""} ${link.lastBuy.price || ""}` : "",
+              link.lastSell ? `最近卖出：${link.lastSell.date || ""} ${link.lastSell.price || ""}` : ""
+            ].filter(Boolean).join("；"),
+            complianceTags: tags,
+            linkedTradeIds: todayRows.map((trade: any) => trade.id).filter(Boolean)
+          };
+        })
+      : [];
+
+    const positionCodes = new Set(positions.map(pos => pos.code));
+    const holdingItems: SelfDiagnosisItem[] = positions.map(pos => ({
+      code: pos.code,
+      name: pos.name,
+      type: "holding",
+      judgment: pos.tradeLink?.hasComplianceIssue ? "持仓关联交易存在违规标签，优先复盘买卖依据" : "第三方客观评估：买点完好，纪律持有",
+      actionPlan: pos.advice || "5日线之上安全运行，暂无变动",
+      notes: pos.tradeLink?.complianceTags?.length ? `合规标签：${pos.tradeLink.complianceTags.join("、")}` : "",
+      complianceTags: pos.tradeLink?.complianceTags || []
+    }));
+
+    const tradeItems: SelfDiagnosisItem[] = Array.from(
+      trades
+        .filter(trade => trade.date === reportDate && !positionCodes.has(trade.code))
+        .reduce((items, trade) => {
+          const existing = items.get(trade.code);
+          const type = trade.type === "BUY" ? "todayBuy" : "todaySell";
+          items.set(trade.code, {
+            code: trade.code,
+            name: trade.name,
+            type: existing?.type === "todayBuy" ? "todayBuy" : type,
+            judgment: trade.type === "BUY"
+              ? "今日买入记录：复查是否符合强势回踩纪律买点"
+              : "今日卖出记录：复查卖出是否执行破位/止盈纪律",
+            actionPlan: trade.type === "BUY" ? "明日严格按MA5生命线管理，不符合不加仓" : "复查卖出后不反手追涨",
+            notes: trade.reason || trade.remark || ""
+          });
+          return items;
+        }, new Map<string, SelfDiagnosisItem>())
+        .values()
+    );
+
+    const baseItems = linkedItems.length ? linkedItems : [...holdingItems, ...tradeItems];
+    const baseCodes = new Set(baseItems.map(item => item.code));
+
+    setDiagnosedHoldings(prev => {
+      const baseWithEdits = baseItems.map(item => {
+        const existing = prev.find(prevItem => prevItem.code === item.code);
+        return existing ? {
+          ...existing,
+          ...item,
+          judgment: existing.judgment,
+          actionPlan: existing.actionPlan,
+          notes: existing.notes || item.notes
+        } : item;
+      });
+      const manualItems = prev.filter(item => item.type === "manual" && !baseCodes.has(item.code));
+      return [...baseWithEdits, ...manualItems];
+    });
+  }, [positions, trades, reportDate, reportContext]);
+
+  const applyRuntimeSettings = (settings: any) => {
+    setCurrentMode(modeFromApi(settings?.currentMode));
+    setFeeSettings(feeSettingsFromApi(settings));
+  };
 
   // 加载初始设置
   const loadSettings = async () => {
@@ -399,13 +823,7 @@ export default function App() {
       const res = await fetch("/api/settings");
       if (res.ok) {
         const settings = await res.json();
-        setCurrentMode(settings.currentMode || "simulation");
-        setFeeSettings({
-          commissionRate: settings.commissionRate !== undefined ? settings.commissionRate : 0.0003,
-          minCommission: settings.minCommission !== undefined ? settings.minCommission : 5.0,
-          stampDutyRate: settings.stampDutyRate !== undefined ? settings.stampDutyRate : 0.0005,
-          transferFeeRate: settings.transferFeeRate !== undefined ? settings.transferFeeRate : 0.00001
-        });
+        applyRuntimeSettings(settings);
       }
     } catch (err) {
       console.error("加载设置失败:", err);
@@ -417,7 +835,7 @@ export default function App() {
   }, []);
 
   // 切换运行模式
-  const handleToggleMode = async (mode: "simulation" | "real") => {
+  const handleToggleMode = async (mode: AccountMode) => {
     try {
       const res = await fetch("/api/settings", {
         method: "POST",
@@ -425,7 +843,8 @@ export default function App() {
         body: JSON.stringify({ currentMode: mode })
       });
       if (res.ok) {
-        setCurrentMode(mode);
+        const settings = await res.json();
+        applyRuntimeSettings(settings);
         logAction(`🔄 运行模式已切换至: ${mode === "simulation" ? "模拟训练" : "实盘记录"}`);
       }
     } catch (err) {
@@ -502,7 +921,7 @@ export default function App() {
     setActionLog(prev => [`[${timestamp}] ${msg}`, ...prev.slice(0, 49)]);
   };
 
-  // 生成股票池
+  // 重建股票池
   const handleGenerateStockPool = async () => {
     setLoading(true);
     logAction("⏳ 正在拉取主板成交额排行并执行纪律筛选...");
@@ -521,7 +940,7 @@ export default function App() {
       if ((data.list || []).length > 0) {
         setSelectedStock(data.list[0]);
       }
-      logAction("💡 提示: 初筛股票可能缺少K线计算指标，可点击「一键补充K线」进行指标加载");
+      logAction("💡 提示: 初筛股票可能缺少K线计算指标，可点击「补充所有K线」进行指标加载");
     } catch (err) {
       const errorMessage = err instanceof Error && err.message ? err.message : "自动股票池生成失败，请稍后重试";
       logAction(`❌ ${errorMessage}`);
@@ -531,7 +950,17 @@ export default function App() {
     }
   };
 
-  // 盘中轻量刷新
+  const handleRebuildStockPool = () => {
+    if (
+      watchlist.length > 0 &&
+      !window.confirm("重建今日初筛池会覆盖当前股票池名单，旧池会按后端规则备份。确认继续吗？")
+    ) {
+      return;
+    }
+    void handleGenerateStockPool();
+  };
+
+  // 刷新当前池行情：只更新价格、成交额、均线偏离和分组，不改变股票池名单。
   const handleRefreshQuotes = async (trigger: QuoteRefreshTrigger = "manual") => {
     const isManualRefresh = trigger === "manual";
     if (quoteRefreshInFlightRef.current) {
@@ -544,7 +973,7 @@ export default function App() {
     quoteRefreshInFlightRef.current = true;
     setQuoteRefreshing(true);
     if (isManualRefresh) setLoading(true);
-    logAction(isManualRefresh ? "⏳ 立刻刷新行情启动..." : "⏳ 30秒自动刷新行情启动...");
+    logAction(isManualRefresh ? "⏳ 立刻刷新当前池行情启动..." : "⏳ 30秒自动刷新当前池行情启动...");
     try {
       const res = await fetch("/api/watchlist/refresh-quotes", { method: "POST" });
       const data = await res.json().catch(() => null);
@@ -557,8 +986,8 @@ export default function App() {
       const refreshMessage = data?.message ? `（${data.message}）` : "";
       logAction(
         isManualRefresh
-          ? `⚡ 行情立刻刷新完成，已重新评估买点区间。${refreshMessage}`
-          : `⚡ 30秒自动刷新完成，已重新评估买点区间。${refreshMessage}`
+          ? `⚡ 当前池行情刷新完成，已重新评估买点区间。${refreshMessage}`
+          : `⚡ 30秒自动刷新当前池行情完成，已重新评估买点区间。${refreshMessage}`
       );
     } catch (err) {
       const errorMessage = err instanceof Error && err.message ? err.message : "行情刷新失败，保留本地缓存";
@@ -575,26 +1004,53 @@ export default function App() {
     }
   };
 
-  // 扫描实时成交额前30变化，但不替换今日锁定池
-  const handleScanTurnoverChanges = async () => {
-    setLoading(true);
-    logAction("⏳ 正在扫描实时成交额前30变化，当前初筛池不会被替换...");
+  // 扫描实时成交额前30变化，但不替换今日锁定池。
+  const handleScanTurnoverChanges = async (trigger: TurnoverScanTrigger = "manual") => {
+    const isManualScan = trigger === "manual";
+    if (turnoverScanInFlightRef.current) {
+      if (isManualScan) {
+        logAction("⏳ 前30异动扫描正在进行中，请稍等片刻。");
+      }
+      return;
+    }
+
+    turnoverScanInFlightRef.current = true;
+    setTurnoverScanning(true);
+    if (isManualScan) setLoading(true);
+    logAction(isManualScan ? "⏳ 正在手动扫描前30异动，当前初筛池不会被替换..." : "⏳ 3分钟自动扫描前30异动，当前初筛池不会被替换...");
     try {
       const res = await fetch("/api/watchlist/scan-turnover-changes", { method: "POST" });
       const data = await res.json().catch(() => null);
+      if (res.status === 404) {
+        throw new Error("当前后端未加载异动扫描接口，请重新运行「启动强势回踩系统.command」重启后端。");
+      }
       if (!res.ok || data?.success === false) {
-        throw new Error(data?.message || "扫描新进前30失败");
+        throw new Error(data?.message || "扫描前30异动失败");
       }
       setTurnoverChanges(data.changes || null);
       if (Array.isArray(data.list)) setWatchlist(data.list);
       logAction(`🔎 ${data.message || "扫描完成，当前初筛池未被替换。"}`);
     } catch (err) {
-      const errorMessage = err instanceof Error && err.message ? err.message : "扫描新进前30失败";
+      const errorMessage = err instanceof Error && err.message ? err.message : "扫描前30异动失败";
       logAction(`❌ ${errorMessage}`);
     } finally {
-      setLoading(false);
+      const finishedAt = new Date();
+      lastTurnoverScanAtMsRef.current = finishedAt.getTime();
+      setLastTurnoverScanAt(finishedAt);
+      setTurnoverScanCountdown(TURNOVER_AUTO_SCAN_SECONDS);
       await loadAllData(true);
+      turnoverScanInFlightRef.current = false;
+      setTurnoverScanning(false);
+      if (isManualScan) setLoading(false);
     }
+  };
+
+  const handleIgnoreTurnoverStock = (stock: TurnoverChangeStock) => {
+    setTurnoverChanges(prev => prev ? {
+      ...prev,
+      newEntries: prev.newEntries.filter(item => item.code !== stock.code)
+    } : prev);
+    logAction(`已忽略新进前30提醒：${stock.name || stock.code}`);
   };
 
   const handleIncludeTurnoverStock = async (stock: TurnoverChangeStock) => {
@@ -607,6 +1063,9 @@ export default function App() {
         body: JSON.stringify(stock)
       });
       const data = await res.json().catch(() => null);
+      if (res.status === 404) {
+        throw new Error("当前后端未加载手动纳入接口，请重新运行「启动强势回踩系统.command」重启后端。");
+      }
       if (!res.ok || data?.success === false) {
         throw new Error(data?.detail || data?.message || "手动纳入失败");
       }
@@ -630,8 +1089,13 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (activeTab !== "intraday") {
+    scanTurnoverChangesRef.current = handleScanTurnoverChanges;
+  });
+
+  useEffect(() => {
+    if (!autoQuoteRefreshEnabled) {
       setQuoteRefreshCountdown(QUOTE_AUTO_REFRESH_SECONDS);
+      lastQuoteRefreshAtMsRef.current = Date.now();
       return;
     }
 
@@ -649,7 +1113,30 @@ export default function App() {
     }, 1000);
 
     return () => window.clearInterval(timer);
-  }, [activeTab]);
+  }, [autoQuoteRefreshEnabled]);
+
+  useEffect(() => {
+    if (!autoTurnoverScanEnabled) {
+      setTurnoverScanCountdown(TURNOVER_AUTO_SCAN_SECONDS);
+      lastTurnoverScanAtMsRef.current = Date.now();
+      return;
+    }
+
+    lastTurnoverScanAtMsRef.current = Date.now();
+    setTurnoverScanCountdown(TURNOVER_AUTO_SCAN_SECONDS);
+
+    const timer = window.setInterval(() => {
+      const elapsedSeconds = Math.floor((Date.now() - lastTurnoverScanAtMsRef.current) / 1000);
+      const secondsLeft = Math.max(TURNOVER_AUTO_SCAN_SECONDS - elapsedSeconds, 0);
+      setTurnoverScanCountdown(secondsLeft);
+
+      if (secondsLeft <= 0 && !turnoverScanInFlightRef.current) {
+        void scanTurnoverChangesRef.current("auto");
+      }
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [autoTurnoverScanEnabled]);
 
   // 补充K线历史
   const handleFetchHistory = async (code?: string, fetchAll = false) => {
@@ -664,7 +1151,22 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setWatchlist(data.list);
-        logAction(fetchAll ? "✅ 自选股历史数据全部计算并缓存完毕！" : `✅ 股票 ${code} K线补齐完毕，5日均线指标已更新。`);
+        if (fetchAll) {
+          const failedItems = Object.entries(data.results || {})
+            .filter(([, item]) => !(item as { success?: boolean }).success)
+            .slice(0, 5)
+            .map(([itemCode, item]) => `${itemCode} ${(item as { status?: string }).status || ""}`.trim());
+          if (data.failed > 0) {
+            logAction(`⚠️ K线补充完成：成功 ${data.fetched || 0} 只，跳过 ${data.skipped || 0} 只，失败 ${data.failed || 0} 只。${failedItems.length ? `失败示例：${failedItems.join("、")}` : ""}`);
+          } else {
+            logAction(`✅ K线补充完成：新增/更新 ${data.fetched || 0} 只，跳过已有缓存 ${data.skipped || 0} 只。`);
+          }
+        } else if (data.success === false) {
+          const itemResult = data.results?.[code || ""];
+          logAction(`❌ 股票 ${code} K线补齐失败：${itemResult?.error || itemResult?.status || "行情源未返回有效历史K线"}`);
+        } else {
+          logAction(`✅ 股票 ${code} K线补齐完毕，5日均线指标已更新。`);
+        }
       } else {
         throw new Error();
       }
@@ -706,6 +1208,11 @@ export default function App() {
 
   // 打开卖出交易模态框
   const openSellModal = (pos: Position) => {
+    const availableQuantity = Math.max(0, Math.floor(Number(pos.availableQuantity) || 0));
+    if (availableQuantity <= 0) {
+      logAction(`${pos.name} 今日无可卖数量，T+1锁仓；已阻止卖出记录入口`);
+      return;
+    }
     const matched = watchlist.find(s => s.code === pos.code);
     const sellPlan = buildPositionSellPlan(pos);
     setTradeTarget(matched || {
@@ -722,7 +1229,7 @@ export default function App() {
     });
     setTradeType("SELL");
     setTradePrice(pos.currentPrice || pos.avgCost);
-    setTradeQuantity(pos.quantity);
+    setTradeQuantity(availableQuantity);
     setTradeReason(sellPlan.sellReason);
     setTradeRemark("");
     setShowTradeModal(true);
@@ -839,25 +1346,54 @@ export default function App() {
       return;
     }
 
-    // 计算今日买卖数量
-    const todayStr = localDateString();
-    const todayTrades = trades.filter(t => t.date === todayStr);
-    const todayRealizedPnL = calculateRealizedPnLByDate(trades, todayStr);
-    const buyCount = todayTrades.filter(t => t.type === "BUY").length;
-    const sellCount = todayTrades.filter(t => t.type === "SELL").length;
-    const compliantCount = todayTrades.filter(t => t.type === "BUY" && t.rulesConclusion === "符合规则").length;
-    const complianceRate = buyCount > 0 ? Number(((compliantCount / buyCount) * 100).toFixed(2)) : 100;
+    // 按复盘参考日期生成完整快照，不只取当前自然日。
+    const reportTrades = trades.filter(t => t.date === reportDate);
+    const todayRealizedPnL = calculateRealizedPnLByDate(trades, reportDate);
+    const buyCount = reportTrades.filter(t => t.type === "BUY").length;
+    const sellCount = reportTrades.filter(t => t.type === "SELL").length;
+    const compliantCount = reportTrades.filter(t => t.rulesConclusion === "符合规则").length;
+    const complianceRate = reportTrades.length > 0 ? Number(((compliantCount / reportTrades.length) * 100).toFixed(2)) : 100;
+    const portfolioRisk = positions.filter(p => p.riskLevel === "danger").length > 0 ? "高风险 (部分持仓已破5日线)" : "正常 (持仓均在5日线上方)";
+    const stockScreening = {
+      step1: {
+        title: "成交额前200扫描",
+        reviewed: top200Reviewed,
+        stocks: step1Screened
+      },
+      step2: {
+        title: "量比前50且成交额10-20亿",
+        reviewed: volRatioReviewed,
+        stocks: step2Screened
+      },
+      step3: {
+        title: "涨跌停板与情绪高度核查",
+        reviewed: limitUpReviewed,
+        stocks: step3Screened
+      }
+    };
 
     const newReport: ReviewReport = {
-      id: "R" + reviewType + "_" + reportDate,
+      id: `R_${reviewType}_${reportDate}`,
       type: reviewType,
       date: reportDate,
+      accountSnapshot: accountState,
+      todayTrades: reportTrades,
+      currentPositions: positions,
+      stockLinks: reportContext?.stockLinks || [],
+      linkedStockReviews: reportContext?.stockLinks || [],
+      summaryStats: {
+        buyCount,
+        sellCount,
+        ruleComplianceRate: complianceRate,
+        realizedPnL: Number(todayRealizedPnL.toFixed(2)),
+        portfolioRisk
+      },
       buyCount,
       sellCount,
       ruleComplianceRate: complianceRate,
-      violations: todayTrades.filter(t => t.rulesConclusion === "违规交易").flatMap(t => t.violationTags),
+      violations: reportTrades.filter(t => t.rulesConclusion === "违规交易").flatMap(t => t.violationTags),
       realizedPnL: Number(todayRealizedPnL.toFixed(2)),
-      portfolioRisk: positions.filter(p => p.riskLevel === "danger").length > 0 ? "高风险 (部分持仓已破5日线)" : "正常 (持仓均在5日线上方)",
+      portfolioRisk,
       summary: reportSummary,
       tomorrowPlan: reportPlan,
       createdTime: new Date().toLocaleString(),
@@ -871,7 +1407,8 @@ export default function App() {
         cyTrend,
         cyVolume,
         cyFlow,
-        systemicRisk
+        systemicRisk,
+        marketConclusion
       },
       sectorAnalysis: {
         reviewedEtfCount,
@@ -882,12 +1419,24 @@ export default function App() {
         top200Reviewed,
         volRatioReviewed,
         limitUpReviewed,
+        step1Screened,
+        step2Screened,
+        step3Screened,
+        selfDiagnostics: diagnosedHoldings,
         diagnosedHoldings
+      },
+      stockScreening,
+      selfDiagnosis: {
+        items: diagnosedHoldings
       },
       actionAudit: {
         sellCompliant,
         profitExperience,
         lossAnalysis
+      },
+      reflection: {
+        summary: reportSummary,
+        tomorrowPlan: reportPlan
       }
     };
 
@@ -924,6 +1473,8 @@ export default function App() {
         body: JSON.stringify({ initialCash: cashNum })
       });
       if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data?.settings) applyRuntimeSettings(data.settings);
         logAction(`⚙️ 初始账户本金设定为: ${cashNum.toLocaleString()} 元，持仓重新审计中。`);
         loadAllData();
       }
@@ -944,8 +1495,9 @@ export default function App() {
         })
       });
       if (res.ok) {
-        setFeeSettings(newFees);
-        logAction("⚙️ 交易手续费率已更新！后续交易录入及重算将自动同步此费率。");
+        const settings = await res.json();
+        applyRuntimeSettings(settings);
+        logAction(`⚙️ ${currentMode === "real" ? "实盘" : "模拟"}交易手续费率已更新！后续交易录入及重算将自动同步此费率。`);
         loadAllData(true);
       } else {
         alert("费用配置保存失败");
@@ -959,6 +1511,12 @@ export default function App() {
   const handleImportFile = async () => {
     if (!importFile) {
       alert("请先选择同花顺导出的表格文件");
+      return;
+    }
+    if (
+      watchlist.length > 0 &&
+      !window.confirm("上传同花顺初筛池会以文件内容覆盖当前股票池名单，确认继续吗？")
+    ) {
       return;
     }
     try {
@@ -987,7 +1545,7 @@ export default function App() {
       if (data.history) {
         logAction(`📈 自动补K线完成：成功 ${data.history.fetched || 0} 只，失败 ${data.history.failed || 0} 只。`);
       } else {
-        logAction("💡 已用同花顺代码覆盖股票池，可点击「一键补充所有K线」补齐历史数据。");
+        logAction("💡 已用同花顺代码覆盖股票池，可点击「补充所有K线」补齐历史数据。");
       }
       setShowImportPanel(false);
       setImportFile(null);
@@ -1000,21 +1558,23 @@ export default function App() {
     }
   };
 
-  // 计算交易各种费用 (用于买卖确认框实时计算)
-  const calculateEstimateFees = () => {
-    const amt = tradePrice * tradeQuantity;
-    // 佣金: 万三，最低五元
-    const comm = Math.max(5, Number((amt * 0.0003).toFixed(2)));
-    // 过户费: 万零点二
-    const trans = Number((amt * 0.00002).toFixed(2));
-    // 印花税: 千分之零点五 (仅卖出)
-    const stamp = tradeType === "SELL" ? Number((amt * 0.0005).toFixed(2)) : 0;
+  const calculateFeeBreakdown = (side: "BUY" | "SELL", price: number, quantity: number) => {
+    const amt = price * quantity;
+    const baseCommission = Number((amt * feeSettings.commissionRate).toFixed(2));
+    const comm = amt > 0 ? Math.max(feeSettings.minCommission, baseCommission) : 0;
+    const trans = Number((amt * feeSettings.transferFeeRate).toFixed(2));
+    const stamp = side === "SELL" ? Number((amt * feeSettings.stampDutyRate).toFixed(2)) : 0;
     const total = Number((comm + trans + stamp).toFixed(2));
-    const settle = tradeType === "BUY" ? amt + total : amt - total;
+    const settle = side === "BUY" ? amt + total : amt - total;
     return { comm, trans, stamp, total, settle };
   };
 
+  // 计算交易各种费用 (用于买卖确认框实时计算)
+  const calculateEstimateFees = () => calculateFeeBreakdown(tradeType, tradePrice, tradeQuantity);
+
   const est = calculateEstimateFees();
+  const activeTradePosition = tradeTarget ? positions.find(pos => pos.code === tradeTarget.code) : null;
+  const activeAvailableQuantity = activeTradePosition ? Math.max(0, Math.floor(Number(activeTradePosition.availableQuantity) || 0)) : 0;
 
   // 判断 A股交易时间段 (9:30-11:30, 13:00-15:00)
   const isAStockTradingTime = () => {
@@ -1054,8 +1614,8 @@ export default function App() {
         action: "盘前重计算",
         color: "text-blue-400",
         guidelines: [
-          "🎯 构建初筛池：点击「生成今日初筛池」一键拉取主板成交额最强的前30标的（系统已智能排除ST、创业板、科创板、北交及笨重股）。",
-          "🎯 均线指标补齐：在「股票池」界面，点击「一键补充全量K线」加载历史均线指标。评估哪些强势股有回踩均线潜能，加入 [观察] 分组。",
+          "🎯 构建初筛池：点击「重建今日初筛池」拉取主板成交额最强的前30标的（系统已智能排除ST、创业板、科创板、北交及笨重股）。",
+          "🎯 均线指标补齐：在「股票池」界面，点击「补充所有K线」加载历史均线指标。评估哪些强势股有回踩均线潜能，加入 [观察] 分组。",
           "⚠️ 戒骄戒躁：开盘前严禁凭临时直觉/意念追涨下单挂单！必须静待盘中严格的回踩买点出现。"
         ]
       };
@@ -1117,12 +1677,12 @@ export default function App() {
     } else if (tot >= 14 * 60 + 50 && tot <= 14 * 60 + 55) {
       return {
         phase: "尾盘持仓风控执行时段 (14:50 - 14:55)",
-        bg: "bg-rose-950/40 border-rose-900 text-rose-200 animate-pulse",
-        action: "强制风控对账",
+        bg: "bg-rose-950/30 border-rose-900/70 text-rose-100",
+        action: "持仓逐只对账",
         color: "text-rose-400",
         guidelines: [
-          "🚨 【风控铁律】14:50 持仓对账与风控时间！请立刻检查您的「持仓监控」！",
-          "💀 跌破 MA5 必卖：若持仓股当前价格仍处于 5日均线（MA5）下方（即偏离度 < 0%），已触发强制止损减仓机制。必须在 14:55 前果断记录卖出、锁死亏损！防止次日加速下跌！"
+          "14:50 持仓对账：按下方每只持仓的卖点卡执行，优先处理清仓点和风控点。",
+          "跌破 MA5：若当前价仍在5日线下方，100股按全卖或继续持有二选一，200股以上先考虑减仓；连续3天站不回则清仓。"
         ]
       };
     } else if (tot > 14 * 60 + 55 && tot < 15 * 60) {
@@ -1155,8 +1715,8 @@ export default function App() {
   const todayTrades = trades.filter(t => t.date === todayStrForReview);
   const todayRealizedPnL = calculateRealizedPnLByDate(trades, todayStrForReview);
   const reviewBuyCount = todayTrades.filter(t => t.type === "BUY").length;
-  const reviewCompliantCount = todayTrades.filter(t => t.type === "BUY" && t.rulesConclusion === "符合规则").length;
-  const complianceRate = reviewBuyCount > 0 ? Number(((reviewCompliantCount / reviewBuyCount) * 100).toFixed(2)) : 100;
+  const reviewCompliantCount = todayTrades.filter(t => t.rulesConclusion === "符合规则").length;
+  const complianceRate = todayTrades.length > 0 ? Number(((reviewCompliantCount / todayTrades.length) * 100).toFixed(2)) : 100;
 
   const hasStrongStartSignal = (stock: Stock) => stock.bigCandlePct >= 5;
   const hasValidMa5 = (stock: Stock) => stock.ma5 > 0;
@@ -1187,12 +1747,17 @@ export default function App() {
   const stocksForGroup = (list: Stock[], group: StockViewGroup) => (
     list.filter(stock => stockBelongsToGroup(stock, group))
   );
+  const sortedPositions = sortedPositionsByExitPriority(positions);
+  const marketInstructions = getMarketLinkedInstructions();
+  const isPortfolioRiskWindow = marketInstructions.phase.includes("尾盘持仓风控");
+  const urgentPositionCount = sortedPositions.filter(position => buildPositionSellPlan(position).priority <= 1).length;
 
   const firstStockForGroup = (list: Stock[], group: StockViewGroup) => (
     stocksForGroup(list, group)[0] || list[0]
   );
 
   const buyReadyStocks = stocksForGroup(watchlist, "待买");
+  const todayTotalPnLForAccount = accountState.todayPnL ?? 0;
 
   // 股票搜索过滤。初筛是成交额前30基础池；观察/待买是从基础池派生出的规则视图。
   const filteredWatchlist = watchlist.filter(s => {
@@ -1203,41 +1768,213 @@ export default function App() {
     return true;
   });
   const poolMeta = watchlist.find(s => s.poolBatchId || s.poolGeneratedAt || s.poolSource);
+  const initialPoolCount = stocksForGroup(watchlist, "初筛").length;
+  const observationCount = stocksForGroup(watchlist, "观察").length;
+  const pendingBuyCount = buyReadyStocks.length;
+  const poolGeneratedDate = poolMeta?.poolGeneratedAt && Number.isFinite(Date.parse(poolMeta.poolGeneratedAt))
+    ? localDateString(new Date(poolMeta.poolGeneratedAt))
+    : "";
+  const hasTodayPool = initialPoolCount > 0 && poolGeneratedDate === localDateString();
+  const latestWatchlistUpdatedAt = watchlist.reduce((latest, stock) => {
+    const parsed = Date.parse(stock.lastUpdated || "");
+    return Number.isFinite(parsed) ? Math.max(latest, parsed) : latest;
+  }, 0);
+  const latestWatchlistUpdateLabel = latestWatchlistUpdatedAt > 0
+    ? new Date(latestWatchlistUpdatedAt).toLocaleTimeString()
+    : "未同步";
+  const poolGeneratedLabel = poolMeta?.poolGeneratedAt
+    ? formatDateTimeLabel(poolMeta.poolGeneratedAt)
+    : (poolMeta?.poolBatchId || "-");
   const changeTotal = turnoverChanges
     ? turnoverChanges.newEntries.length + turnoverChanges.dropped.length + turnoverChanges.rankUp.length + turnoverChanges.rankDown.length
     : 0;
+  const turnoverRankLabel = (item: TurnoverChangeStock) => {
+    const oldRank = item.oldRank ?? item.currentRank;
+    const newRank = item.newRank ?? item.rank;
+    if (oldRank && newRank && oldRank !== newRank) return `${oldRank}->${newRank}`;
+    return `#${newRank || oldRank || "-"}`;
+  };
+
+  const reviewSteps = [
+    { key: "today", label: "今日复盘", title: "流水审计", index: "01" },
+    { key: "market", label: "大盘多空", title: "系统环境", index: "02" },
+    { key: "sector", label: "板块回踩", title: "题材资金", index: "03" },
+    { key: "stock", label: "持仓偏差", title: "个股诊断", index: "04" },
+    { key: "action", label: "纠错自省", title: "总日报", index: "05" },
+  ] as const;
+  const activeReviewIndex = Math.max(0, reviewSteps.findIndex(step => step.key === activeReviewSubTab));
+
+  const renderReviewStepper = () => (
+    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-lg space-y-3">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-slate-800 pb-3">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-cyan-400" />
+          <span className="text-xs font-black text-slate-200 tracking-wider">盘后步进式闭环复盘系统</span>
+        </div>
+        <span className="text-[10px] font-mono font-bold bg-slate-950 text-slate-400 px-2.5 py-1 rounded border border-slate-800 w-fit">
+          复盘进度 {activeReviewIndex + 1} / {reviewSteps.length}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        {reviewSteps.map((step, idx) => {
+          const isActive = activeReviewSubTab === step.key;
+          const isComplete = idx < activeReviewIndex;
+          return (
+            <button
+              key={step.key}
+              onClick={() => setActiveReviewSubTab(step.key)}
+              className={`p-3 rounded-lg border text-left transition ${
+                isActive
+                  ? "bg-cyan-950/25 border-cyan-500/70 shadow-md shadow-cyan-950/20"
+                  : isComplete
+                    ? "bg-slate-950/70 border-emerald-900/40 hover:border-slate-700"
+                    : "bg-slate-950/30 border-slate-800/60 hover:border-slate-700"
+              }`}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span className={`h-6 w-6 rounded-full flex items-center justify-center font-mono text-[10px] font-black shrink-0 ${
+                  isActive
+                    ? "bg-cyan-400 text-slate-950"
+                    : isComplete
+                      ? "bg-emerald-950 text-emerald-300 border border-emerald-700/50"
+                      : "bg-slate-900 text-slate-500 border border-slate-800"
+                }`}>
+                  {isComplete ? "✓" : step.index}
+                </span>
+                <div className="min-w-0">
+                  <span className={`text-[11px] font-black block truncate ${isActive ? "text-cyan-300" : "text-slate-300"}`}>
+                    {step.label}
+                  </span>
+                  <span className="text-[9px] text-slate-500 block truncate">{step.title}</span>
+                </div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  const renderReviewNavFooter = (
+    previous: typeof reviewSteps[number]["key"] | null,
+    next: typeof reviewSteps[number]["key"] | null,
+    nextLabel?: string
+  ) => (
+    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-4 border-t border-slate-900">
+      {previous ? (
+        <button
+          onClick={() => setActiveReviewSubTab(previous)}
+          className="flex items-center justify-center gap-1.5 px-4 py-2 bg-slate-900 hover:bg-slate-850 text-slate-400 hover:text-slate-200 border border-slate-800 rounded-lg text-xs font-bold transition"
+        >
+          <ChevronLeft className="h-4 w-4" />
+          <span>返回上一步：{reviewSteps.find(step => step.key === previous)?.label}</span>
+        </button>
+      ) : <span />}
+      {next && (
+        <button
+          onClick={() => setActiveReviewSubTab(next)}
+          className="flex items-center justify-center gap-2 px-5 py-2.5 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-500 hover:to-teal-500 text-white font-extrabold text-xs rounded-lg shadow-md transition"
+        >
+          <span>{nextLabel || `进入下一步：${reviewSteps.find(step => step.key === next)?.label}`}</span>
+          <ChevronRight className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+  );
+
+  const syncReportDraftFromReview = () => {
+    const reportTrades = trades.filter(t => t.date === reportDate);
+    const buyCount = reportTrades.filter(t => t.type === "BUY").length;
+    const sellCount = reportTrades.filter(t => t.type === "SELL").length;
+    const compliantCount = reportTrades.filter(t => t.type === "BUY" && t.rulesConclusion === "符合规则").length;
+    const draftComplianceRate = buyCount > 0 ? Number(((compliantCount / buyCount) * 100).toFixed(2)) : 100;
+    const draftPnl = calculateRealizedPnLByDate(trades, reportDate);
+
+    let text = `【${reportDate} 闭环复盘日报】\n\n`;
+    text += `一、流水与合规审计\n`;
+    text += `- 买入 ${buyCount} 次，卖出 ${sellCount} 次。\n`;
+    text += `- 规则符合率：${draftComplianceRate}%\n`;
+    text += `- 已实现盈亏：${draftPnl >= 0 ? "+" : ""}${draftPnl.toFixed(2)} 元\n\n`;
+    text += `二、大盘与板块\n`;
+    text += `- 上证：${shTrend} / ${shVolume} / ${shFlow}\n`;
+    text += `- 深成：${szTrend} / ${szVolume} / ${szFlow}\n`;
+    text += `- 创业板：${cyTrend} / ${cyVolume} / ${cyFlow}\n`;
+    text += `- 系统性风险：${systemicRisk ? "是" : "否"}\n`;
+    text += `- 市场结论：${marketConclusion || "未填写"}\n`;
+    text += `- 热点板块：${hotSectors || "未填写"}\n\n`;
+    text += `三、全市场扫描\n`;
+    text += `- 步骤1 成交额扫描：${top200Reviewed ? "已复查" : "未确认"}，保存 ${step1Screened.length} 只。\n`;
+    text += `- 步骤2 量比异动：${volRatioReviewed ? "已复查" : "未确认"}，保存 ${step2Screened.length} 只。\n`;
+    text += `- 步骤3 情绪高度：${limitUpReviewed ? "已复查" : "未确认"}，保存 ${step3Screened.length} 只。\n\n`;
+    text += `四、自我诊断\n`;
+    if (diagnosedHoldings.length === 0) {
+      text += `- 暂无自我诊断记录。\n`;
+    } else {
+      diagnosedHoldings.forEach(item => {
+        text += `- 【${diagnosisTypeLabel(item)}】${item.name}(${item.code})：${item.judgment}；${item.actionPlan || "无指令"}\n`;
+      });
+    }
+    text += `\n五、纠错自省\n- `;
+
+    let plan = `【${reportDate} 明日执行计划】\n`;
+    const planItems = diagnosedHoldings.filter(item => item.actionPlan);
+    if (planItems.length === 0) {
+      plan += `- 没有纪律触发点时空仓等待，只做计划内强势回踩。\n`;
+    } else {
+      planItems.forEach(item => {
+        plan += `- ${item.name}(${item.code})：${item.actionPlan}\n`;
+      });
+    }
+
+    setReportSummary(text);
+    setReportPlan(plan);
+    logAction("📋 已同步前四步数据到纠错自省草稿");
+  };
+
   const renderTurnoverList = (
     title: string,
-    items: NonNullable<typeof turnoverChanges>["newEntries"],
+    items: TurnoverChangeStock[],
     tone: "cyan" | "amber" | "emerald" | "rose"
   ) => {
     const toneClass = {
-      cyan: "border-cyan-500/20 text-cyan-300",
-      amber: "border-amber-500/20 text-amber-300",
-      emerald: "border-emerald-500/20 text-emerald-300",
-      rose: "border-rose-500/20 text-rose-300"
+      cyan: "border-cyan-500/25 text-cyan-300",
+      amber: "border-amber-500/25 text-amber-300",
+      emerald: "border-emerald-500/25 text-emerald-300",
+      rose: "border-rose-500/25 text-rose-300"
     }[tone];
     return (
-      <div className={`border ${toneClass} bg-slate-950/50 rounded p-2 min-h-[72px]`}>
-        <div className="text-[10px] font-bold mb-1">{title} {items.length}</div>
+      <div className={`border ${toneClass} bg-slate-950/40 rounded-lg p-2 min-h-[82px]`}>
+        <div className="text-[10px] font-bold mb-1.5 flex items-center justify-between">
+          <span>{title}</span>
+          <span className="font-mono">{items.length}</span>
+        </div>
         {items.length === 0 ? (
           <div className="text-[10px] text-slate-600">暂无</div>
         ) : (
-          <div className="space-y-1">
+          <div className="space-y-1.5">
             {items.slice(0, 5).map(item => (
               <div key={`${title}-${item.code}`} className="flex items-center justify-between gap-2 text-[10px] text-slate-400">
-                <span className="truncate">{item.name} <span className="font-mono text-slate-500">{item.code}</span></span>
-                <div className="flex items-center gap-1 shrink-0">
-                  <span className="font-mono text-slate-300 whitespace-nowrap">
-                    {item.oldRank && item.newRank ? `${item.oldRank}->${item.newRank}` : `#${item.rank || "-"}`}
-                  </span>
+                <span className="min-w-0 truncate">
+                  <span className="text-slate-300">{item.name || item.code}</span>
+                  <span className="font-mono text-slate-500 ml-1">{item.code}</span>
+                </span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className="font-mono text-slate-300 whitespace-nowrap">{turnoverRankLabel(item)}</span>
                   {title === "新进" && (
-                    <button
-                      onClick={() => void handleIncludeTurnoverStock(item)}
-                      className="px-1.5 py-0.5 bg-cyan-950 hover:bg-cyan-900 text-cyan-300 border border-cyan-500/20 rounded"
-                    >
-                      纳入
-                    </button>
+                    <>
+                      <button
+                        onClick={() => void handleIncludeTurnoverStock(item)}
+                        className="px-2 py-0.5 bg-cyan-600 hover:bg-cyan-500 text-white border border-cyan-400/30 rounded font-semibold transition"
+                      >
+                        纳入
+                      </button>
+                      <button
+                        onClick={() => handleIgnoreTurnoverStock(item)}
+                        className="px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 border border-slate-700 rounded transition"
+                      >
+                        忽略
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
@@ -1249,32 +1986,271 @@ export default function App() {
     );
   };
 
-  const renderPositionSellCard = (position: Position) => {
-    const plan = buildPositionSellPlan(position);
-    const priceClass = position.floatingPnL >= 0 ? "text-rose-400" : "text-emerald-400";
+  const renderTurnoverPreviewRows = (items: TurnoverChangeStock[], kind: "new" | "dropped") => {
+    if (items.length === 0) {
+      return (
+        <div className="rounded border border-dashed border-slate-800 bg-slate-950/30 px-3 py-2 text-[10px] text-slate-600">
+          {kind === "new" ? "暂无新进前30提醒" : "暂无跌出前30提醒"}
+        </div>
+      );
+    }
 
     return (
-      <div key={position.code} className={`border rounded-lg p-4 space-y-3 ${plan.cardClass}`}>
-        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 border-b border-slate-800/40 pb-2.5">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <span className={`h-2.5 w-2.5 rounded-full ${plan.dotClass}`}></span>
-              <span className="font-mono text-xs font-bold text-slate-100">
-                {position.name} ({position.code})
-              </span>
+      <div className="space-y-1.5">
+        {items.slice(0, 3).map(item => (
+          <div key={`${kind}-${item.code}`} className="flex items-center justify-between gap-2 rounded border border-slate-800 bg-slate-950/45 px-2.5 py-2">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-200">
+                <span className="truncate">{item.name || item.code}</span>
+                <span className="font-mono text-[10px] text-slate-500">{item.code}</span>
+              </div>
+              <div className="mt-0.5 flex items-center gap-2 text-[10px] text-slate-500">
+                <span className="font-mono">{turnoverRankLabel(item)}</span>
+                <span>{formatMoneyShort(item.volume)}</span>
+              </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-400 font-mono">
-              <span>{position.buyDate || "买入日期待补"}</span>
-              <span>{holdingTimeLabel(position)}</span>
-              <span>可卖 {position.availableQuantity} 股</span>
+            {kind === "new" ? (
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  onClick={() => void handleIncludeTurnoverStock(item)}
+                  className="inline-flex items-center gap-1 rounded bg-cyan-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-cyan-500 transition"
+                >
+                  <Plus className="h-3 w-3" />
+                  <span>纳入</span>
+                </button>
+                <button
+                  onClick={() => handleIgnoreTurnoverStock(item)}
+                  className="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[10px] font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition"
+                >
+                  <XCircle className="h-3 w-3" />
+                  <span>忽略</span>
+                </button>
+              </div>
+            ) : (
+              <span className="shrink-0 rounded border border-amber-500/20 bg-amber-950/20 px-2 py-1 text-[10px] font-semibold text-amber-300">
+                只提醒
+              </span>
+            )}
+          </div>
+        ))}
+        {items.length > 3 && (
+          <div className="text-[10px] text-slate-600">另有 {items.length - 3} 只，可在下方完整明细处理</div>
+        )}
+      </div>
+    );
+  };
+
+  const renderScreenedStockRows = (
+    stocks: ReviewScreenedStock[],
+    sourceStep: "step1" | "step2" | "step3",
+    sourceTitle: string
+  ) => {
+    if (isScreening) {
+      return (
+        <div className="py-8 text-center space-y-2">
+          <div className="animate-spin rounded-full h-4 w-4 border-2 border-cyan-500 border-t-transparent mx-auto"></div>
+          <CardText className="text-[10px] text-slate-500">正在刷新扫描结果...</CardText>
+        </div>
+      );
+    }
+
+    if (stocks.length === 0) {
+      return (
+        <CardText as="div" className="p-5 text-center text-slate-600 text-[10px] italic bg-slate-950/70 border border-slate-850 rounded">
+          暂无扫描结果，请先刷新当前池或重新运行三步扫描。
+        </CardText>
+      );
+    }
+
+    return (
+      <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
+        {stocks.map(stock => {
+          const alreadyAdded = diagnosedHoldings.some(item => item.code === stock.code);
+          return (
+            <div key={`${sourceStep}-${stock.code}`} className="bg-slate-900/80 p-2.5 rounded border border-slate-850 hover:border-cyan-900/40 transition space-y-2">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] font-bold text-slate-200 font-mono truncate">{stock.name}</span>
+                    <span className="text-[9px] text-slate-500 font-mono">{stock.code}</span>
+                    {stock.rank !== undefined && (
+                      <span className="text-[9px] text-slate-500 font-mono">#{stock.rank}</span>
+                    )}
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-[9px] text-slate-500">
+                    <span>成交 {(stock.volume / 100000000).toFixed(1)}亿</span>
+                    {stock.volRatio !== undefined && <span>量比 {stock.volRatio}</span>}
+                    {stock.limitHeight && <span className="text-amber-400">{stock.limitHeight}</span>}
+                  </div>
+                </div>
+                <span className={`text-[10px] font-mono font-bold shrink-0 ${stock.pct >= 0 ? "text-red-400" : "text-emerald-400"}`}>
+                  {stock.pct >= 0 ? `+${stock.pct.toFixed(2)}%` : `${stock.pct.toFixed(2)}%`}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 border-t border-slate-950 pt-1.5">
+                <span className="text-[9px] text-cyan-400 font-extrabold">
+                  {stock.stars} {stock.confidence ?? "-"}% 信心
+                </span>
+                <button
+                  type="button"
+                  onClick={() => addToSelfDiagnosis(stock, sourceStep, sourceTitle)}
+                  className={`px-2 py-1 rounded text-[9px] font-bold border transition flex items-center gap-1 ${
+                    alreadyAdded
+                      ? "bg-slate-950 text-slate-500 border-slate-800"
+                      : "bg-cyan-950/50 hover:bg-cyan-900/60 text-cyan-300 border-cyan-700/40"
+                  }`}
+                >
+                  <Plus className="h-3 w-3" />
+                  <span>{alreadyAdded ? "已在诊断" : "加入自我诊断"}</span>
+                </button>
+              </div>
+              {stock.reason && <CardText className="text-[9px] text-slate-400 leading-normal">{stock.reason}</CardText>}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const renderScreenStepCard = (
+    stepNo: string,
+    title: string,
+    description: string,
+    reviewed: boolean,
+    onReviewedChange: (value: boolean) => void,
+    stocks: ReviewScreenedStock[],
+    sourceStep: "step1" | "step2" | "step3"
+  ) => (
+    <div className={`p-4 rounded-lg border transition flex flex-col justify-between ${reviewed ? "bg-cyan-950/15 border-cyan-800/40" : "bg-slate-950 border-slate-850"}`}>
+      <div className="space-y-3">
+        <div className="flex items-start justify-between gap-3">
+          <span className="text-[10px] bg-slate-900 text-slate-400 px-2 py-0.5 rounded font-bold font-mono">步骤 {stepNo}</span>
+          <input
+            type="checkbox"
+            checked={reviewed}
+            onChange={(e) => onReviewedChange(e.target.checked)}
+            className="rounded text-cyan-600 focus:ring-0 focus:ring-offset-0 bg-slate-900 border-slate-800 cursor-pointer"
+          />
+        </div>
+        <div>
+          <h4 className="text-xs font-black text-slate-200 mt-1">{title}</h4>
+          <CardText className="text-[11px] text-slate-400 mt-1 leading-relaxed">{description}</CardText>
+        </div>
+        <div className="border-t border-slate-900 pt-3 space-y-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <label className="text-[9px] font-bold text-slate-500 uppercase tracking-wider block">扫描结果</label>
+            <span className="text-[9px] text-slate-500 font-mono">{stocks.length} 只</span>
+          </div>
+          {renderScreenedStockRows(stocks, sourceStep, title)}
+        </div>
+      </div>
+      <div className="mt-4 pt-2 border-t border-slate-900/60 flex items-center justify-between">
+        <span className="text-[10px] text-cyan-400 block font-bold">{reviewed ? "✓ 已确认复查" : "⏳ 待确认"}</span>
+      </div>
+    </div>
+  );
+
+  const renderPositionSellCard = (position: Position, index: number) => {
+    const plan = buildPositionSellPlan(position);
+    const priceClass = position.floatingPnL >= 0 ? "text-rose-400" : "text-emerald-400";
+    const hasMa5 = Number.isFinite(position.ma5) && position.ma5 > 0;
+    const canSellToday = Math.max(0, Math.floor(Number(position.availableQuantity) || 0)) > 0;
+    const tradeLink = position.tradeLink;
+    const stopLossPct = systemicRisk ? 7 : 9;
+    const hardStopLine = position.avgCost > 0 ? position.avgCost * (1 - stopLossPct / 100) : 0;
+    const takeProfitLine = hasMa5 ? position.ma5 * 1.07 : 0;
+    const ma5DistanceText = hasMa5 ? lineDistanceLabel(position.currentPrice, position.ma5, "floor") : "等待MA5";
+    const sellLineRows = [
+      {
+        label: "止盈观察线",
+        formula: "MA5 +7%",
+        value: takeProfitLine,
+        text: hasMa5 ? lineDistanceLabel(position.currentPrice, takeProfitLine, "target") : "等待MA5",
+        active: plan.triggerKey === "take-profit",
+        activeClass: "border-amber-700/70 bg-amber-950/20",
+        labelClass: "text-amber-300"
+      },
+      {
+        label: "5日线风控线",
+        formula: "MA5",
+        value: hasMa5 ? position.ma5 : 0,
+        text: ma5DistanceText,
+        active: plan.triggerKey === "ma5-risk" || plan.triggerKey === "clear",
+        activeClass: "border-rose-700/70 bg-rose-950/20",
+        labelClass: "text-rose-300"
+      },
+      {
+        label: "成本硬止损线",
+        formula: systemicRisk ? "成本 -7%" : "成本 -9%",
+        value: hardStopLine,
+        text: hardStopLine > 0 ? lineDistanceLabel(position.currentPrice, hardStopLine, "floor") : "等待成本",
+        active: hardStopLine > 0 && position.currentPrice <= hardStopLine,
+        activeClass: "border-red-700/70 bg-red-950/20",
+        labelClass: "text-red-300"
+      }
+    ];
+    const sellLayers = [
+      {
+        key: "next-day",
+        label: "1. 次日强弱",
+        title: "10点前不强就走",
+        text: plan.nextMorningRule,
+        active: plan.triggerKey === "next-day",
+        className: "border-cyan-800/50 bg-cyan-950/10 text-cyan-200"
+      },
+      {
+        key: "take-profit",
+        label: "2. 止盈",
+        title: "远离5日线锁利润",
+        text: plan.takeProfitRule,
+        active: plan.triggerKey === "take-profit",
+        className: "border-amber-800/50 bg-amber-950/10 text-amber-200"
+      },
+      {
+        key: "risk",
+        label: "3. 止损",
+        title: "跌破5日线控风险",
+        text: plan.ma5RiskRule,
+        active: plan.triggerKey === "ma5-risk" || plan.triggerKey === "clear",
+        className: "border-rose-800/50 bg-rose-950/10 text-rose-200"
+      }
+    ];
+
+    return (
+      <div key={position.code} className={`border rounded-lg p-4 space-y-4 ${plan.cardClass}`}>
+        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 border-b border-slate-800/40 pb-2.5">
+          <div className="flex items-start gap-3">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-slate-700 bg-slate-950/50 text-[10px] font-black text-slate-300">
+              {index + 1}
+            </span>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <span className={`h-2.5 w-2.5 rounded-full ${plan.dotClass}`}></span>
+                <span className="font-mono text-xs font-bold text-slate-100">
+                  {position.name} ({position.code})
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-400 font-mono">
+                <span>{position.buyDate || "买入日期待补"}</span>
+                <span>{holdingTimeLabel(position)}</span>
+                <span>可卖 {position.availableQuantity} 股</span>
+              </div>
             </div>
           </div>
-          <span className={`text-[10px] font-extrabold tracking-widest px-2.5 py-1 rounded ${plan.badgeClass}`}>
-            {plan.statusLabel}
-          </span>
+          <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+            <span className="text-[10px] font-mono text-slate-500">按卖点优先级排序</span>
+            <span className={`text-[10px] font-extrabold tracking-widest px-2.5 py-1 rounded ${plan.badgeClass}`}>
+              {plan.statusLabel}
+            </span>
+          </div>
         </div>
 
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 text-center text-[10px] font-mono">
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-2 text-center text-[10px] font-mono">
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
+            <span className="text-slate-500 block mb-0.5">持仓天数</span>
+            <span className="font-bold text-slate-100">{holdingTimeLabel(position)}</span>
+          </div>
           <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
             <span className="text-slate-500 block mb-0.5">当前持股</span>
             <span className="font-bold text-slate-100">{position.quantity} 股</span>
@@ -1290,10 +2266,10 @@ export default function App() {
           <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2">
             <span className="text-slate-500 block mb-0.5">MA5 / 偏离</span>
             <span className={`font-bold ${position.deviation5 < 0 ? "text-emerald-400" : "text-rose-400"}`}>
-              ¥{position.ma5.toFixed(2)} / {signedPercent(position.deviation5)}
+              {hasMa5 ? `${formatPrice(position.ma5)} / ${signedPercent(position.deviation5)}` : "待补K线"}
             </span>
           </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2 col-span-2 lg:col-span-1">
+          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2 col-span-2 md:col-span-1">
             <span className="text-slate-500 block mb-0.5">浮动盈亏</span>
             <span className={`font-bold ${priceClass}`}>
               {position.floatingPnL >= 0 ? "+" : ""}{position.floatingPnL.toFixed(2)} ({signedPercent(position.floatingPnLPct)})
@@ -1301,38 +2277,99 @@ export default function App() {
           </div>
         </div>
 
-        <div className="bg-slate-950/30 border border-slate-800/40 rounded p-3 space-y-1.5">
+        {tradeLink && (
+          <div className="rounded border border-slate-800/50 bg-slate-950/25 p-3 space-y-2">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">交易联动</span>
+              <span className={`w-fit text-[10px] font-bold px-2 py-0.5 rounded ${
+                tradeLink.hasComplianceIssue ? "bg-amber-950 text-amber-300" : "bg-emerald-950 text-emerald-300"
+              }`}>
+                {tradeLink.hasComplianceIssue ? "有审计标签" : "流水合规"}
+              </span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[10px] text-slate-400">
+              <CardText as="span">最近买入：{tradeLink.lastBuy ? `${tradeLink.lastBuy.date || ""} ${formatPrice(Number(tradeLink.lastBuy.price) || 0)}` : "无"}</CardText>
+              <CardText as="span">最近卖出：{tradeLink.lastSell ? `${tradeLink.lastSell.date || ""} ${formatPrice(Number(tradeLink.lastSell.price) || 0)}` : "无"}</CardText>
+              <CardText as="span">今日流水：{tradeLink.todayTrades?.length || 0} 笔</CardText>
+            </div>
+            {Boolean(tradeLink.complianceTags?.length) && (
+              <div className="flex flex-wrap gap-1">
+                {tradeLink.complianceTags?.map(tag => (
+                  <span key={tag} className="text-[9px] bg-rose-950/40 text-rose-300 px-1.5 py-0.5 rounded">
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="bg-slate-950/35 border border-slate-800/50 rounded p-3 space-y-2">
           <div className="flex items-center justify-between gap-3">
-            <span className="text-xs font-extrabold text-slate-100">{plan.title}</span>
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">自动卖点判定</span>
             <span className="text-[10px] text-slate-500 font-mono shrink-0">
               跌破MA5 {Math.max(0, Math.floor(Number(position.belowMa5Days) || 0))} 天
             </span>
           </div>
-          <p className="text-xs leading-relaxed text-slate-300">{plan.primaryAction}</p>
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <h4 className="text-sm font-extrabold text-slate-100">{plan.title}</h4>
+            <span className={`w-fit text-[10px] font-bold px-2 py-0.5 rounded ${plan.badgeClass}`}>{plan.statusLabel}</span>
+          </div>
+          <CardText className="text-xs leading-relaxed text-slate-300">{plan.primaryAction}</CardText>
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">止盈 / 止损线</span>
+            <span className="text-[10px] text-slate-500 font-mono">
+              当前价 {formatPrice(position.currentPrice)} · 硬止损{systemicRisk ? "已按系统风险收紧" : "按常规水位"}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            {sellLineRows.map(line => (
+              <div
+                key={line.label}
+                className={`rounded border p-3 ${line.active ? line.activeClass : "border-slate-800/50 bg-slate-950/30"}`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className={`text-[11px] font-bold ${line.labelClass}`}>{line.label}</span>
+                  <span className="text-[10px] text-slate-500 font-mono">{line.formula}</span>
+                </div>
+                <div className="mt-1 flex items-end justify-between gap-2">
+                  <span className="text-sm font-black font-mono text-slate-100">{formatPrice(line.value)}</span>
+                  <span className="text-[10px] font-mono text-slate-400 text-right">{line.text}</span>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 text-[11px] leading-relaxed">
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2.5">
-            <span className="text-cyan-300 font-bold block mb-1">1. 次日不强就走</span>
-            <span className="text-slate-400">{plan.nextMorningRule}</span>
-          </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2.5">
-            <span className="text-amber-300 font-bold block mb-1">2. 远离5日线止盈</span>
-            <span className="text-slate-400">{plan.takeProfitRule}</span>
-          </div>
-          <div className="bg-slate-950/35 rounded border border-slate-800/40 p-2.5">
-            <span className="text-rose-300 font-bold block mb-1">3. 跌破5日线风控</span>
-            <span className="text-slate-400">{plan.ma5RiskRule}</span>
-          </div>
+          {sellLayers.map(layer => (
+            <div
+              key={layer.key}
+              className={`rounded border p-2.5 ${layer.active ? layer.className : "bg-slate-950/25 border-slate-800/40 text-slate-400"}`}
+            >
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <span className="font-bold">{layer.label}</span>
+                {layer.active && <span className="text-[9px] font-black uppercase tracking-wider">当前触发</span>}
+              </div>
+              <span className="font-bold block text-slate-200 mb-1">{layer.title}</span>
+              <CardText as="span" className={layer.active ? "text-slate-200" : "text-slate-400"}>{layer.text}</CardText>
+            </div>
+          ))}
         </div>
 
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-t border-slate-800/40 pt-2.5">
-          <span className="text-[10px] text-slate-500">
+          <CardText as="span" className="text-[10px] text-slate-500">
             系统提醒：{position.advice || plan.sizingRule}
-          </span>
+          </CardText>
           <button
             onClick={() => openSellModal(position)}
-            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded transition shadow shrink-0"
+            disabled={!canSellToday}
+            className={`px-3 py-1.5 text-white font-bold text-xs rounded transition shadow shrink-0 ${
+              canSellToday ? "bg-emerald-600 hover:bg-emerald-500" : "bg-slate-800 text-slate-500 cursor-not-allowed"
+            }`}
           >
             {plan.buttonLabel}
           </button>
@@ -1341,18 +2378,31 @@ export default function App() {
     );
   };
 
+  const handleQuickBuyEntry = () => {
+    setActiveTab("watchlist");
+    setWatchlistGroup("待买");
+    const firstBuyReady = stocksForGroup(watchlist, "待买")[0];
+    if (firstBuyReady) setSelectedStock(firstBuyReady);
+    logAction("💡 已切到待买列表；请选中股票，并在右侧详情卡进行盘中手动确认");
+  };
+
+  const handleQuickSellEntry = () => {
+    setActiveTab("intraday");
+    logAction("💡 已切到盘中持仓监控；请在持仓卡片中点击「记录卖出」归档");
+  };
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col font-sans selection:bg-blue-500/20 selection:text-blue-200">
+    <div className="h-screen overflow-hidden bg-slate-950 text-slate-200 flex flex-col font-sans selection:bg-blue-500/20 selection:text-blue-200">
       
       {/* 顶部系统状态 Bar */}
-      <header className="bg-slate-900 border-b border-slate-800 py-3 px-4 flex flex-wrap items-center justify-between sticky top-0 z-40 shadow-sm text-white gap-3">
+      <header className="shrink-0 bg-slate-900 border-b border-slate-800 py-3 px-4 flex flex-wrap items-center justify-between sticky top-0 z-40 shadow-sm text-white gap-3">
         <div className="flex items-center space-x-3">
           <div className="bg-gradient-to-tr from-blue-600 to-indigo-500 p-1.5 rounded-lg shadow-inner">
             <ShieldAlert className="h-5 w-5 text-white" />
           </div>
           <div>
             <h1 className="text-sm font-bold tracking-tight text-white">强势回踩短线交易纪律系统</h1>
-            <p className="text-[10px] text-slate-400">主板前排股票 5日线低吸回踩纪律工作台</p>
+            <CardText className="text-[10px] text-slate-400">主板前排股票 5日线低吸回踩纪律工作台</CardText>
           </div>
         </div>
 
@@ -1402,8 +2452,8 @@ export default function App() {
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
             <span className="text-slate-400 text-[10px]">当日盈亏:</span>
-            <span className={`font-bold text-[12px] ${accountState.todayPnL !== undefined && accountState.todayPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-              {accountState.todayPnL !== undefined && accountState.todayPnL >= 0 ? "+" : ""}{accountState.todayPnL !== undefined ? accountState.todayPnL.toLocaleString(undefined, { minimumFractionDigits: 2 }) : "0.00"}
+            <span className={`font-bold text-[12px] ${todayTotalPnLForAccount >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
+              {signedCurrency(todayTotalPnLForAccount)}
             </span>
           </div>
           <div className="flex items-center space-x-1.5 last:border-0">
@@ -1427,10 +2477,10 @@ export default function App() {
       </header>
 
       {/* 核心工作区分割 */}
-      <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
+      <div className="flex-1 min-h-0 flex flex-col md:flex-row overflow-hidden">
         
         {/* 左侧菜单导航 */}
-        <nav className="w-full md:w-56 bg-slate-900 border-b md:border-b-0 md:border-r border-slate-800 p-3 flex flex-row md:flex-col justify-around md:justify-start space-y-0 md:space-y-1.5 shrink-0 overflow-x-auto">
+        <nav className="w-full md:w-56 min-h-0 bg-slate-900 border-b md:border-b-0 md:border-r border-slate-800 p-3 flex flex-row md:flex-col justify-around md:justify-start space-y-0 md:space-y-1.5 shrink-0 overflow-x-auto md:overflow-x-hidden md:overflow-y-hidden">
           <div className="hidden md:block px-3 py-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider">纪律罗盘</div>
           
           <button
@@ -1497,7 +2547,7 @@ export default function App() {
         </nav>
 
         {/* 右侧主视口 */}
-        <main className="flex-1 bg-slate-950 p-4 md:p-6 overflow-y-auto">
+        <main className="flex-1 min-h-0 min-w-0 bg-slate-950 p-4 md:p-6 overflow-y-auto overscroll-contain">
           {loading && (
             <div className="fixed top-12 right-6 bg-blue-600 border border-blue-500 text-white text-[10px] font-mono py-1 px-3.5 rounded shadow-lg flex items-center space-x-2 animate-bounce z-50">
               <span className="inline-block h-1.5 w-1.5 rounded-full bg-white animate-ping"></span>
@@ -1510,46 +2560,68 @@ export default function App() {
             <div className="space-y-6">
               
               {/* 热力引导语 */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between shadow-sm space-y-3 md:space-y-0">
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm grid grid-cols-1 lg:grid-cols-[1fr_auto] gap-4 items-center">
                 <div className="space-y-1">
                   <div className="flex items-center space-x-2">
                     <Sparkles className="h-4 w-4 text-amber-400 fill-amber-400" />
                     <h3 className="text-sm font-semibold text-slate-200">欢迎使用强势回踩短线交易纪律系统</h3>
                   </div>
-                  <p className="text-xs text-slate-400">本系统围绕<b>沪深主板前排股5日均线（0%~2%）回踩低吸</b>交易纪律，约束盘前选股，强化交易存证，阻断乱买冲动。</p>
+                  <CardText className="text-xs text-slate-400">本系统围绕<b>沪深主板前排股5日均线（0%~2%）回踩低吸</b>交易纪律，约束盘前选股，强化交易存证，阻断乱买冲动。</CardText>
                 </div>
-                <div className="flex items-center space-x-2">
-                  <button
-                    onClick={handleGenerateStockPool}
-                    className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-semibold shadow-sm flex items-center space-x-1.5 transition"
-                  >
-                    <Briefcase className="h-3.5 w-3.5" />
-                    <span>生成今日初筛池</span>
-                  </button>
-                  <button
-                    onClick={() => void handleRefreshQuotes("manual")}
-                    disabled={quoteRefreshing}
-                    className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center space-x-1.5 transition"
-                  >
-                    <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
-                    <span>{quoteRefreshing ? "刷新中..." : "盘中轻量刷新"}</span>
-                  </button>
+                <div className="w-full lg:w-[420px] rounded-lg border border-slate-800 bg-slate-950/45 px-3 py-3">
+                  <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase text-cyan-300">
+                        <Briefcase className="h-3.5 w-3.5 shrink-0" />
+                        <span>盘前第一步</span>
+                      </div>
+                      <CardText className="text-[11px] text-slate-400 leading-normal">
+                        {hasTodayPool
+                          ? `今日初筛池 ${initialPoolCount} 只，${poolMeta?.isPoolLocked ? "已锁池" : "未锁池"}`
+                          : initialPoolCount > 0
+                            ? "当前池不是今日批次，开盘前先重建今日名单"
+                            : "先拉取主板成交额前30，锁定今日基础名单"}
+                      </CardText>
+                    </div>
+                    {hasTodayPool ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveTab("watchlist");
+                          setWatchlistGroup("初筛");
+                        }}
+                        className="shrink-0 px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
+                      >
+                        <Briefcase className="h-3.5 w-3.5" />
+                        <span>查看股票池</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={handleRebuildStockPool}
+                        disabled={loading}
+                        className="shrink-0 px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
+                      >
+                        <Briefcase className="h-3.5 w-3.5" />
+                        <span>{loading ? "构建中..." : "构建今日初筛池"}</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
 
               {/* 🚦 股市状态联动交易纪律指南 */}
               {(() => {
-                const instr = getMarketLinkedInstructions();
+                const instr = marketInstructions;
                 return (
                   <div className={`border p-4 rounded-xl shadow-sm ${instr.bg} space-y-3`}>
                     <div className="flex items-center justify-between">
                       <div className="flex items-center space-x-2">
                         <span className="flex h-2.5 w-2.5 relative">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
                           <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-cyan-500"></span>
                         </span>
                         <h4 className="text-xs font-bold uppercase tracking-wider">
-                          🚦 {instr.phase}
+                          {instr.phase}
                         </h4>
                       </div>
                       <span className="text-[10px] bg-slate-950/10 px-2.5 py-0.5 rounded-full font-bold">
@@ -1557,10 +2629,10 @@ export default function App() {
                       </span>
                     </div>
                     <div className="space-y-1.5">
-                      <h5 className="text-xs font-bold">按照纪律规则，当前您应当执行以下操作：</h5>
+                      <h5 className="text-xs font-bold">全局时间提醒</h5>
                       <div className="text-xs space-y-1 pl-1 leading-relaxed">
                         {instr.guidelines.map((g, idx) => (
-                          <p key={idx} className="font-medium">{g}</p>
+                          <CardText key={idx} className="font-medium">{g}</CardText>
                         ))}
                       </div>
                     </div>
@@ -1576,7 +2648,7 @@ export default function App() {
                     <span className="text-2xl font-bold text-slate-100">{stocksForGroup(watchlist, "初筛").length}</span>
                     <span className="text-[10px] text-slate-400 font-medium">基础候选</span>
                   </div>
-                  <p className="text-[10px] text-slate-500 mt-2">成交额前30，已排除ST/创业/科创/北交等</p>
+                  <CardText className="text-[10px] text-slate-500 mt-2">成交额前30，已排除ST/创业/科创/北交等</CardText>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm">
                   <span className="text-[10px] text-slate-400 font-bold uppercase block tracking-wider">观察</span>
@@ -1584,7 +2656,7 @@ export default function App() {
                     <span className="text-2xl font-bold text-slate-100">{stocksForGroup(watchlist, "观察").length}</span>
                     <span className="text-[10px] text-slate-400 font-medium">等待回踩</span>
                   </div>
-                  <p className="text-[10px] text-slate-500 mt-2">含待买观察、继续观察、偏高不追、远离不追</p>
+                  <CardText className="text-[10px] text-slate-500 mt-2">含待买观察、继续观察、偏高不追、远离不追</CardText>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm border-l-cyan-500 border-l-4">
                   <span className="text-[10px] text-cyan-400 font-bold uppercase block tracking-wider">待买观察</span>
@@ -1592,73 +2664,7 @@ export default function App() {
                     <span className="text-2xl font-bold text-cyan-400">{buyReadyStocks.length}</span>
                     <span className="text-[10px] text-cyan-500 font-medium">重点盯</span>
                   </div>
-                  <p className="text-[10px] text-slate-500 mt-2">大阳启动后回踩MA5 0%~2%，未跌破</p>
-                </div>
-              </div>
-
-              {/* 今日账户资产与资金动态监控 (同花顺风格) */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg space-y-4">
-                <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
-                  <div className="flex items-center space-x-2">
-                    <TrendingUp className="h-4 w-4 text-cyan-400" />
-                    <h3 className="text-xs font-extrabold text-slate-200 uppercase tracking-wider">
-                      今日持仓资产与资金动态监控
-                    </h3>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <span className="text-[10px] text-slate-400">初始总本金:</span>
-                    <span className="text-xs font-mono font-bold text-slate-200">
-                      ¥{accountState.initialCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                    </span>
-                    <button
-                      onClick={handleResetCash}
-                      className="text-[10px] text-cyan-400 hover:text-cyan-300 border border-cyan-500/20 px-2 py-0.5 rounded bg-cyan-950/40 hover:bg-cyan-950/70 ml-2 transition"
-                    >
-                      修改本金
-                    </button>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                  <div className="bg-slate-950/60 p-3 rounded-lg border border-slate-850/60">
-                    <span className="text-[10px] text-slate-400 block mb-1">今日账户总资产</span>
-                    <span className="text-sm font-mono font-extrabold text-slate-100 block">
-                      ¥{accountState.totalAssets.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                    </span>
-                  </div>
-                  <div className="bg-slate-950/60 p-3 rounded-lg border border-slate-850/60">
-                    <span className="text-[10px] text-slate-400 block mb-1">可用现金余额</span>
-                    <span className="text-sm font-mono font-extrabold text-slate-100 block">
-                      ¥{accountState.availableCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                    </span>
-                  </div>
-                  <div className="bg-slate-950/60 p-3 rounded-lg border border-slate-850/60">
-                    <span className="text-[10px] text-slate-400 block mb-1">当前持仓市值</span>
-                    <span className="text-sm font-mono font-extrabold text-amber-500 block">
-                      ¥{accountState.holdingValue.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                    </span>
-                  </div>
-                  <div className="bg-slate-950/60 p-3 rounded-lg border border-slate-850/60">
-                    <span className="text-[10px] text-slate-400 block mb-1">当日浮动盈亏</span>
-                    <span className={`text-sm font-mono font-extrabold block ${accountState.todayPnL !== undefined && accountState.todayPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-                      {accountState.todayPnL !== undefined && accountState.todayPnL >= 0 ? "+" : ""}{accountState.todayPnL !== undefined ? accountState.todayPnL.toLocaleString(undefined, { minimumFractionDigits: 2 }) : "0.00"}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between text-[11px] text-slate-400 bg-slate-950/40 p-2.5 rounded-md border border-slate-800/40">
-                  <div>
-                    <span>累计实现盈亏: </span>
-                    <span className={`font-mono font-bold ${accountState.totalPnL >= 0 ? "text-rose-400" : "text-emerald-400"}`}>
-                      {accountState.totalPnL >= 0 ? "+" : ""}{accountState.totalPnL.toLocaleString(undefined, { minimumFractionDigits: 2 })} 元
-                    </span>
-                  </div>
-                  <div>
-                    <span>账户总收益率: </span>
-                    <span className={`font-mono font-bold ${accountState.totalPnL >= 0 ? "text-rose-400" : "text-emerald-400"}`}>
-                      {accountState.totalPnL >= 0 ? "+" : ""}{accountState.totalReturnPct.toFixed(2)}%
-                    </span>
-                  </div>
+                  <CardText className="text-[10px] text-slate-500 mt-2">大阳启动后回踩MA5 0%~2%，未跌破</CardText>
                 </div>
               </div>
 
@@ -1672,15 +2678,43 @@ export default function App() {
                 </div>
 
                 {positions.length === 0 ? (
-                  <div className="bg-slate-900/40 border border-slate-800 rounded-lg p-4 text-center text-xs text-slate-500 italic">
+                  <CardText as="div" className="bg-slate-900/40 border border-slate-800 rounded-lg p-4 text-center text-xs text-slate-500 italic">
                     当前账户暂无持仓。买入流水录入后，这里会按次日强度、远离MA5止盈、跌破MA5风控三层规则生成卖点计划。
-                  </div>
+                  </CardText>
                 ) : (
                   <div className="grid grid-cols-1 gap-4">
-                    {positions.map(p => renderPositionSellCard(p))}
+                    {sortedPositions.map((p, idx) => renderPositionSellCard(p, idx))}
                   </div>
                 )}
               </div>
+
+              {isPortfolioRiskWindow && positions.length > 0 && (
+                <div className="border p-4 rounded-xl shadow-sm bg-rose-950/40 border-rose-900 text-rose-100 animate-pulse space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                    <div className="flex items-center space-x-2">
+                      <span className="relative flex h-2.5 w-2.5">
+                        <span className="absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75 animate-ping"></span>
+                        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-rose-500"></span>
+                      </span>
+                      <h4 className="text-xs font-black uppercase tracking-wider">尾盘持仓风险卡</h4>
+                    </div>
+                    <span className="w-fit rounded bg-rose-950 border border-rose-700/60 px-2.5 py-0.5 text-[10px] font-black text-rose-200">
+                      清仓/风控 {urgentPositionCount} 只
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] leading-relaxed">
+                    <CardText as="div" className="rounded border border-rose-800/50 bg-slate-950/30 p-2.5 text-rose-100">
+                      先处理上方持仓卡里标记为“清仓点”和“风控点”的股票。
+                    </CardText>
+                    <CardText as="div" className="rounded border border-rose-800/50 bg-slate-950/30 p-2.5 text-rose-100">
+                      14:50 仍跌破 MA5：100股按全卖或继续持有二选一，200股以上优先减仓。
+                    </CardText>
+                    <CardText as="div" className="rounded border border-rose-800/50 bg-slate-950/30 p-2.5 text-rose-100">
+                      连续3天站不回 MA5 的票，不再延迟判断，按纪律清仓。
+                    </CardText>
+                  </div>
+                </div>
+              )}
 
               {/* ACTIVE PLAYBOOK | 强势回踩交易铁律控制台 */}
               <div className="space-y-4">
@@ -1692,7 +2726,7 @@ export default function App() {
                         <span>主板成交额前排强势股的 5 日线回踩低吸模式</span>
                       </h3>
                     </div>
-                    <p className="text-[11px] text-slate-400 font-medium">只在强势确认后等待 MA5 附近回踩；进入待买也必须经过资金、时间和风控校验。</p>
+                    <CardText className="text-[11px] text-slate-400 font-medium">只在强势确认后等待 MA5 附近回踩；进入待买也必须经过资金、时间和风控校验。</CardText>
                   </div>
 
                   {/* 6格铁律矩阵 */}
@@ -1705,9 +2739,9 @@ export default function App() {
                       </div>
                       <div className="space-y-1">
                         <h4 className="text-xs font-extrabold text-slate-200">沪深主板 A 股</h4>
-                        <p className="text-[11px] text-slate-400 leading-normal">
+                        <CardText className="text-[11px] text-slate-400 leading-normal">
                           代码以 600/601/603/605/000/001/002 开头。<b>排除 ST、创业板、科创板、北交所及京东方A等笨重股</b>，坚决只做主板前排最强流动性大阳股！
-                        </p>
+                        </CardText>
                       </div>
                     </div>
 
@@ -1719,9 +2753,9 @@ export default function App() {
                       </div>
                       <div className="space-y-1">
                         <h4 className="text-xs font-extrabold text-slate-200">近 10-20 日有 ≥5% 阳线</h4>
-                        <p className="text-[11px] text-slate-400 leading-normal">
+                        <CardText className="text-[11px] text-slate-400 leading-normal">
                           近 20 个交易日内必须出现过单日涨幅大于或等于 <b>5%</b>、且收盘高于开盘的阳线，证明已有强势启动信号。
-                        </p>
+                        </CardText>
                       </div>
                     </div>
 
@@ -1733,9 +2767,9 @@ export default function App() {
                       </div>
                       <div className="space-y-1">
                         <h4 className="text-xs font-extrabold text-slate-200">距 MA5 0% ~ 2% 黄金低吸金区</h4>
-                        <p className="text-[11px] text-slate-400 leading-normal">
+                        <CardText className="text-[11px] text-slate-400 leading-normal">
                           股价调整回踩至 <b>0%~2%</b> 为待买观察；<b>2%~5%</b> 继续观察；<b>5%~7%</b> 偏高不追；<b>&gt;7%</b> 远离不追；<b>&lt;0%</b> 跌破MA5，不进入待买。
-                        </p>
+                        </CardText>
                       </div>
                     </div>
 
@@ -1747,9 +2781,9 @@ export default function App() {
                       </div>
                       <div className="space-y-1">
                         <h4 className="text-xs font-extrabold text-slate-200">9:35-10:00 / 14:30-14:55</h4>
-                        <p className="text-[11px] text-slate-400 leading-normal">
+                        <CardText className="text-[11px] text-slate-400 leading-normal">
                           早盘 9:35 确认高位承接且不破 MA5 收回；尾盘 14:30-14:55 确认支撑彻底稳固。<b>严禁 9:30 抢开盘、午盘中段或临期最后几分钟无计划追高。</b>
-                        </p>
+                        </CardText>
                       </div>
                     </div>
 
@@ -1761,9 +2795,9 @@ export default function App() {
                       </div>
                       <div className="space-y-1">
                         <h4 className="text-xs font-extrabold text-slate-200">可用资金: ¥{accountState.availableCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</h4>
-                        <p className="text-[11px] text-slate-400 leading-normal">
+                        <CardText className="text-[11px] text-slate-400 leading-normal">
                           单只标的最少买 1 手（100股）。现金不足 1 手时坚决克制手痒不买，任何时候<b>绝不私用未授权高杠杆</b>，记录交易时严格检验账面现金。
-                        </p>
+                        </CardText>
                       </div>
                     </div>
 
@@ -1775,9 +2809,9 @@ export default function App() {
                       </div>
                       <div className="space-y-1">
                         <h4 className="text-xs font-extrabold text-slate-200">5 日线管理仓位 (若大盘风险收紧止损位)</h4>
-                        <p className="text-[11px] text-slate-400 leading-normal">
+                        <CardText className="text-[11px] text-slate-400 leading-normal">
                           次日 10:00 前不强就走（无溢价冲高无力）；远离 MA5 止盈；14:50 跌破看减仓/直接清仓；3日不收回强制淘汰。<b>若大盘见顶或大阴系统性风险，单股止损位由 9~10% 严格上调收紧到 7~8% 铁律！</b>
-                        </p>
+                        </CardText>
                       </div>
                     </div>
                   </div>
@@ -1790,25 +2824,17 @@ export default function App() {
                       <Plus className="h-3.5 w-3.5 text-cyan-400" />
                       <span>短线实盘交易补录控制台</span>
                     </h4>
-                    <p className="text-[10px] text-slate-400 leading-normal">在实盘/模拟盘中成交后，请在此记入，系统自动同步审计，并在「交易记录审计」生成违规证据归档。</p>
+                    <CardText className="text-[10px] text-slate-400 leading-normal">在实盘/模拟盘中成交后，请在此记入，系统自动同步审计，并在「交易记录审计」生成违规证据归档。</CardText>
                   </div>
                   <div className="flex items-center space-x-3 w-full md:w-auto shrink-0">
                     <button
-                      onClick={() => {
-                        setActiveTab("watchlist");
-                        setWatchlistGroup("待买");
-                        logAction("💡 请在待买列表中选中股票，并在右侧详情卡进行盘中手动确认");
-                      }}
+                      onClick={handleQuickBuyEntry}
                       className="flex-1 md:flex-initial px-5 py-2.5 bg-rose-950/50 hover:bg-rose-900/50 border border-rose-900/60 rounded-lg font-bold text-xs text-rose-300 transition duration-150 text-center active:scale-95 cursor-pointer"
                     >
                       💡 记录实盘买入
                     </button>
                     <button
-                      onClick={() => {
-                        setActiveTab("watchlist");
-                        setWatchlistGroup("持仓");
-                        logAction("💡 请在持仓列表中选中对应股，点击「确认卖出」归档");
-                      }}
+                      onClick={handleQuickSellEntry}
                       className="flex-1 md:flex-initial px-5 py-2.5 bg-emerald-950/50 hover:bg-emerald-900/50 border border-emerald-900/60 rounded-lg font-bold text-xs text-emerald-300 transition duration-150 text-center active:scale-95 cursor-pointer"
                     >
                       💡 记录实盘卖出
@@ -1823,55 +2849,233 @@ export default function App() {
           {activeTab === "watchlist" && (
             <div className="space-y-4">
               
-              {/* 同花顺导入/股票池操作行 */}
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-3 rounded-lg">
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    onClick={handleGenerateStockPool}
-                    className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded text-xs font-semibold transition"
-                  >
-                    生成今日初筛池
-                  </button>
-                  <button
-                    onClick={() => void handleRefreshQuotes("manual")}
-                    disabled={quoteRefreshing}
-                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:bg-slate-800 disabled:text-slate-500 text-slate-300 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition"
-                  >
-                    <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
-                    <span>刷新当前池行情</span>
-                  </button>
-                  <button
-                    onClick={handleScanTurnoverChanges}
-                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition"
-                  >
-                    <AlertCircle className="h-3.5 w-3.5 text-amber-300" />
-                    <span>扫描新进前30</span>
-                  </button>
-                  <button
-                    onClick={() => handleFetchHistory(undefined, true)}
-                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs font-semibold transition"
-                  >
-                    一键补充所有K线
-                  </button>
-                  <button
-                    onClick={() => setShowImportPanel(!showImportPanel)}
-                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition"
-                  >
-                    <FileSpreadsheet className="h-3.5 w-3.5" />
-                    <span>上传同花顺初筛池</span>
-                  </button>
+              {/* 今日锁池与行情同步中心 */}
+              <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm space-y-4">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 border-b border-slate-800 pb-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <ShieldAlert className="h-4 w-4 text-cyan-400" />
+                      <h3 className="text-sm font-bold text-slate-100">今日锁池与行情同步中心</h3>
+                    </div>
+                    <CardText className="text-[11px] text-slate-400 leading-normal">
+                      自动刷新会重算观察/待买分组但不改名单；扫描异动只提醒新进/跌出；重建初筛才会覆盖今日股票名单。
+                    </CardText>
+                  </div>
+
+                  <div className="relative w-full md:w-80">
+                    <Search className="h-3.5 w-3.5 text-slate-500 absolute left-3 top-2.5" />
+                    <input
+                      type="text"
+                      placeholder="输入代码或名称搜索..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="w-full pl-8 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded text-xs focus:outline-none focus:border-cyan-500 font-mono text-slate-200"
+                    />
+                  </div>
                 </div>
 
-                <div className="relative">
-                  <Search className="h-3.5 w-3.5 text-slate-500 absolute left-3 top-2.5" />
-                  <input
-                    type="text"
-                    placeholder="输入代码或名称搜索..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    className="w-full sm:w-60 pl-8 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded text-xs focus:outline-none focus:border-cyan-500 font-mono text-slate-200"
-                  />
+                <div className="rounded-lg border border-slate-800 bg-slate-950/35 p-3">
+                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-x-4 gap-y-3 text-[10px]">
+                    <div>
+                      <span className="text-slate-600 block">今日初筛池</span>
+                      <span className={`font-bold ${poolMeta?.isPoolLocked ? "text-cyan-300" : "text-slate-300"}`}>
+                        {poolMeta?.isPoolLocked ? "已锁池" : "未锁池"}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">批次</span>
+                      <span className="text-slate-300 font-mono break-all">{poolGeneratedLabel}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">来源</span>
+                      <span className="text-slate-300">{poolMeta?.poolSource || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">池内股票</span>
+                      <span className="text-slate-300 font-mono">{initialPoolCount} 只</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">观察 / 待买</span>
+                      <span className="text-slate-300 font-mono">{observationCount} / {pendingBuyCount}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-600 block">上次行情刷新</span>
+                      <span className="text-slate-300 font-mono">{lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : latestWatchlistUpdateLabel}</span>
+                    </div>
+                  </div>
                 </div>
+
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 items-stretch">
+                  <div className="border border-slate-800 bg-slate-950/35 rounded-lg p-3 h-full flex flex-col gap-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2 text-xs font-bold text-cyan-300">
+                          <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
+                          <span>安全刷新</span>
+                        </div>
+                        <CardText className="text-[10px] text-slate-400 leading-normal">
+                          只更新池内股票现价、成交额、MA5偏离率，并重算观察/待买分组；不改变初筛池名单。
+                        </CardText>
+                      </div>
+                      <span className="text-[10px] font-mono text-cyan-300 bg-cyan-950/60 border border-cyan-500/20 rounded px-2 py-0.5 whitespace-nowrap">
+                        {autoQuoteRefreshEnabled ? (quoteRefreshing ? "刷新中" : `${quoteRefreshCountdown}s`) : "已关闭"}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-[10px] font-mono">
+                      <div className="rounded border border-cyan-500/20 bg-cyan-950/10 px-2 py-1.5 text-slate-400">更新 <span className="text-cyan-300">行情</span></div>
+                      <div className="rounded border border-cyan-500/20 bg-cyan-950/10 px-2 py-1.5 text-slate-400">重算 <span className="text-cyan-300">分组</span></div>
+                      <div className="rounded border border-slate-700 bg-slate-950/50 px-2 py-1.5 text-slate-400">名单 <span className="text-slate-300">不变</span></div>
+                    </div>
+                    <div className="mt-auto grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-2">
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={autoQuoteRefreshEnabled}
+                        onClick={() => setAutoQuoteRefreshEnabled(prev => !prev)}
+                        className={`px-3.5 py-1.5 rounded border text-xs font-semibold flex items-center justify-between gap-3 transition ${
+                          autoQuoteRefreshEnabled
+                            ? "bg-cyan-600/20 border-cyan-500/40 text-cyan-200"
+                            : "bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200"
+                        }`}
+                      >
+                        <span>自动刷新当前池行情 30秒</span>
+                        <span className={`h-4 w-7 rounded-full p-0.5 transition ${autoQuoteRefreshEnabled ? "bg-cyan-500" : "bg-slate-700"}`}>
+                          <span className={`block h-3 w-3 rounded-full bg-white transition ${autoQuoteRefreshEnabled ? "translate-x-3" : "translate-x-0"}`}></span>
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => void handleRefreshQuotes("manual")}
+                        disabled={quoteRefreshing}
+                        className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
+                      >
+                        <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
+                        <span>{quoteRefreshing ? "刷新中..." : "立刻刷新当前池行情"}</span>
+                      </button>
+                    </div>
+                    <div className="text-[10px] text-slate-500 font-mono">
+                      最新行情 {lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : latestWatchlistUpdateLabel}
+                    </div>
+                  </div>
+
+                  <div className="border border-slate-800 bg-slate-950/35 rounded-lg p-3 h-full flex flex-col gap-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
+                          <AlertCircle className="h-3.5 w-3.5" />
+                          <span>异动提醒</span>
+                        </div>
+                        <CardText className="text-[10px] text-slate-400 leading-normal">
+                          发现成交额前30的新进/跌出票；扫描只提醒，不替换当前池。只有点击新进票的“纳入”才会改名单。
+                        </CardText>
+                      </div>
+                      <span className="text-[10px] font-mono text-amber-300 bg-amber-950/60 border border-amber-500/20 rounded px-2 py-0.5 whitespace-nowrap">
+                        {autoTurnoverScanEnabled ? (turnoverScanning ? "扫描中" : `${turnoverScanCountdown}s`) : "已关闭"}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-2 text-[10px] font-mono">
+                      <div className="rounded border border-cyan-500/20 bg-cyan-950/10 px-2 py-1.5 text-slate-400">新进 <span className="text-cyan-300">{turnoverChanges?.newEntries.length || 0}</span></div>
+                      <div className="rounded border border-amber-500/20 bg-amber-950/10 px-2 py-1.5 text-slate-400">跌出 <span className="text-amber-300">{turnoverChanges?.dropped.length || 0}</span></div>
+                      <div className="rounded border border-emerald-500/20 bg-emerald-950/10 px-2 py-1.5 text-slate-400">上升 <span className="text-emerald-300">{turnoverChanges?.rankUp.length || 0}</span></div>
+                      <div className="rounded border border-rose-500/20 bg-rose-950/10 px-2 py-1.5 text-slate-400">下降 <span className="text-rose-300">{turnoverChanges?.rankDown.length || 0}</span></div>
+                    </div>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-bold text-cyan-300">新进前30</div>
+                        {turnoverChanges ? renderTurnoverPreviewRows(turnoverChanges.newEntries, "new") : (
+                          <div className="rounded border border-dashed border-slate-800 bg-slate-950/30 px-3 py-2 text-[10px] text-slate-600">
+                            扫描后这里会显示新进票，并提供“纳入”按钮
+                          </div>
+                        )}
+                      </div>
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-bold text-amber-300">跌出前30</div>
+                        {turnoverChanges ? renderTurnoverPreviewRows(turnoverChanges.dropped, "dropped") : (
+                          <div className="rounded border border-dashed border-slate-800 bg-slate-950/30 px-3 py-2 text-[10px] text-slate-600">
+                            扫描后这里会显示跌出票，只做提醒
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-auto grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-2">
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={autoTurnoverScanEnabled}
+                        onClick={() => setAutoTurnoverScanEnabled(prev => !prev)}
+                        className={`px-3.5 py-1.5 rounded border text-xs font-semibold flex items-center justify-between gap-3 transition ${
+                          autoTurnoverScanEnabled
+                            ? "bg-amber-600/20 border-amber-500/40 text-amber-200"
+                            : "bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200"
+                        }`}
+                      >
+                        <span>自动扫描前30异动 3分钟</span>
+                        <span className={`h-4 w-7 rounded-full p-0.5 transition ${autoTurnoverScanEnabled ? "bg-amber-500" : "bg-slate-700"}`}>
+                          <span className={`block h-3 w-3 rounded-full bg-white transition ${autoTurnoverScanEnabled ? "translate-x-3" : "translate-x-0"}`}></span>
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => void handleScanTurnoverChanges("manual")}
+                        disabled={turnoverScanning}
+                        className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
+                      >
+                        <AlertCircle className="h-3.5 w-3.5 text-amber-300" />
+                        <span>{turnoverScanning ? "扫描中..." : "手动扫描前30异动"}</span>
+                      </button>
+                    </div>
+                    <div className="text-[10px] text-slate-500 font-mono">
+                      上次扫描 {lastTurnoverScanAt ? lastTurnoverScanAt.toLocaleTimeString() : "未触发"}
+                    </div>
+                  </div>
+
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-950/30 px-3 py-3 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
+                      <Activity className="h-3.5 w-3.5 text-slate-400" />
+                      <span>名单管理与数据修复</span>
+                    </div>
+                    <CardText className="text-[10px] text-slate-500">
+                      补K线只补指标；重建或上传会覆盖当前名单；异动里的“纳入”只添加对应新进票。
+                    </CardText>
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <button
+                      onClick={handleRebuildStockPool}
+                      className="px-3.5 py-1.5 bg-rose-950/60 hover:bg-rose-900/60 text-rose-200 border border-rose-700/50 rounded text-xs font-semibold shadow-sm transition"
+                    >
+                      重建今日初筛池
+                    </button>
+                    <button
+                      onClick={() => handleFetchHistory(undefined, true)}
+                      className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm transition"
+                    >
+                      补充所有K线
+                    </button>
+                    <button
+                      onClick={() => setShowImportPanel(!showImportPanel)}
+                      className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold shadow-sm flex items-center justify-center gap-1.5 transition"
+                    >
+                      <FileSpreadsheet className="h-3.5 w-3.5" />
+                      <span>上传同花顺初筛池</span>
+                    </button>
+                  </div>
+                </div>
+
+                {turnoverChanges && (
+                  <div className="border-t border-slate-800 pt-3">
+                    <div className="flex items-center justify-between gap-3 mb-2">
+                      <span className="text-xs font-bold text-slate-300">成交额前30变动提醒</span>
+                      <span className="text-[10px] text-slate-500 font-mono">{changeTotal} 条</span>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
+                      {renderTurnoverList("新进", turnoverChanges.newEntries, "cyan")}
+                      {renderTurnoverList("跌出", turnoverChanges.dropped, "amber")}
+                      {renderTurnoverList("上升", turnoverChanges.rankUp, "emerald")}
+                      {renderTurnoverList("下降", turnoverChanges.rankDown, "rose")}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* 同花顺表格导入区域 */}
@@ -1881,9 +3085,9 @@ export default function App() {
                     <span className="text-xs font-bold text-slate-300">同花顺表格导入当前初筛池</span>
                     <button onClick={() => setShowImportPanel(false)} className="text-slate-500 hover:text-slate-300 text-xs">取消</button>
                   </div>
-                  <p className="text-[10px] text-slate-500">
+                  <CardText className="text-[10px] text-slate-500">
                     支持 .xlsx / .xls / .csv。系统会以表格中的股票代码为准，清洗成沪深主板前30只并覆盖当前股票池；旧股票池会先自动备份。
-                  </p>
+                  </CardText>
                   <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-center">
                     <input
                       type="file"
@@ -1915,52 +3119,6 @@ export default function App() {
                   </div>
                 </div>
               )}
-
-              <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_2fr] gap-3">
-                <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-xs font-bold text-slate-300">今日初筛池</span>
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${poolMeta?.isPoolLocked ? "bg-cyan-950 text-cyan-300 border border-cyan-500/20" : "bg-slate-800 text-slate-500"}`}>
-                      {poolMeta?.isPoolLocked ? "已锁池" : "未锁池"}
-                    </span>
-                  </div>
-                  <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
-                    <div>
-                      <span className="text-slate-600 block">批次</span>
-                      <span className="text-slate-300 font-mono break-all">{poolMeta?.poolBatchId || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">来源</span>
-                      <span className="text-slate-300">{poolMeta?.poolSource || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">生成时间</span>
-                      <span className="text-slate-300 font-mono">{poolMeta?.poolGeneratedAt || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-600 block">钉住</span>
-                      <span className="text-slate-300 font-mono">{watchlist.filter(s => s.isPinned).length} / {watchlist.length}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg">
-                  <div className="flex items-center justify-between gap-3 mb-2">
-                    <span className="text-xs font-bold text-slate-300">成交额前30变动提醒</span>
-                    <span className="text-[10px] text-slate-500 font-mono">{turnoverChanges ? `${changeTotal} 条` : "未扫描"}</span>
-                  </div>
-                  {turnoverChanges ? (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2">
-                      {renderTurnoverList("新进", turnoverChanges.newEntries, "cyan")}
-                      {renderTurnoverList("跌出", turnoverChanges.dropped, "amber")}
-                      {renderTurnoverList("上升", turnoverChanges.rankUp, "emerald")}
-                      {renderTurnoverList("下降", turnoverChanges.rankDown, "rose")}
-                    </div>
-                  ) : (
-                    <div className="text-[10px] text-slate-500">点击「扫描新进前30」后显示。</div>
-                  )}
-                </div>
-              </div>
 
               {/* 分组 TAB 与表格视口 */}
               <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
@@ -2128,12 +3286,12 @@ export default function App() {
                           <Info className="h-3.5 w-3.5 text-cyan-400" />
                           <span>纪律诊断结论：</span>
                         </div>
-                        <p className="text-xs text-slate-400 font-mono leading-relaxed">{selectedStock.reason || "暂未计算得出诊断。您可以点击一键刷新重新诊断。"}</p>
+                        <CardText className="text-xs text-slate-400 font-mono leading-relaxed">{selectedStock.reason || "暂未计算得出诊断。您可以点击「刷新当前池行情」重新诊断。"}</CardText>
                         
                         {selectedStock.reminder && (
                           <div className="border-t border-slate-800/40 pt-1.5 mt-1.5 flex items-start space-x-1.5">
                             <span className="text-[10px] font-bold text-cyan-500 uppercase shrink-0 mt-0.5">指令:</span>
-                            <span className="text-xs text-slate-300 font-medium">{selectedStock.reminder}</span>
+                            <CardText as="span" className="text-xs text-slate-300 font-medium">{selectedStock.reminder}</CardText>
                           </div>
                         )}
                       </div>
@@ -2184,9 +3342,9 @@ export default function App() {
 
                     </div>
                   ) : (
-                    <div className="bg-slate-900 border border-slate-800 p-8 rounded-lg text-center text-slate-500 italic">
+                    <CardText as="div" className="bg-slate-900 border border-slate-800 p-8 rounded-lg text-center text-slate-500 italic">
                       请点击左侧列表中的股票，调阅其高保真日K线及纪律红黄绿灯判定。
-                    </div>
+                    </CardText>
                   )}
                 </div>
 
@@ -2201,19 +3359,37 @@ export default function App() {
               
               {/* 今日信号播报 */}
               <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-4 shadow-md">
-                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-slate-800 pb-2">
                   <div className="flex items-center space-x-2">
                     <TrendingUp className="h-4.5 w-4.5 text-cyan-400" />
                     <h3 className="text-sm font-bold text-slate-200">盘中强回踩低吸监控</h3>
                   </div>
-                  <button
-                    onClick={() => void handleRefreshQuotes("manual")}
-                    disabled={quoteRefreshing}
-                    className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-cyan-700 disabled:opacity-75 disabled:cursor-not-allowed text-white rounded text-xs font-semibold shadow-md flex items-center space-x-1.5 transition"
-                  >
-                    <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : "animate-spin-hover"}`} />
-                    <span>{quoteRefreshing ? "刷新中..." : "立刻刷新行情"}</span>
-                  </button>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={autoQuoteRefreshEnabled}
+                      onClick={() => setAutoQuoteRefreshEnabled(prev => !prev)}
+                      className={`px-3 py-1.5 rounded border text-xs font-semibold flex items-center justify-between gap-3 transition ${
+                        autoQuoteRefreshEnabled
+                          ? "bg-cyan-600/20 border-cyan-500/40 text-cyan-200"
+                          : "bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <span>自动刷新当前池行情 30秒</span>
+                      <span className={`h-4 w-7 rounded-full p-0.5 transition ${autoQuoteRefreshEnabled ? "bg-cyan-500" : "bg-slate-700"}`}>
+                        <span className={`block h-3 w-3 rounded-full bg-white transition ${autoQuoteRefreshEnabled ? "translate-x-3" : "translate-x-0"}`}></span>
+                      </span>
+                    </button>
+                    <button
+                      onClick={() => void handleRefreshQuotes("manual")}
+                      disabled={quoteRefreshing}
+                      className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-cyan-700 disabled:opacity-75 disabled:cursor-not-allowed text-white rounded text-xs font-semibold shadow-md flex items-center justify-center space-x-1.5 transition"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${quoteRefreshing ? "animate-spin" : ""}`} />
+                      <span>{quoteRefreshing ? "刷新中..." : "立刻刷新当前池行情"}</span>
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -2228,12 +3404,14 @@ export default function App() {
                     <span className="text-xs font-mono text-slate-300 mt-1 block">已启用主力成交量筛选约束</span>
                   </div>
                   <div className="p-3 bg-slate-950/60 border border-slate-850 rounded-lg">
-                    <span className="text-[10px] text-slate-500 font-bold block">30秒自动刷新</span>
+                    <span className="text-[10px] text-slate-500 font-bold block">自动刷新当前池行情</span>
                     <span className="text-xs text-slate-300 mt-1 block">
-                      {quoteRefreshing ? "正在刷新行情..." : `${quoteRefreshCountdown}s 后自动刷新`}
+                      {autoQuoteRefreshEnabled
+                        ? (quoteRefreshing ? "正在刷新行情..." : `${quoteRefreshCountdown}s 后自动刷新`)
+                        : "已关闭，手动刷新可用"}
                     </span>
                     <span className="text-[10px] text-slate-500 mt-1 block">
-                      上次本页刷新 {lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : "未触发"}
+                      上次刷新 {lastQuoteRefreshAt ? lastQuoteRefreshAt.toLocaleTimeString() : latestWatchlistUpdateLabel}
                     </span>
                   </div>
                 </div>
@@ -2248,16 +3426,16 @@ export default function App() {
 
                 <div className="grid grid-cols-1 gap-4">
                   {buyReadyStocks.length === 0 ? (
-                    <div className="p-8 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40">
-                      盘中暂无进入待买观察层（大阳启动后回踩MA5，偏离度0%~2%且未跌破MA5）的主板股。请点击一键刷新或等待回踩。
-                    </div>
+                    <CardText as="div" className="p-8 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40">
+                      盘中暂无进入待买观察层（大阳启动后回踩MA5，偏离度0%~2%且未跌破MA5）的主板股。请刷新当前池行情或等待回踩。
+                    </CardText>
                   ) : (
                     buyReadyStocks.map(s => (
                       <div key={s.code} className="p-4 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-lg flex items-center justify-between transition">
                         <div className="space-y-1">
                           <span className="text-xs font-bold text-slate-200">{s.name} <span className="font-mono text-slate-500 font-normal">{s.code}</span></span>
-                          <p className="text-[10px] text-rose-400 font-medium">MA5偏离度: {s.deviation5}% | 5日线: {s.ma5}</p>
-                          <p className="text-[11px] text-slate-400 leading-normal">{s.reason}</p>
+                          <CardText className="text-[10px] text-rose-400 font-medium">MA5偏离度: {s.deviation5}% | 5日线: {s.ma5}</CardText>
+                          <CardText className="text-[11px] text-slate-400 leading-normal">{s.reason}</CardText>
                         </div>
                         <button
                           onClick={() => openBuyModal(s)}
@@ -2280,11 +3458,11 @@ export default function App() {
 
                 <div className="space-y-3">
                   {positions.length === 0 ? (
-                    <div className="p-8 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40 text-xs">
+                    <CardText as="div" className="p-8 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40 text-xs">
                       当前暂无持仓。买入流水录入后，这里会同步显示实时价格、MA5偏离、持仓时间和卖点计划。
-                    </div>
+                    </CardText>
                   ) : (
-                    positions.map(p => renderPositionSellCard(p))
+                    sortedPositions.map((p, idx) => renderPositionSellCard(p, idx))
                   )}
                 </div>
               </div>
@@ -2301,21 +3479,21 @@ export default function App() {
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg">
                   <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">总买入次数</span>
                   <span className="text-2xl font-bold font-mono text-rose-500 block mt-1">{trades.filter(t => t.type === "BUY").length} 次</span>
-                  <p className="text-[10px] text-slate-500 mt-2">包含实盘或模拟买入存底</p>
+                  <CardText className="text-[10px] text-slate-500 mt-2">包含实盘或模拟买入存底</CardText>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg">
                   <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">交易合规率</span>
                   <span className={`text-2xl font-bold font-mono block mt-1 ${auditStats ? (auditStats.complianceRate >= 80 ? "text-rose-500" : "text-amber-500") : "text-slate-400"}`}>
                     {auditStats ? `${auditStats.complianceRate}%` : "未完成"}
                   </span>
-                  <p className="text-[10px] text-slate-500 mt-2">买入规则不含违规标签的比例</p>
+                  <CardText className="text-[10px] text-slate-500 mt-2">买入和卖出规则不含违规标签的比例</CardText>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg">
                   <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">全部已实现盈亏</span>
                   <span className={`text-2xl font-bold font-mono block mt-1 ${accountState.realizedPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
                     {accountState.realizedPnL >= 0 ? "+" : ""}{accountState.realizedPnL.toLocaleString()} 元
                   </span>
-                  <p className="text-[10px] text-slate-500 mt-2">扣除税费后的净卖出差额</p>
+                  <CardText className="text-[10px] text-slate-500 mt-2">扣除税费后的净卖出差额</CardText>
                 </div>
               </div>
 
@@ -2348,7 +3526,7 @@ export default function App() {
                       {trades.length === 0 ? (
                         <tr>
                           <td colSpan={9} className="p-8 text-center text-slate-500 italic">
-                            暂无任何买卖存档记录。可在分组表格点击「买入」进行录入。
+                            <CardText as="span">暂无任何买卖存档记录。可在分组表格点击「买入」进行录入。</CardText>
                           </td>
                         </tr>
                       ) : (
@@ -2391,8 +3569,8 @@ export default function App() {
                               </div>
                             </td>
                             <td className="p-3 text-slate-400 max-w-xs break-words">
-                              <p className="font-semibold text-slate-300">{t.reason}</p>
-                              {t.remark && <p className="text-[10px] text-slate-500 mt-1 italic">备注: {t.remark}</p>}
+                              <CardText className="font-semibold text-slate-300">{t.reason}</CardText>
+                              {t.remark && <CardText className="text-[10px] text-slate-500 mt-1 italic">备注: {t.remark}</CardText>}
                             </td>
                             <td className="p-3">
                               <div className="flex items-center space-x-1.5">
@@ -2428,27 +3606,7 @@ export default function App() {
             <div className="space-y-6">
               
               {/* 五大维度闭环复盘导航 */}
-              <div className="flex flex-wrap bg-slate-950 p-1 rounded-lg border border-slate-800 gap-1">
-                {(["today", "market", "sector", "stock", "action"] as const).map(subTab => (
-                  <button
-                    key={subTab}
-                    onClick={() => setActiveReviewSubTab(subTab)}
-                    className={`flex-1 py-2 px-3 text-xs font-bold rounded-md transition duration-150 flex items-center justify-center space-x-1.5 ${
-                      activeReviewSubTab === subTab 
-                        ? "bg-gradient-to-r from-cyan-600 to-teal-600 text-white shadow-lg" 
-                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"
-                    }`}
-                  >
-                    <span>
-                      {subTab === "today" ? "📊 今日复盘" :
-                       subTab === "market" ? "📈 大盘多空" :
-                       subTab === "sector" ? "🔥 板块回踩" :
-                       subTab === "stock" ? "🎯 持仓偏差" :
-                       "✍️ 纠错自省"}
-                    </span>
-                  </button>
-                ))}
-              </div>
+              {renderReviewStepper()}
 
               {/* 子视图 1: 今日复盘 */}
               {activeReviewSubTab === "today" && (
@@ -2495,9 +3653,9 @@ export default function App() {
                       <ShieldAlert className="h-5 w-5 text-rose-500 shrink-0 mt-0.5" />
                       <div>
                         <h4 className="text-xs font-bold uppercase tracking-wider text-rose-400">🚨 短线纪律雷达报警：捕获违规硬伤！</h4>
-                        <p className="text-[11px] mt-1 text-rose-300 leading-relaxed">
+                        <CardText className="text-[11px] mt-1 text-rose-300 leading-relaxed">
                           今日流水中包含违规买入。例如偏离5日线（MA5）过高、或5日均线仍向下时临时起意买入。硬伤交易会极快稀释您的长期复利！请前往「操作复盘与存档」标签写下深刻反省。
-                        </p>
+                        </CardText>
                       </div>
                     </div>
                   )}
@@ -2523,7 +3681,7 @@ export default function App() {
                           {!todayTrades || todayTrades.length === 0 ? (
                             <tr>
                               <td colSpan={8} className="p-8 text-center text-slate-500 italic">
-                                今日无任何买卖操作。短线空仓也是一种极高雅的操作纪律！
+                                <CardText as="span">今日无任何买卖操作。短线空仓也是一种极高雅的操作纪律！</CardText>
                               </td>
                             </tr>
                           ) : (
@@ -2549,7 +3707,7 @@ export default function App() {
                                   </span>
                                 </td>
                                 <td className="p-3 text-slate-400 max-w-xs truncate" title={t.reason}>
-                                  {t.reason}
+                                  <CardText as="span">{t.reason}</CardText>
                                 </td>
                               </tr>
                             ))
@@ -2558,6 +3716,7 @@ export default function App() {
                       </table>
                     </div>
                   </div>
+                  {renderReviewNavFooter(null, "market", "进入下一步：大盘多空研判")}
                 </div>
               )}
                          {/* 子视图 2: 大盘复盘 */}
@@ -2565,17 +3724,24 @@ export default function App() {
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 animate-fade-in">
                   
                   {/* Left Column: Interactive evaluation */}
-                  <div className="lg:col-span-2 bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-5">
-                    <div className="border-b border-slate-800 pb-2">
+                  <div className="lg:col-span-2 bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-5">
+                    <div className="border-b border-slate-800 pb-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                      <div>
                       <h3 className="text-xs font-black text-cyan-400 uppercase tracking-widest">
-                        📈 核心指数趋势与资金大普查行动
+                        核心指数趋势与资金大普查行动
                       </h3>
-                      <p className="text-[11px] text-slate-400 mt-1">请核对上证、深证和创业板指数的走势、成交量及资金动向，确立底层交易水位。</p>
+                      <CardText className="text-[11px] text-slate-400 mt-1">请核对上证、深证和创业板指数的走势、成交量及资金动向，确立底层交易水位。</CardText>
+                      </div>
+                      <span className={`text-[10px] font-black px-2.5 py-1 rounded border ${
+                        systemicRisk ? "bg-rose-950/50 text-rose-300 border-rose-800" : "bg-cyan-950/40 text-cyan-300 border-cyan-800/50"
+                      }`}>
+                        {systemicRisk ? "风险收紧" : "常规水位"}
+                      </span>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       {/* 上证综指 */}
-                      <div className="bg-slate-950 p-3.5 rounded border border-slate-850 space-y-2.5">
+                      <div className="bg-slate-950/70 p-4 rounded-lg border border-slate-800 space-y-3 shadow-inner">
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-extrabold text-slate-200">上证指数</span>
                           <span className="text-[10px] font-mono text-slate-500">000001.SH</span>
@@ -2583,7 +3749,7 @@ export default function App() {
                         <div className="space-y-1.5 text-xs">
                           <div>
                             <span className="text-[10px] text-slate-500">走势趋势:</span>
-                            <select value={shTrend} onChange={(e) => setShTrend(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={shTrend} onChange={(e) => setShTrend(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="向上">向上 (多头主导)</option>
                               <option value="震荡">震荡 (均线粘合)</option>
                               <option value="向下">向下 (破位防踩)</option>
@@ -2591,7 +3757,7 @@ export default function App() {
                           </div>
                           <div>
                             <span className="text-[10px] text-slate-500">成交量能:</span>
-                            <select value={shVolume} onChange={(e) => setShVolume(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={shVolume} onChange={(e) => setShVolume(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="放量">放量 (资金活跃)</option>
                               <option value="缩量">缩量 (追高谨慎)</option>
                               <option value="持平">持平 (存量博弈)</option>
@@ -2599,7 +3765,7 @@ export default function App() {
                           </div>
                           <div>
                             <span className="text-[10px] text-slate-500">资金流向:</span>
-                            <select value={shFlow} onChange={(e) => setShFlow(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={shFlow} onChange={(e) => setShFlow(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="净流入">资金主力净流入</option>
                               <option value="净流出">资金主力净流出</option>
                             </select>
@@ -2608,7 +3774,7 @@ export default function App() {
                       </div>
 
                       {/* 深证成指 */}
-                      <div className="bg-slate-950 p-3.5 rounded border border-slate-850 space-y-2.5">
+                      <div className="bg-slate-950/70 p-4 rounded-lg border border-slate-800 space-y-3 shadow-inner">
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-extrabold text-slate-200">深证成指</span>
                           <span className="text-[10px] font-mono text-slate-500">399001.SZ</span>
@@ -2616,7 +3782,7 @@ export default function App() {
                         <div className="space-y-1.5 text-xs">
                           <div>
                             <span className="text-[10px] text-slate-500">走势趋势:</span>
-                            <select value={szTrend} onChange={(e) => setSzTrend(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={szTrend} onChange={(e) => setSzTrend(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="向上">向上 (多头主导)</option>
                               <option value="震荡">震荡 (均线粘合)</option>
                               <option value="向下">向下 (破位防踩)</option>
@@ -2624,7 +3790,7 @@ export default function App() {
                           </div>
                           <div>
                             <span className="text-[10px] text-slate-500">成交量能:</span>
-                            <select value={szVolume} onChange={(e) => setSzVolume(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={szVolume} onChange={(e) => setSzVolume(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="放量">放量 (资金活跃)</option>
                               <option value="缩量">缩量 (追高谨慎)</option>
                               <option value="持平">持平 (存量博弈)</option>
@@ -2632,7 +3798,7 @@ export default function App() {
                           </div>
                           <div>
                             <span className="text-[10px] text-slate-500">资金流向:</span>
-                            <select value={szFlow} onChange={(e) => setSzFlow(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={szFlow} onChange={(e) => setSzFlow(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="净流入">资金主力净流入</option>
                               <option value="净流出">资金主力净流出</option>
                             </select>
@@ -2641,7 +3807,7 @@ export default function App() {
                       </div>
 
                       {/* 创业板指 */}
-                      <div className="bg-slate-950 p-3.5 rounded border border-slate-850 space-y-2.5">
+                      <div className="bg-slate-950/70 p-4 rounded-lg border border-slate-800 space-y-3 shadow-inner">
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-extrabold text-slate-200">创业板指</span>
                           <span className="text-[10px] font-mono text-slate-500">399006.SZ</span>
@@ -2649,7 +3815,7 @@ export default function App() {
                         <div className="space-y-1.5 text-xs">
                           <div>
                             <span className="text-[10px] text-slate-500">走势趋势:</span>
-                            <select value={cyTrend} onChange={(e) => setCyTrend(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={cyTrend} onChange={(e) => setCyTrend(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="向上">向上 (多头主导)</option>
                               <option value="震荡">震荡 (均线粘合)</option>
                               <option value="向下">向下 (破位防踩)</option>
@@ -2657,7 +3823,7 @@ export default function App() {
                           </div>
                           <div>
                             <span className="text-[10px] text-slate-500">成交量能:</span>
-                            <select value={cyVolume} onChange={(e) => setCyVolume(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={cyVolume} onChange={(e) => setCyVolume(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="放量">放量 (资金活跃)</option>
                               <option value="缩量">缩量 (追高谨慎)</option>
                               <option value="持平">持平 (存量博弈)</option>
@@ -2665,7 +3831,7 @@ export default function App() {
                           </div>
                           <div>
                             <span className="text-[10px] text-slate-500">资金流向:</span>
-                            <select value={cyFlow} onChange={(e) => setCyFlow(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
+                            <select value={cyFlow} onChange={(e) => setCyFlow(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-[11px] text-slate-300 mt-0.5 focus:outline-none">
                               <option value="净流入">资金主力净流入</option>
                               <option value="净流出">资金主力净流出</option>
                             </select>
@@ -2675,10 +3841,10 @@ export default function App() {
                     </div>
 
                     {/* 系统性大盘风险判定 */}
-                    <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                    <div className="bg-slate-950/70 p-4 rounded-lg border border-slate-800 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                       <div className="space-y-1">
                         <span className="text-xs font-extrabold text-slate-200">🚦 判定今日市场是否遇系统性见顶/大阴大跌风险？</span>
-                        <p className="text-[11px] text-slate-400">大盘出现系统性下踩时，必须提高止损警戒水位，收紧底仓浮亏度。</p>
+                        <CardText className="text-[11px] text-slate-400">大盘出现系统性下踩时，必须提高止损警戒水位，收紧底仓浮亏度。</CardText>
                       </div>
                       <div className="flex items-center space-x-3 shrink-0">
                         <label className="relative inline-flex items-center cursor-pointer">
@@ -2705,18 +3871,32 @@ export default function App() {
                         <ShieldAlert className="h-5 w-5 text-rose-500 shrink-0 mt-0.5" />
                         <div>
                           <h4 className="text-xs font-black uppercase text-rose-400">🚨 止损风控铁律升级警报</h4>
-                          <p className="text-[11px] mt-1 text-rose-300 leading-normal">
+                          <CardText className="text-[11px] mt-1 text-rose-300 leading-normal">
                             当前已手动确认触发系统性大盘风险！依据交易止损与盈利优化策略：<b>单股止损水位由原 9-10% 自动上调收紧至 7-8%！以防范极端踩踏，死守本金！</b>
-                          </p>
-                          <p className="text-[10px] mt-1 text-slate-400 font-medium">请立即核对持仓，如有股票跌破5日线且亏损触及 7%-8%，14:50 前必须无条件清仓！</p>
+                          </CardText>
+                          <CardText className="text-[10px] mt-1 text-slate-400 font-medium">请立即核对持仓，如有股票跌破5日线且亏损触及 7%-8%，14:50 前必须无条件清仓！</CardText>
                         </div>
                       </div>
                     )}
+
+                    <div className="bg-slate-950/70 p-4 rounded-lg border border-slate-800 space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-extrabold text-slate-200">大盘研判综合结论</span>
+                        <span className="text-[10px] text-slate-500">保存日报时同步归档</span>
+                      </div>
+                      <textarea
+                        value={marketConclusion}
+                        onChange={(e) => setMarketConclusion(e.target.value)}
+                        placeholder="写下今天大盘的综合研判，例如缩量回踩5日线、多头承接、系统性风险低或需降低仓位。"
+                        rows={3}
+                        className="w-full bg-slate-900 border border-slate-850 rounded p-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500 leading-relaxed"
+                      />
+                    </div>
                   </div>
 
                   {/* Right Column: Static gauge & advise */}
                   <div className="col-span-1 space-y-4">
-                    <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg flex flex-col items-center justify-center text-center space-y-4 shadow">
+                    <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl min-h-[220px] flex flex-col items-center justify-center text-center space-y-4 shadow-lg">
                       <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">
                         多空强度综合指数
                       </span>
@@ -2765,14 +3945,17 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-2">
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-2">
                       <h4 className="text-xs font-extrabold text-slate-300">上证、深证及创业板复盘硬指标</h4>
-                      <p className="text-[11px] text-slate-400 leading-normal">
+                      <CardText className="text-[11px] text-slate-400 leading-normal">
                         若遇系统性风险（例如主力资金呈断崖式净流出、多指数破位MA5），止损硬限必须从9%-10%上调收紧至7%-8%，以第三方冷静逻辑阻断扛单行为。
-                      </p>
+                      </CardText>
                     </div>
                   </div>
 
+                  <div className="lg:col-span-3">
+                    {renderReviewNavFooter("today", "sector", "进入下一步：板块回踩扫描")}
+                  </div>
                 </div>
               )}
 
@@ -2787,7 +3970,7 @@ export default function App() {
                         <h3 className="text-xs font-black text-cyan-400 uppercase tracking-widest flex items-center space-x-1.5">
                           <span>🔥 50只行业板块 ETF 趋势及资金多头大复盘</span>
                         </h3>
-                        <p className="text-[11px] text-slate-400">拉网式大复盘 50 个行业 ETF 的主力资金流向与五日生命线排列，锁定最热强势回踩板块。</p>
+                        <CardText className="text-[11px] text-slate-400">拉网式大复盘 50 个行业 ETF 的主力资金流向与五日生命线排列，锁定最热强势回踩板块。</CardText>
                       </div>
                       <div className="bg-slate-950 border border-slate-800 rounded px-2.5 py-1 text-center shrink-0">
                         <span className="text-[10px] text-slate-500 block">今日扫过标的</span>
@@ -2873,11 +4056,14 @@ export default function App() {
                       </div>
                       <div className="p-3.5 bg-slate-950 border border-slate-850 rounded text-[11px] text-slate-400 space-y-1.5">
                         <span className="font-bold text-slate-300 block">💡 行业 ETF 交易指引:</span>
-                        <span>做超短线必须做到「板块护航，个股突围」。只要大板块趋势向上且没有见顶断崖，旗下强势股的回踩五日线行为便是安全的黄金买入段。</span>
+                        <CardText as="span">做超短线必须做到「板块护航，个股突围」。只要大板块趋势向上且没有见顶断崖，旗下强势股的回踩五日线行为便是安全的黄金买入段。</CardText>
                       </div>
                     </div>
                   </div>
 
+                  <div className="lg:col-span-3">
+                    {renderReviewNavFooter("market", "stock", "进入下一步：个股诊断")}
+                  </div>
                 </div>
               )}
 
@@ -2887,132 +4073,147 @@ export default function App() {
                   
                   {/* Step 1 to 3: Global Stock Screen Wizards */}
                   <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-5">
-                    <div className="border-b border-slate-800 pb-2">
-                      <h3 className="text-xs font-black text-cyan-400 uppercase tracking-widest">
-                        🎯 全市场流动性前排、暴量突围股、涨跌停板拉网大筛选
-                      </h3>
-                      <p className="text-[11px] text-slate-400 mt-1">这套严格的标准化流程不仅能帮您过滤出真正的流动性龙虎种子，更能彻底杜绝盲目盘中跟风。</p>
+                    <div className="border-b border-slate-800 pb-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                      <div>
+                        <h3 className="text-xs font-black text-cyan-400 uppercase tracking-widest">
+                          全市场三步扫描
+                        </h3>
+                        <CardText className="text-[11px] text-slate-400 mt-1">步骤1-3保留完整扫描结果，只有点击“加入自我诊断”的股票才会进入步骤4。</CardText>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleManualScreening}
+                        disabled={isScreening}
+                        className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-bold text-[11px] rounded shadow transition flex items-center justify-center gap-1.5 shrink-0"
+                      >
+                        <RefreshCw className={`h-3.5 w-3.5 ${isScreening ? "animate-spin" : ""}`} />
+                        <span>{isScreening ? "正在扫描..." : "重新运行三步扫描"}</span>
+                      </button>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      {/* 步骤 1 */}
-                      <div className={`p-4 rounded-lg border transition ${top200Reviewed ? "bg-cyan-950/15 border-cyan-800/40" : "bg-slate-950 border-slate-850"}`}>
-                        <div className="flex items-start justify-between">
-                          <span className="text-[10px] bg-slate-900 text-slate-400 px-2 py-0.5 rounded font-bold font-mono">步骤 1</span>
-                          <input 
-                            type="checkbox" 
-                            checked={top200Reviewed} 
-                            onChange={(e) => setTop200Reviewed(e.target.checked)}
-                            className="rounded text-cyan-600 focus:ring-0 focus:ring-offset-0 bg-slate-900 border-slate-800 cursor-pointer"
-                          />
-                        </div>
-                        <h4 className="text-xs font-black text-slate-200 mt-2">成交额降序前 200 股扫描</h4>
-                        <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                          按全市场昨日成交额由大到小排序，精扫前 200 只股票。剔除僵尸、锁定最强流动性人气大资金池。
-                        </p>
-                        <span className="text-[10px] text-cyan-400 block mt-2 font-bold">{top200Reviewed ? "✓ 已按成交前200筛选完毕" : "⏳ 待勾选确认"}</span>
-                      </div>
-
-                      {/* 步骤 2 */}
-                      <div className={`p-4 rounded-lg border transition ${volRatioReviewed ? "bg-cyan-950/15 border-cyan-800/40" : "bg-slate-950 border-slate-850"}`}>
-                        <div className="flex items-start justify-between">
-                          <span className="text-[10px] bg-slate-900 text-slate-400 px-2 py-0.5 rounded font-bold font-mono">步骤 2</span>
-                          <input 
-                            type="checkbox" 
-                            checked={volRatioReviewed} 
-                            onChange={(e) => setVolRatioReviewed(e.target.checked)}
-                            className="rounded text-cyan-600 focus:ring-0 focus:ring-offset-0 bg-slate-900 border-slate-800 cursor-pointer"
-                          />
-                        </div>
-                        <h4 className="text-xs font-black text-slate-200 mt-2">量比前 50 且成交在 10~20亿</h4>
-                        <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                          精确复盘当日量比前 50 且成交额在 10 亿 ~ 20 亿以上的放量突围股，捕捉爆量异动主力。
-                        </p>
-                        <span className="text-[10px] text-cyan-400 block mt-2 font-bold">{volRatioReviewed ? "✓ 已按量比与10-20亿级筛选" : "⏳ 待勾选确认"}</span>
-                      </div>
-
-                      {/* 步骤 3 */}
-                      <div className={`p-4 rounded-lg border transition ${limitUpReviewed ? "bg-cyan-950/15 border-cyan-800/40" : "bg-slate-950 border-slate-850"}`}>
-                        <div className="flex items-start justify-between">
-                          <span className="text-[10px] bg-slate-900 text-slate-400 px-2 py-0.5 rounded font-bold font-mono">步骤 3</span>
-                          <input 
-                            type="checkbox" 
-                            checked={limitUpReviewed} 
-                            onChange={(e) => setLimitUpReviewed(e.target.checked)}
-                            className="rounded text-cyan-600 focus:ring-0 focus:ring-offset-0 bg-slate-900 border-slate-800 cursor-pointer"
-                          />
-                        </div>
-                        <h4 className="text-xs font-black text-slate-200 mt-2">当日涨跌停板股票核查</h4>
-                        <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                          扫描核查当日所有涨停及跌停个股。拆解龙头股连板高度、封板溢价率及市场最热门主线题材。
-                        </p>
-                        <span className="text-[10px] text-cyan-400 block mt-2 font-bold">{limitUpReviewed ? "✓ 已核对当日涨跌停板高度" : "⏳ 待勾选确认"}</span>
-                      </div>
+                      {renderScreenStepCard(
+                        "1",
+                        "成交额前200扫描",
+                        "按成交额从大到小精扫前排流动性票，完整结果会落盘到 JSON，日报正文只摘要前10只。",
+                        top200Reviewed,
+                        setTop200Reviewed,
+                        step1Screened,
+                        "step1"
+                      )}
+                      {renderScreenStepCard(
+                        "2",
+                        "量比前50 + 10-20亿成交额",
+                        "复查放量异动且成交额适中的标的，捕捉主力点火后的回踩观察对象。",
+                        volRatioReviewed,
+                        setVolRatioReviewed,
+                        step2Screened,
+                        "step2"
+                      )}
+                      {renderScreenStepCard(
+                        "3",
+                        "涨跌停 / 连板 / 情绪高度扫描",
+                        "核查涨停、跌停、连板与强趋势票，记录情绪高度和风险方向。",
+                        limitUpReviewed,
+                        setLimitUpReviewed,
+                        step3Screened,
+                        "step3"
+                      )}
                     </div>
                   </div>
 
-                  {/* Step 4: Objective diagnostics on watchlist and positions */}
+                  {/* Step 4: Self diagnostics */}
                   <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-4">
                     <div className="border-b border-slate-800 pb-2 flex flex-col md:flex-row md:items-center justify-between gap-2">
                       <div className="space-y-0.5">
                         <h3 className="text-xs font-black text-cyan-400 uppercase tracking-widest flex items-center space-x-1.5">
-                          <span>🕵️ 步骤 4：以纯第三方冷静视角诊断自选与持仓 (强力破除屁股决定脑袋执念)</span>
+                          <span>步骤 4：我的自我诊断记录</span>
                         </h3>
-                        <p className="text-[11px] text-slate-400">请无视自己的买入成本、盈亏心理状态。假设您没有任何头寸，以极度客观的第三方视角判定此股应坚守或是必须割肉退出。</p>
+                        <CardText className="text-[11px] text-slate-400">这里只记录我真正需要复盘的持仓、今日交易票和手动加入的重点观察票，不自动塞入所有系统扫描结果。</CardText>
                       </div>
                       <span className="text-[10px] text-slate-500 font-mono">
-                        共有 {diagnosedHoldings.length} 只标的列席诊断
+                        共有 {diagnosedHoldings.length} 条自我诊断记录
                       </span>
                     </div>
 
                     {diagnosedHoldings.length === 0 ? (
-                      <div className="p-8 text-center text-slate-500 italic bg-slate-950 rounded border border-slate-850 text-xs">
-                        当前自选股或持仓为空，无法启动诊断。可在「今日看板」快捷补录买入，数据会自动加载于此！
-                      </div>
+                      <CardText as="div" className="p-8 text-center text-slate-500 italic bg-slate-950 rounded border border-slate-850 text-xs">
+                        暂无自我诊断对象。当前持仓、今日交易会自动进入；步骤1-3中的股票需要手动点击“加入自我诊断”。
+                      </CardText>
                     ) : (
-                      <div className="space-y-3">
+                      <div className="space-y-4">
                         {diagnosedHoldings.map((diag, idx) => (
-                          <div key={diag.code} className="bg-slate-950 p-4 rounded-lg border border-slate-850 grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
-                            <div className="space-y-1">
-                              <span className="text-xs font-mono font-black text-slate-200 block">{diag.name} ({diag.code})</span>
-                              <div className="flex items-center space-x-2">
-                                <span className="text-[10px] text-slate-500">五日均线上方占比/生命线状态:</span>
-                                <span className="text-[10px] bg-slate-900 text-cyan-300 font-bold px-1.5 rounded">健康监视</span>
+                          <div key={diag.code} className="bg-slate-950 p-4 rounded-lg border border-slate-850 space-y-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-900 pb-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-xs font-mono font-black text-slate-200">{diag.name} ({diag.code})</span>
+                                <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${
+                                  diag.type === "holding" ? "bg-amber-950/60 text-amber-400 border-amber-900/40" :
+                                  diag.type === "todayBuy" ? "bg-rose-950/60 text-rose-300 border-rose-900/40" :
+                                  diag.type === "todaySell" ? "bg-emerald-950/60 text-emerald-300 border-emerald-900/40" :
+                                  "bg-cyan-950/60 text-cyan-300 border-cyan-900/40"
+                                }`}>
+                                  {diagnosisTypeLabel(diag)}
+                                </span>
                               </div>
+                              {diag.type === "manual" && (
+                                <button
+                                  type="button"
+                                  onClick={() => setDiagnosedHoldings(prev => prev.filter(item => item.code !== diag.code))}
+                                  className="text-[10px] text-slate-500 hover:text-rose-300 transition"
+                                >
+                                  移除
+                                </button>
+                              )}
                             </div>
                             
-                            {/* Diagnosis option dropdown */}
-                            <div>
-                              <label className="text-[9px] text-slate-500 uppercase block tracking-wider mb-1">第三方立场客观判定结论</label>
-                              <select 
-                                value={diag.judgment} 
-                                onChange={(e) => {
-                                  const updated = [...diagnosedHoldings];
-                                  updated[idx].judgment = e.target.value;
-                                  setDiagnosedHoldings(updated);
-                                }}
-                                className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-xs text-slate-300 focus:outline-none"
-                              >
-                                <option value="第三方客观评估：买点完好，无理由坚定持有">✅ 买点成立，生命线支撑有力，持有</option>
-                                <option value="第三方客观评估：破位跌破5日线，必须割肉清仓">🚨 已经破位MA5，必须毫不手软清仓割肉</option>
-                                <option value="第三方客观评估：未有跌破但三天未冲高，应微亏调仓">⏳ 连续3日未收回，符合时间淘汰机制，退出</option>
-                                <option value="第三方客观评估：距均线乖离过大，看分批止盈锁定盈利">💰 乖离过大远离MA5，无贪婪锁定高位浮盈</option>
-                              </select>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                              <div>
+                                <label className="text-[9px] text-slate-500 uppercase block tracking-wider mb-1">客观判断</label>
+                                <select 
+                                  value={diag.judgment} 
+                                  onChange={(e) => {
+                                    const updated = [...diagnosedHoldings];
+                                    updated[idx].judgment = e.target.value;
+                                    setDiagnosedHoldings(updated);
+                                  }}
+                                  className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-xs text-slate-300 focus:outline-none"
+                                >
+                                  <option value="第三方客观评估：买点完好，无理由坚定持有">买点成立，生命线支撑有力，持有</option>
+                                  <option value="第三方客观评估：破位跌破5日线，必须割肉清仓">已经破位MA5，必须清仓割肉</option>
+                                  <option value="第三方客观评估：未有跌破但三天未冲高，应微亏调仓">连续3日未收回，符合时间淘汰机制，退出</option>
+                                  <option value="第三方客观评估：距均线乖离过大，看分批止盈锁定盈利">乖离过大远离MA5，分批止盈锁定浮盈</option>
+                                </select>
+                              </div>
+
+                              <div>
+                                <label className="text-[9px] text-slate-500 uppercase block tracking-wider mb-1">明日执行指令</label>
+                                <input 
+                                  type="text"
+                                  value={diag.actionPlan}
+                                  onChange={(e) => {
+                                    const updated = [...diagnosedHoldings];
+                                    updated[idx].actionPlan = e.target.value;
+                                    setDiagnosedHoldings(updated);
+                                  }}
+                                  placeholder="例如: 9:35破5日线无承接必须退出，不抱幻想"
+                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-2 text-xs text-slate-300 focus:outline-none"
+                                />
+                              </div>
                             </div>
 
-                            {/* Plan input */}
                             <div>
-                              <label className="text-[9px] text-slate-500 uppercase block tracking-wider mb-1">明日操盘硬性执行口令</label>
-                              <input 
-                                type="text"
-                                value={diag.actionPlan}
+                              <label className="text-[9px] text-slate-500 uppercase block tracking-wider mb-1">手写诊断</label>
+                              <textarea
+                                value={diag.notes || ""}
                                 onChange={(e) => {
                                   const updated = [...diagnosedHoldings];
-                                  updated[idx].actionPlan = e.target.value;
+                                  updated[idx].notes = e.target.value;
                                   setDiagnosedHoldings(updated);
                                 }}
-                                placeholder="例如: 9:35破5日线无多头承接必须坚决退出，不抱幻想"
-                                className="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none"
+                                rows={2}
+                                placeholder="写下该股的回踩、承接、卖出纪律或情绪偏差。"
+                                className="w-full bg-slate-900 border border-slate-800 rounded p-2 text-xs text-slate-300 focus:outline-none leading-relaxed"
                               />
                             </div>
                           </div>
@@ -3020,154 +4221,210 @@ export default function App() {
                       </div>
                     )}
                   </div>
+                  {renderReviewNavFooter("sector", "action", "进入最后一步：纠错自省归档")}
                 </div>
               )}
 
-              {/* 子视图 5: 操作复盘与存档 */}
+              {/* 子视图 5: 纠错自省归档 */}
               {activeReviewSubTab === "action" && (
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start animate-fade-in">
-                  {/* 书写心得 */}
-                  <div className="lg:col-span-1 bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-4">
-                    <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
-                      <BookOpen className="h-4 w-4 text-cyan-400" />
-                      <h3 className="text-xs font-bold uppercase text-slate-200 tracking-wider">保存复盘日记归档</h3>
-                    </div>
+                <div className="space-y-6 animate-fade-in">
+                  <div className="grid grid-cols-1 xl:grid-cols-[1.35fr_0.85fr] gap-6 items-start">
+                    <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-5">
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-slate-800 pb-3">
+                        <div className="flex items-center gap-2">
+                          <BookOpen className="h-4 w-4 text-cyan-400" />
+                          <div>
+                            <h3 className="text-xs font-black uppercase text-slate-200 tracking-wider">步骤 5：纠错自省归档</h3>
+                            <CardText className="text-[11px] text-slate-500 mt-0.5">最后只写反思与明日计划，前四步会作为完整快照一起保存。</CardText>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={syncReportDraftFromReview}
+                          className="px-3 py-2 bg-cyan-950/60 hover:bg-cyan-900/70 text-cyan-300 border border-cyan-800/60 rounded-lg text-[11px] font-black transition flex items-center justify-center gap-1.5"
+                        >
+                          <Sparkles className="h-3.5 w-3.5" />
+                          <span>一键同步前四步</span>
+                        </button>
+                      </div>
 
-                    <div className="space-y-3">
-                      <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">复盘时间维度</label>
-                        <div className="flex bg-slate-950 p-1 rounded border border-slate-800 mt-1">
-                          {(["daily", "weekly", "monthly"] as const).map(t => (
-                            <button
-                              key={t}
-                              onClick={() => setReviewType(t)}
-                              className={`flex-1 py-1 text-[10px] font-bold rounded transition ${reviewType === t ? "bg-slate-800 text-cyan-400" : "text-slate-500 hover:text-slate-300"}`}
-                            >
-                              {t === "daily" ? "日报" : t === "weekly" ? "周报" : "月报"}
-                            </button>
-                          ))}
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">复盘时间维度</label>
+                          <div className="flex bg-slate-950 p-1 rounded border border-slate-800 mt-1">
+                            {(["daily", "weekly", "monthly"] as const).map(t => (
+                              <button
+                                key={t}
+                                onClick={() => setReviewType(t)}
+                                className={`flex-1 py-1.5 text-[10px] font-bold rounded transition ${reviewType === t ? "bg-slate-800 text-cyan-400" : "text-slate-500 hover:text-slate-300"}`}
+                              >
+                                {t === "daily" ? "日报" : t === "weekly" ? "周报" : "月报"}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">复盘参考日期</label>
+                          <input
+                            type="date"
+                            value={reportDate}
+                            onChange={(e) => setReportDate(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs font-mono text-slate-300 mt-1 focus:outline-none focus:border-cyan-500"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">卖出纪律</label>
+                          <select
+                            value={sellCompliant}
+                            onChange={(e) => setSellCompliant(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs text-slate-300 mt-1 focus:outline-none focus:border-cyan-500"
+                          >
+                            <option value="符合模式">符合模式</option>
+                            <option value="执行偏慢">执行偏慢</option>
+                            <option value="存在幻想扛单">存在幻想扛单</option>
+                            <option value="止盈过早">止盈过早</option>
+                          </select>
+                        </div>
+                        <div className="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">盈利经验</label>
+                            <input
+                              value={profitExperience}
+                              onChange={(e) => setProfitExperience(e.target.value)}
+                              placeholder="赚钱来自哪条纪律？"
+                              className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs text-slate-300 mt-1 focus:outline-none focus:border-cyan-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">亏损分析</label>
+                            <input
+                              value={lossAnalysis}
+                              onChange={(e) => setLossAnalysis(e.target.value)}
+                              placeholder="亏损来自哪条偏差？"
+                              className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs text-slate-300 mt-1 focus:outline-none focus:border-cyan-500"
+                            />
+                          </div>
                         </div>
                       </div>
 
                       <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">复盘参考日期</label>
-                        <input
-                          type="date"
-                          value={reportDate}
-                          onChange={(e) => setReportDate(e.target.value)}
-                          className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs font-mono text-slate-300 mt-1 focus:outline-none focus:border-cyan-500"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">今日违规诊断与纠错面反思</label>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">纠错自省日报</label>
                         <textarea
-                          rows={6}
+                          rows={10}
                           value={reportSummary}
                           onChange={(e) => setReportSummary(e.target.value)}
-                          placeholder="分析今日买卖，纠错乱买违纪，如何消灭盘中情绪下单？有哪些大阳线标的符合昨日计划..."
-                          className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs text-slate-300 mt-1 focus:outline-none focus:border-cyan-500 leading-relaxed"
+                          placeholder="写今天最重要的偏差：有没有临时起意、追涨、扛单、止盈犹豫、违反MA5纪律。"
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs text-slate-300 mt-1 focus:outline-none focus:border-cyan-500 leading-relaxed"
                         />
                       </div>
 
                       <div>
-                        <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">明日严苛作战行动计划 (拒绝临时决策)</label>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase block tracking-wider">明日计划</label>
                         <textarea
-                          rows={4}
+                          rows={5}
                           value={reportPlan}
                           onChange={(e) => setReportPlan(e.target.value)}
-                          placeholder="唯一允许观察的对象，买入等待位置，持仓在均线破位时的清仓计划..."
-                          className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs text-slate-300 mt-1 focus:outline-none focus:border-cyan-500 leading-relaxed"
+                          placeholder="写明日只允许观察的对象、买入等待位置、持仓破位后的清仓计划。"
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs text-slate-300 mt-1 focus:outline-none focus:border-cyan-500 leading-relaxed"
                         />
                       </div>
 
                       <button
                         onClick={handleSaveReport}
-                        className="w-full py-2 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-500 hover:to-teal-500 text-white font-bold text-xs rounded transition shadow"
+                        className="w-full py-3 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-500 hover:to-teal-500 text-white font-black text-xs rounded-lg transition shadow-md"
                       >
-                        一键保存复盘报告并归档笔记本
+                        保存并合成今日总日报
                       </button>
-                    </div>
-                  </div>
-
-                  {/* 历史复盘档案笔记本 */}
-                  <div className="lg:col-span-2 bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-4">
-                    <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                      <div className="flex items-center space-x-2">
-                        <FileText className="h-4 w-4 text-cyan-400" />
-                        <h3 className="text-xs font-bold uppercase text-slate-200 tracking-wider">
-                          历史{reviewType === "daily" ? "日" : reviewType === "weekly" ? "周" : "月"}复盘笔记本
-                        </h3>
-                      </div>
                     </div>
 
                     <div className="space-y-4">
-                      {reportsList.length === 0 ? (
-                        <div className="p-12 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40 text-xs">
-                          暂无任何历史复盘记录。
-                        </div>
-                      ) : (
-                        reportsList.map(rep => (
-                          <div key={rep.id} className="bg-slate-950 border border-slate-800/60 p-4 rounded-lg space-y-3">
-                            <div className="flex flex-wrap items-center justify-between border-b border-slate-850 pb-2">
-                              <span className="text-xs font-bold font-mono text-cyan-400 flex items-center space-x-1.5">
-                                <Calendar className="h-3.5 w-3.5" />
-                                <span>{rep.date} 复盘归档</span>
-                              </span>
-                              <span className="text-[10px] text-slate-500 font-mono">归档时间: {rep.createdTime}</span>
-                            </div>
-
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
-                              <div className="p-2 bg-slate-900/60 rounded border border-slate-800">
-                                <span className="text-[9px] text-slate-500 block">买入/卖出</span>
-                                <span className="text-xs font-bold text-slate-300 font-mono">{rep.buyCount}次 / {rep.sellCount}次</span>
-                              </div>
-                              <div className="p-2 bg-slate-900/60 rounded border border-slate-800">
-                                <span className="text-[9px] text-slate-500 block">合规率</span>
-                                <span className={`text-xs font-bold font-mono ${rep.ruleComplianceRate >= 80 ? "text-rose-500" : "text-amber-500"}`}>
-                                  {rep.ruleComplianceRate}%
-                                </span>
-                              </div>
-                              <div className="p-2 bg-slate-900/60 rounded border border-slate-800">
-                                <span className="text-[9px] text-slate-500 block">实现损益</span>
-                                <span className={`text-xs font-bold font-mono ${rep.realizedPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-                                  {rep.realizedPnL >= 0 ? "+" : ""}{rep.realizedPnL.toLocaleString()}
-                                </span>
-                              </div>
-                              <div className="p-2 bg-slate-900/60 rounded border border-slate-800">
-                                <span className="text-[9px] text-slate-500 block">账户风控状态</span>
-                                <span className="text-xs font-bold text-slate-300">{rep.portfolioRisk.split(" ")[0]}</span>
-                              </div>
-                            </div>
-
-                            <div className="space-y-1.5 text-xs">
-                              <h4 className="font-bold text-slate-300">💡 纠错与纪律心魔：</h4>
-                              <p className="text-slate-400 leading-normal pl-2 border-l border-cyan-500/30 whitespace-pre-wrap">{rep.summary}</p>
-                            </div>
-
-                            {rep.tomorrowPlan && (
-                              <div className="space-y-1.5 text-xs pt-1 border-t border-slate-900">
-                                <h4 className="font-bold text-slate-300">🎯 明日作战操盘计划：</h4>
-                                <p className="text-slate-400 leading-normal pl-2 border-l border-teal-500/30 whitespace-pre-wrap">{rep.tomorrowPlan}</p>
-                              </div>
-                            )}
-
-                            {rep.violations && rep.violations.length > 0 && (
-                              <div className="pt-2 border-t border-slate-900 flex flex-wrap gap-1.5 items-center">
-                                <span className="text-[10px] font-bold text-rose-500 uppercase">捕获违规细节:</span>
-                                {rep.violations.map((v, i) => (
-                                  <span key={i} className="text-[9px] bg-rose-950/40 text-rose-300 px-1.5 py-0.5 rounded">
-                                    {v}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
+                      <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-4">
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                          <div className="flex items-center gap-2">
+                            <Sparkles className="h-4 w-4 text-cyan-400" />
+                            <h3 className="text-xs font-black uppercase text-slate-200 tracking-wider">归档快照</h3>
                           </div>
-                        ))
-                      )}
+                          <span className="text-[10px] text-slate-500 font-mono">{reportDate}</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="bg-slate-950/70 border border-slate-800 rounded-lg p-3">
+                            <span className="text-[9px] text-slate-500 block">交易流水</span>
+                            <span className="text-sm font-black text-slate-200 font-mono">{trades.filter(t => t.date === reportDate).length} 条</span>
+                          </div>
+                          <div className="bg-slate-950/70 border border-slate-800 rounded-lg p-3">
+                            <span className="text-[9px] text-slate-500 block">自我诊断</span>
+                            <span className="text-sm font-black text-cyan-300 font-mono">{diagnosedHoldings.length} 条</span>
+                          </div>
+                          <div className="bg-slate-950/70 border border-slate-800 rounded-lg p-3">
+                            <span className="text-[9px] text-slate-500 block">扫描结果</span>
+                            <span className="text-sm font-black text-slate-200 font-mono">{step1Screened.length + step2Screened.length + step3Screened.length} 只</span>
+                          </div>
+                          <div className="bg-slate-950/70 border border-slate-800 rounded-lg p-3">
+                            <span className="text-[9px] text-slate-500 block">当前持仓</span>
+                            <span className="text-sm font-black text-slate-200 font-mono">{positions.length} 只</span>
+                          </div>
+                        </div>
+                        <CardText as="div" className="bg-cyan-950/10 border border-cyan-900/30 rounded-lg p-3 text-[11px] text-slate-400 leading-relaxed">
+                          JSON 会保存完整数组；Markdown 只摘要扫描前10只，便于阅读。
+                        </CardText>
+                      </div>
+
+                      <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg space-y-4">
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                          <div className="flex items-center gap-2">
+                            <FileText className="h-4 w-4 text-cyan-400" />
+                            <h3 className="text-xs font-black uppercase text-slate-200 tracking-wider">
+                              历史{reviewType === "daily" ? "日" : reviewType === "weekly" ? "周" : "月"}报
+                            </h3>
+                          </div>
+                          <span className="text-[10px] text-slate-500 font-mono">{reportsList.length} 篇</span>
+                        </div>
+
+                        <div className="space-y-3 max-h-[360px] overflow-y-auto pr-1">
+                          {reportsList.length === 0 ? (
+                            <CardText as="div" className="p-8 text-center text-slate-500 italic bg-slate-950 rounded-lg border border-slate-800/40 text-xs">
+                              暂无任何历史复盘记录。
+                            </CardText>
+                          ) : (
+                            reportsList.map(rep => (
+                              <div key={rep.id} className="bg-slate-950 border border-slate-800/60 p-3 rounded-lg space-y-2">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="text-xs font-bold font-mono text-cyan-400 flex items-center gap-1.5">
+                                    <Calendar className="h-3.5 w-3.5" />
+                                    <span>{rep.date}</span>
+                                  </span>
+                                  <span className={`text-[10px] font-bold font-mono ${rep.realizedPnL >= 0 ? "text-rose-400" : "text-emerald-400"}`}>
+                                    {rep.realizedPnL >= 0 ? "+" : ""}{rep.realizedPnL.toLocaleString()}
+                                  </span>
+                                </div>
+                                <div className="grid grid-cols-3 gap-2 text-center">
+                                  <div className="bg-slate-900/60 rounded border border-slate-800 p-2">
+                                    <span className="text-[9px] text-slate-500 block">买/卖</span>
+                                    <span className="text-[11px] font-bold text-slate-300">{rep.buyCount}/{rep.sellCount}</span>
+                                  </div>
+                                  <div className="bg-slate-900/60 rounded border border-slate-800 p-2">
+                                    <span className="text-[9px] text-slate-500 block">合规</span>
+                                    <span className="text-[11px] font-bold text-cyan-300">{rep.ruleComplianceRate}%</span>
+                                  </div>
+                                  <div className="bg-slate-900/60 rounded border border-slate-800 p-2">
+                                    <span className="text-[9px] text-slate-500 block">风险</span>
+                                    <span className="text-[11px] font-bold text-slate-300">{(rep.portfolioRisk || "").split(" ")[0] || "-"}</span>
+                                  </div>
+                                </div>
+                                <CardText className="text-[11px] text-slate-400 leading-relaxed max-h-16 overflow-hidden whitespace-pre-wrap">{rep.summary}</CardText>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
                     </div>
                   </div>
 
+                  {renderReviewNavFooter("stock", null)}
                 </div>
               )}
 
@@ -3181,7 +4438,9 @@ export default function App() {
               <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-4">
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
                   <Coins className="h-4 w-4 text-cyan-400" />
-                  <h3 className="text-sm font-bold text-slate-200">交易系统手续费率配置</h3>
+                  <h3 className="text-sm font-bold text-slate-200">
+                    {currentMode === "real" ? "实盘交易手续费率配置" : "模拟交易手续费率配置"}
+                  </h3>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -3239,7 +4498,7 @@ export default function App() {
                     onClick={() => handleSaveFees(feeSettings)}
                     className="px-4 py-2 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-500 hover:to-teal-500 text-white rounded text-xs font-semibold shadow transition"
                   >
-                    保存并应用手续费率
+                    保存当前模式手续费率
                   </button>
                 </div>
               </div>
@@ -3257,11 +4516,11 @@ export default function App() {
                     <label className="text-xs font-bold text-slate-300 block mb-1">
                       {currentMode === "real" ? "调整实盘初始总本金 (元)" : "调整模拟初始总本金 (元)"}
                     </label>
-                    <p className="text-[10px] text-slate-500 mb-2">
+                    <CardText className="text-[10px] text-slate-500 mb-2">
                       {currentMode === "real" 
                         ? "更改后，系统的实盘可用现金与实盘已实现盈亏将根据您的实盘交易历史重新计算。" 
                         : "更改后，系统的模拟可用现金与模拟已实现盈亏将根据您的模拟交易历史重新计算。"}
-                    </p>
+                    </CardText>
                     <div className="flex space-x-2">
                       <input
                         type="number"
@@ -3377,9 +4636,9 @@ export default function App() {
 
                 {/* 违规警告 */}
                 {tradeType === "BUY" && (tradePrice > (tradeTarget.ma5 * 1.02) || tradePrice < tradeTarget.ma5 || tradeTarget.bigCandlePct < 5.0 || !tradeTarget.ma5Upward || !isMainBoard(tradeTarget.code)) && (
-                  <p className="text-[10px] text-amber-500 italic leading-normal border-t border-slate-900 pt-1.5">
+                  <CardText className="text-[10px] text-amber-500 italic leading-normal border-t border-slate-900 pt-1.5">
                     ⚠️ 警告：当前录入数据在纪律上存在违规买入风险（无5%阳线启动、MA5未向上、非偏离金区或已跌破MA5）。继续录入将产生红字违规证据，并归档至审计中心。
-                  </p>
+                  </CardText>
                 )}
               </div>
             )}
@@ -3420,10 +4679,23 @@ export default function App() {
                 <input
                   type="number"
                   step="100"
+                  max={tradeType === "SELL" && activeAvailableQuantity > 0 ? activeAvailableQuantity : undefined}
                   value={tradeQuantity}
-                  onChange={(e) => setTradeQuantity(Number(e.target.value))}
+                  onChange={(e) => {
+                    const nextQuantity = Number(e.target.value);
+                    setTradeQuantity(
+                      tradeType === "SELL" && activeAvailableQuantity > 0
+                        ? Math.min(nextQuantity, activeAvailableQuantity)
+                        : nextQuantity
+                    );
+                  }}
                   className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-xs font-mono text-slate-200 mt-1 focus:outline-none focus:border-cyan-500"
                 />
+                {tradeType === "SELL" && activeTradePosition && (
+                  <CardText className="text-[10px] text-slate-500 mt-1">
+                    当前持有 {activeTradePosition.quantity} 股，可卖 {activeAvailableQuantity} 股
+                  </CardText>
+                )}
               </div>
 
               <div>
@@ -3546,13 +4818,10 @@ export default function App() {
                   onChange={(e) => {
                     const price = Number(e.target.value);
                     setEditPrice(price);
-                    const amt = price * editQuantity;
-                    const comm = Math.max(feeSettings.minCommission, Number((amt * feeSettings.commissionRate).toFixed(2)));
-                    const trans = Number((amt * feeSettings.transferFeeRate).toFixed(2));
-                    const stamp = editingTrade.type === "SELL" ? Number((amt * feeSettings.stampDutyRate).toFixed(2)) : 0;
-                    setEditCommission(comm);
-                    setEditTransferFee(trans);
-                    setEditStampDuty(stamp);
+                    const fees = calculateFeeBreakdown(editingTrade?.type || "BUY", price, editQuantity);
+                    setEditCommission(fees.comm);
+                    setEditTransferFee(fees.trans);
+                    setEditStampDuty(fees.stamp);
                   }}
                   className="w-full bg-slate-950 border border-slate-850 rounded p-2 text-xs font-mono text-slate-200 mt-1 focus:outline-none focus:border-cyan-500"
                 />
@@ -3567,13 +4836,10 @@ export default function App() {
                   onChange={(e) => {
                     const qty = Number(e.target.value);
                     setEditQuantity(qty);
-                    const amt = editPrice * qty;
-                    const comm = Math.max(feeSettings.minCommission, Number((amt * feeSettings.commissionRate).toFixed(2)));
-                    const trans = Number((amt * feeSettings.transferFeeRate).toFixed(2));
-                    const stamp = editingTrade.type === "SELL" ? Number((amt * feeSettings.stampDutyRate).toFixed(2)) : 0;
-                    setEditCommission(comm);
-                    setEditTransferFee(trans);
-                    setEditStampDuty(stamp);
+                    const fees = calculateFeeBreakdown(editingTrade?.type || "BUY", editPrice, qty);
+                    setEditCommission(fees.comm);
+                    setEditTransferFee(fees.trans);
+                    setEditStampDuty(fees.stamp);
                   }}
                   className="w-full bg-slate-950 border border-slate-850 rounded p-2 text-xs font-mono text-slate-200 mt-1 focus:outline-none focus:border-cyan-500"
                 />

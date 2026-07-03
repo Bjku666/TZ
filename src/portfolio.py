@@ -78,16 +78,17 @@ def calculate_trade_fees(
     commission = amount * commission_rate
     if use_min_commission and amount > 0:
         commission = max(commission, min_commission)
-    stamp_tax = amount * stamp_tax_rate if side == "卖出" else 0.0
-    transfer_fee = amount * transfer_fee_rate
-    total_fee = commission + stamp_tax + transfer_fee
+    commission = round(commission, 2)
+    stamp_tax = round(amount * stamp_tax_rate if side == "卖出" else 0.0, 2)
+    transfer_fee = round(amount * transfer_fee_rate, 2)
+    total_fee = round(commission + stamp_tax + transfer_fee, 2)
 
     return {
         "amount": round(amount, 2),
-        "commission": round(commission, 2),
-        "stamp_tax": round(stamp_tax, 2),
-        "transfer_fee": round(transfer_fee, 2),
-        "total_fee": round(total_fee, 2),
+        "commission": commission,
+        "stamp_tax": stamp_tax,
+        "transfer_fee": transfer_fee,
+        "total_fee": total_fee,
     }
 
 
@@ -182,6 +183,7 @@ def build_positions_from_trades(
         return pd.DataFrame(columns=POSITION_COLUMNS)
 
     states: dict[str, dict[str, Any]] = {}
+    today = pd.Timestamp(date.today()).normalize()
     for _, trade in flow.iterrows():
         code = clean_code(trade["代码"])
         if not code:
@@ -194,6 +196,7 @@ def build_positions_from_trades(
                 "数量": 0.0,
                 "成本总额": 0.0,
                 "买入日期": trade["日期"],
+                "今日买入数量": 0.0,
             },
         )
         qty = number_or(trade.get("数量"))
@@ -210,6 +213,8 @@ def build_positions_from_trades(
                 state["数量"] = 0.0
             state["数量"] += qty
             state["成本总额"] += amount + total_fee
+            if pd.to_datetime(trade["日期"], errors="coerce").normalize() == today:
+                state["今日买入数量"] += qty
             if str(trade.get("名称", "")).strip():
                 state["名称"] = trade.get("名称", "")
         else:
@@ -224,11 +229,12 @@ def build_positions_from_trades(
                 state["成本总额"] = 0.0
 
     rows: list[dict[str, Any]] = []
-    today = pd.Timestamp(date.today())
     for code, state in states.items():
         qty = number_or(state.get("数量"))
         if qty <= 0:
             continue
+        today_buy_qty = number_or(state.get("今日买入数量"))
+        available_qty = max(0, min(qty, qty - today_buy_qty))
         avg_cost = state["成本总额"] / qty if qty else 0
         context = current_context(code, watchlist, legacy_holdings)
         current_price = number_or(context.get("当前价"), avg_cost)
@@ -243,11 +249,12 @@ def build_positions_from_trades(
         if deviation is not None:
             below_ma5_days = max(1, below_ma5_days) if deviation < 0 else 0
         buy_date = date_or_today(state.get("买入日期"))
+        holding_days = max(0, int((today - buy_date.normalize()).days))
         rows.append({
             "代码": code,
             "名称": state.get("名称") or context.get("名称", ""),
             "数量": int(qty),
-            "可卖数量": int(qty),
+            "可卖数量": int(available_qty),
             "平均成本": avg_cost,
             "当前价": current_price,
             "市值": market_value,
@@ -255,9 +262,9 @@ def build_positions_from_trades(
             "浮动盈亏%": floating_pct,
             "MA5": ma5,
             "MA5偏离率%": deviation,
-            "持仓天数": max(0, int((today - buy_date.normalize()).days)),
+            "持仓天数": holding_days,
             "跌破MA5天数": below_ma5_days,
-            "操作提醒": holding_advice(current_price, ma5, qty, below_ma5_days),
+            "操作提醒": holding_advice(current_price, ma5, qty, below_ma5_days, available_qty, holding_days),
             "买入日期": buy_date.date().isoformat(),
         })
     return pd.DataFrame(rows, columns=POSITION_COLUMNS)

@@ -8,12 +8,14 @@ from backend.storage.sqlite_store import init_db
 from src.data import ensure_data_dir
 
 APP_NAME = "强势回踩短线交易纪律系统 API"
+APP_VERSION = "0.1.1"
+API_CONTRACT_VERSION = "watchlist-sync-v4"
 
 
 def create_app() -> FastAPI:
     ensure_data_dir()
     init_db()
-    app = FastAPI(title=APP_NAME, version="0.1.0")
+    app = FastAPI(title=APP_NAME, version=APP_VERSION)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -30,10 +32,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "version": APP_VERSION,
+            "contract": API_CONTRACT_VERSION,
+        }
 
     return app
 
 
 app = create_app()
-

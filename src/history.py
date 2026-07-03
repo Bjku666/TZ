@@ -14,6 +14,12 @@ from src.data import ROOT, DATA_DIR, clean_code
 from src.rules import recent_big_candle_pct
 
 HISTORY_DIR = DATA_DIR / "history"
+EASTMONEY_HISTORY_HOSTS = [
+    "push2his.eastmoney.com",
+    "push2.eastmoney.com",
+    "82.push2his.eastmoney.com",
+    "82.push2.eastmoney.com",
+]
 
 
 def ensure_history_dir() -> None:
@@ -124,10 +130,8 @@ def get_history_status(code: str) -> str:
 
 
 def fetch_history_akshare(code: str, start_date: str = "20250601",
-                          end_date: str | None = None) -> pd.DataFrame | None:
-    """Fetch historical daily data for a stock using AkShare.
-
-    Uses akshare.stock_zh_a_hist with qfq (前复权) adjustment.
+                          end_date: str | None = None) -> tuple[pd.DataFrame | None, str]:
+    """Fetch historical daily data with multiple providers.
 
     Args:
         code: 6-digit stock code.
@@ -142,8 +146,16 @@ def fetch_history_akshare(code: str, start_date: str = "20250601",
     if end_date is None:
         end_date = datetime.date.today().isoformat().replace("-", "")
     direct = fetch_history_eastmoney(code, start_date, end_date)
-    if direct is not None and not direct.empty:
+    if direct[0] is not None and not direct[0].empty:
         return direct
+
+    tencent = fetch_history_tencent(code, start_date, end_date)
+    if tencent[0] is not None and not tencent[0].empty:
+        return tencent
+
+    sina = fetch_history_sina(code)
+    if sina[0] is not None and not sina[0].empty:
+        return sina
 
     try:
         import akshare as ak
@@ -155,13 +167,31 @@ def fetch_history_akshare(code: str, start_date: str = "20250601",
             end_date=end_date,
             adjust="qfq",
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, (
+            f"东方财富: {direct[1] or '未返回'}；"
+            f"腾讯: {tencent[1] or '未返回'}；"
+            f"新浪: {sina[1] or '未返回'}；"
+            f"AKShare: {str(exc)[:180]}"
+        )
 
     if raw is None or raw.empty:
-        return None
+        return None, (
+            f"东方财富: {direct[1] or '未返回'}；"
+            f"腾讯: {tencent[1] or '未返回'}；"
+            f"新浪: {sina[1] or '未返回'}；"
+            "AKShare: 返回空数据"
+        )
 
-    return standardize_history(raw, code)
+    standardized = standardize_history(raw, code)
+    if standardized is None or standardized.empty:
+        return None, (
+            f"东方财富: {direct[1] or '未返回'}；"
+            f"腾讯: {tencent[1] or '未返回'}；"
+            f"新浪: {sina[1] or '未返回'}；"
+            "AKShare: 数据格式无法识别"
+        )
+    return standardized, "AKShare"
 
 
 def eastmoney_secid(code: str) -> str:
@@ -170,14 +200,26 @@ def eastmoney_secid(code: str) -> str:
     return f"{market}.{cleaned}"
 
 
+def market_symbol(code: str) -> str:
+    cleaned = clean_code(code)
+    return ("sh" if cleaned.startswith(("6", "9")) else "sz") + cleaned
+
+
+def history_date_dash(value: str | None) -> str:
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
+
+
 def fetch_history_eastmoney(code: str, start_date: str = "20250601",
-                            end_date: str | None = None) -> pd.DataFrame | None:
+                            end_date: str | None = None) -> tuple[pd.DataFrame | None, str]:
     """Fetch daily history directly from Eastmoney's kline endpoint."""
     import datetime
 
     cleaned = clean_code(code)
     if not cleaned:
-        return None
+        return None, "股票代码无效"
     if end_date is None:
         end_date = datetime.date.today().isoformat().replace("-", "")
 
@@ -191,55 +233,170 @@ def fetch_history_eastmoney(code: str, start_date: str = "20250601",
         "beg": start_date,
         "end": end_date,
     }
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?" + urllib.parse.urlencode(params)
+    errors: list[str] = []
+    query = urllib.parse.urlencode(params)
+    for host in EASTMONEY_HISTORY_HOSTS:
+        url = f"https://{host}/api/qt/stock/kline/get?" + query
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://quote.eastmoney.com/",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=6) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            errors.append(f"{host}: {str(exc)[:120]}")
+            continue
+
+        klines = (payload.get("data") or {}).get("klines") or []
+        if not klines:
+            errors.append(f"{host}: 返回空K线")
+            continue
+
+        rows: list[dict[str, object]] = []
+        for item in klines:
+            parts = str(item).split(",")
+            if len(parts) < 11:
+                continue
+            rows.append({
+                "日期": parts[0],
+                "开盘": parts[1],
+                "收盘": parts[2],
+                "最高": parts[3],
+                "最低": parts[4],
+                "成交量": parts[5],
+                "成交额": parts[6],
+                "单日涨幅%": parts[8],
+            })
+        if not rows:
+            errors.append(f"{host}: K线格式为空")
+            continue
+        standardized = standardize_history(pd.DataFrame(rows), cleaned)
+        if standardized is not None and not standardized.empty:
+            return standardized, host
+        errors.append(f"{host}: K线格式无法识别")
+    return None, "；".join(errors)
+
+
+def fetch_history_tencent(code: str, start_date: str = "20250601",
+                          end_date: str | None = None) -> tuple[pd.DataFrame | None, str]:
+    """Fetch daily history from Tencent's appstock endpoint."""
+    import datetime
+
+    cleaned = clean_code(code)
+    if not cleaned:
+        return None, "股票代码无效"
+    if end_date is None:
+        end_date = datetime.date.today().isoformat().replace("-", "")
+
+    symbol = market_symbol(cleaned)
+    start = history_date_dash(start_date)
+    end = history_date_dash(end_date)
+    param = f"{symbol},day,{start},{end},180,qfq"
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urllib.parse.urlencode({"param": param})
     request = urllib.request.Request(
         url,
         headers={
             "User-Agent": "Mozilla/5.0",
-            "Referer": "https://quote.eastmoney.com/",
+            "Referer": "https://gu.qq.com/",
         },
     )
-
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=6) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"腾讯: {str(exc)[:180]}"
 
-    klines = (payload.get("data") or {}).get("klines") or []
-    if not klines:
-        return None
-
+    stock_data = (payload.get("data") or {}).get(symbol) or {}
+    rows_raw = stock_data.get("qfqday") or stock_data.get("day") or []
     rows: list[dict[str, object]] = []
-    for item in klines:
-        parts = str(item).split(",")
-        if len(parts) < 11:
+    for item in rows_raw:
+        if not isinstance(item, list) or len(item) < 6:
             continue
         rows.append({
-            "日期": parts[0],
-            "开盘": parts[1],
-            "收盘": parts[2],
-            "最高": parts[3],
-            "最低": parts[4],
-            "成交量": parts[5],
-            "成交额": parts[6],
-            "单日涨幅%": parts[8],
+            "日期": item[0],
+            "开盘": item[1],
+            "收盘": item[2],
+            "最高": item[3],
+            "最低": item[4],
+            "成交量": item[5],
         })
     if not rows:
-        return None
-    return standardize_history(pd.DataFrame(rows), cleaned)
+        return None, "腾讯: 返回空K线"
+    standardized = standardize_history(pd.DataFrame(rows), cleaned)
+    if standardized is None or standardized.empty:
+        return None, "腾讯: K线格式无法识别"
+    return standardized, "腾讯"
+
+
+def fetch_history_sina(code: str, datalen: int = 180) -> tuple[pd.DataFrame | None, str]:
+    """Fetch daily history from Sina's KLine endpoint."""
+    cleaned = clean_code(code)
+    if not cleaned:
+        return None, "股票代码无效"
+    params = {
+        "symbol": market_symbol(cleaned),
+        "scale": "240",
+        "ma": "no",
+        "datalen": str(datalen),
+    }
+    url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.sina.com.cn/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=6) as response:
+            text = response.read().decode("utf-8", errors="ignore")
+        raw = json.loads(text)
+    except Exception as exc:
+        return None, f"新浪: {str(exc)[:180]}"
+
+    if not isinstance(raw, list) or not raw:
+        return None, "新浪: 返回空K线"
+    rows = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "日期": item.get("day"),
+            "开盘": item.get("open"),
+            "收盘": item.get("close"),
+            "最高": item.get("high"),
+            "最低": item.get("low"),
+            "成交量": item.get("volume"),
+        })
+    standardized = standardize_history(pd.DataFrame(rows), cleaned)
+    if standardized is None or standardized.empty:
+        return None, "新浪: K线格式无法识别"
+    return standardized, "新浪"
 
 
 def standardize_history(raw: pd.DataFrame, code: str) -> pd.DataFrame | None:
     """Standardize raw historical data from AKShare or direct Eastmoney."""
     col_map = {
         "日期": "日期",
+        "day": "日期",
+        "date": "日期",
         "开盘": "开盘",
+        "open": "开盘",
         "最高": "最高",
+        "high": "最高",
         "最低": "最低",
+        "low": "最低",
         "收盘": "收盘",
+        "close": "收盘",
         "成交量": "成交量",
+        "volume": "成交量",
+        "vol": "成交量",
         "成交额": "成交额",
+        "amount": "成交额",
         "涨跌幅": "单日涨幅%",
     }
     renamed = {}
@@ -337,9 +494,9 @@ def fetch_and_cache(code: str, start_date: str = "20250601",
         status: str describing the outcome
         data: DataFrame or None
     """
-    df = fetch_history_akshare(code, start_date, end_date)
+    df, source_message = fetch_history_akshare(code, start_date, end_date)
     if df is None:
-        return {"success": False, "status": "自动获取失败", "error": "行情源未返回有效历史K线", "data": None}
+        return {"success": False, "status": "自动获取失败", "error": source_message or "行情源未返回有效历史K线", "data": None}
     save_history_cache(df)
     diagnosis = diagnose_history(code)
     if not diagnosis["is_valid"]:

@@ -4,7 +4,13 @@ set -e
 
 PROJECT_DIR="/Users/lulu/Desktop/touzi"
 BACKEND_URL="http://127.0.0.1:8000"
+BACKEND_PORT="8000"
 FRONTEND_URL="http://127.0.0.1:5173"
+BACKEND_REQUIRED_CONTRACT="watchlist-sync-v4"
+BACKEND_REQUIRED_ROUTES=(
+  "/api/watchlist/scan-turnover-changes"
+  "/api/watchlist/include-turnover-stock"
+)
 
 cd "$PROJECT_DIR"
 mkdir -p "$PROJECT_DIR/.tmp"
@@ -49,14 +55,65 @@ wait_for_url() {
   return 1
 }
 
-if /usr/bin/curl --silent --fail "$BACKEND_URL/api/health" >/dev/null 2>&1; then
-  echo "Python 后端已在运行：$BACKEND_URL"
-else
+backend_has_required_routes() {
+  local schema_file="$PROJECT_DIR/.tmp/backend-openapi.json"
+  local route
+  if ! /usr/bin/curl --silent --fail "$BACKEND_URL/openapi.json" > "$schema_file" 2>/dev/null; then
+    return 1
+  fi
+  for route in "${BACKEND_REQUIRED_ROUTES[@]}"; do
+    if ! /usr/bin/grep -q "$route" "$schema_file"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+backend_has_required_contract() {
+  local health_file="$PROJECT_DIR/.tmp/backend-health.json"
+  if ! /usr/bin/curl --silent --fail "$BACKEND_URL/api/health" > "$health_file" 2>/dev/null; then
+    return 1
+  fi
+  /usr/bin/grep -q "\"contract\"[[:space:]]*:[[:space:]]*\"${BACKEND_REQUIRED_CONTRACT}\"" "$health_file"
+}
+
+stop_project_backend() {
+  local pids pid command_line
+  pids=("${(@f)$(/usr/sbin/lsof -tiTCP:${BACKEND_PORT} -sTCP:LISTEN 2>/dev/null || true)}")
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for pid in "${pids[@]}"; do
+    command_line="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_line" == *"uvicorn backend.main:app"* || "$command_line" == *"backend.main:app"* ]]; then
+      echo "正在停止旧 Python 后端进程：$pid"
+      /bin/kill "$pid" 2>/dev/null || true
+    else
+      echo "警告：端口 ${BACKEND_PORT} 被非本项目进程占用：$command_line"
+    fi
+  done
+  sleep 1
+}
+
+start_backend() {
   echo "正在启动 Python FastAPI 后端..."
   PYTHONPATH="$PROJECT_DIR" nohup .venv/bin/uvicorn backend.main:app \
     --host 127.0.0.1 \
-    --port 8000 \
+    --port "$BACKEND_PORT" \
     > "$PROJECT_DIR/.tmp/backend.log" 2>&1 &
+}
+
+if /usr/bin/curl --silent --fail "$BACKEND_URL/api/health" >/dev/null 2>&1; then
+  if backend_has_required_contract && backend_has_required_routes; then
+    echo "Python 后端已在运行且接口完整：$BACKEND_URL"
+  else
+    echo "Python 后端已在运行，但版本或接口不是最新，正在重启..."
+    stop_project_backend
+    start_backend
+  fi
+else
+  start_backend
 fi
 
 wait_for_url "$BACKEND_URL/api/health" "Python 后端"

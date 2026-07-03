@@ -12,7 +12,7 @@ from src.realtime import china_now, is_a_share_trading_time
 from src.rules import clean_code, screening_result
 
 from backend.services.portfolio_service import portfolio_snapshot
-from backend.services.settings_service import get_settings
+from backend.services.settings_service import trade_fee_settings
 from backend.storage import sqlite_store
 from backend.storage.csv_adapter import (
     api_trade_id,
@@ -53,6 +53,8 @@ def _audit_buy(stock: dict[str, Any] | None, code: str, name: str, price: float,
     else:
         if stock.get("historyStatus") != "已有缓存":
             tags.append("缺少有效历史K线")
+        if stock.get("stage") != "待买观察" and not stock.get("canBuy"):
+            tags.append("不在待买观察")
         if not stock.get("ma5Upward"):
             tags.append("MA5未向上")
         if number(stock.get("bigCandlePct")) < 5:
@@ -69,6 +71,61 @@ def _audit_buy(stock: dict[str, Any] | None, code: str, name: str, price: float,
     if len(tags) <= 2:
         return "部分不符", tags
     return "违规交易", tags
+
+
+def _audit_sell(position: dict[str, Any] | None, quantity: float, reason: str) -> tuple[str, list[str]]:
+    tags: list[str] = []
+    if not position:
+        return "违规交易", ["无持仓卖出"]
+
+    owned = number(position.get("quantity"))
+    available = number(position.get("availableQuantity"))
+    current_price = number(position.get("currentPrice"))
+    avg_cost = number(position.get("avgCost"))
+    ma5 = number(position.get("ma5"))
+    deviation = number(position.get("deviation5"))
+    below_days = int(number(position.get("belowMa5Days")))
+    hold_days = int(number(position.get("holdDays")))
+    reason_text = str(reason or "")
+
+    if quantity > owned:
+        tags.append("卖出数量超过持仓")
+    if quantity > available:
+        tags.append("T+1可卖数量不足")
+
+    hit_ma5_risk = ma5 > 0 and deviation < 0
+    hit_clear = below_days >= 3
+    hit_take_profit = ma5 > 0 and deviation > 7
+    hit_hard_stop = avg_cost > 0 and current_price <= avg_cost * 0.91
+    hit_next_day = hold_days <= 1 and any(key in reason_text for key in ["次日", "10点", "10:00", "不强", "冲高", "退出"])
+
+    if ma5 <= 0:
+        tags.append("缺少MA5卖出依据")
+    if not (hit_ma5_risk or hit_clear or hit_take_profit or hit_hard_stop or hit_next_day):
+        tags.append("未触发卖出纪律")
+
+    if not tags:
+        return "符合规则", []
+    if len(tags) <= 2 and "卖出数量超过持仓" not in tags and "T+1可卖数量不足" not in tags:
+        return "部分不符", tags
+    return "违规交易", tags
+
+
+def _position_snapshot(position: dict[str, Any] | None) -> dict[str, Any]:
+    if not position:
+        return {}
+    return {
+        "quantity": number(position.get("quantity")),
+        "availableQuantity": number(position.get("availableQuantity")),
+        "avgCost": number(position.get("avgCost")),
+        "currentPrice": number(position.get("currentPrice")),
+        "ma5": number(position.get("ma5")),
+        "deviation5": number(position.get("deviation5")),
+        "holdDays": int(number(position.get("holdDays"))),
+        "belowMa5Days": int(number(position.get("belowMa5Days"))),
+        "advice": str(position.get("advice") or ""),
+        "riskLevel": str(position.get("riskLevel") or "normal"),
+    }
 
 
 def _sync_after_trade(mode: str | None = None) -> None:
@@ -90,14 +147,18 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
     portfolio = portfolio_snapshot(active_mode)
     account_state = portfolio["accountState"]
     positions = {item["code"]: item for item in portfolio["positions"]}
-    fees = calculate_trade_fees(side, price, quantity, get_settings())
+    fees = calculate_trade_fees(side, price, quantity, trade_fee_settings(active_mode))
     total_cost = fees["amount"] + fees["total_fee"]
     if side == "买入" and number(account_state.get("availableCash")) < total_cost:
         raise ValueError(f"可用资金不足，需要 {total_cost:.2f} 元")
+    position = positions.get(code)
     if side == "卖出":
-        owned = number((positions.get(code) or {}).get("quantity"))
+        owned = number((position or {}).get("quantity"))
+        available = number((position or {}).get("availableQuantity"))
         if owned < quantity:
             raise ValueError(f"持仓不足，当前仅持有 {owned:.0f} 股")
+        if available < quantity:
+            raise ValueError(f"T+1可卖数量不足，当前可卖 {available:.0f} 股")
 
     now = china_now()
     trade_date = str(payload.get("date") or now.date().isoformat())
@@ -112,11 +173,12 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
         "ma5Upward": bool((stock or {}).get("ma5Upward")),
         "cashSufficient": number(account_state.get("availableCash")) >= price * 100,
         "inTradingTime": is_a_share_trading_time(now),
+        "positionBeforeTrade": _position_snapshot(position),
     }
     if side == "买入":
         conclusion, tags = _audit_buy(stock, code, name, price, number(account_state.get("availableCash")))
     else:
-        conclusion, tags = "符合规则", []
+        conclusion, tags = _audit_sell(position, quantity, str(payload.get("reason") or ""))
 
     frame = ensure_trade_frame(load_trades())
     new_row = {

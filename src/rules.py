@@ -279,18 +279,31 @@ def holding_advice(
     ma5: Any,
     quantity: Any,
     below_ma5_days: Any = 0,
+    available_quantity: Any | None = None,
+    holding_days: Any | None = None,
 ) -> str:
     deviation = ma5_deviation(current_price, ma5)
     qty = int(quantity) if is_number(quantity) else 0
+    available_qty = qty if available_quantity is None else int(available_quantity) if is_number(available_quantity) else 0
+    hold_days = int(holding_days) if is_number(holding_days) else None
     days = int(below_ma5_days) if is_number(below_ma5_days) else 0
+    t1_locked = available_qty <= 0 or (hold_days is not None and hold_days <= 0)
+    if t1_locked:
+        if deviation is None:
+            return "今日建仓T+1不可卖，先补当前价和MA5"
+        if deviation < 0 or days >= 3:
+            return "今日建仓T+1不可卖，记录跌破MA5，明日优先处理"
+        if deviation > 7:
+            return "今日建仓T+1不可卖，远离MA5先记录止盈计划"
+        return "今日建仓T+1不可卖，明日10:00看强弱"
     if days >= 3:
         return "连续3天未站回MA5，清仓"
     if deviation is None:
         return "补充当前价和MA5"
     if deviation < 0:
-        return "14:50仍跌破MA5，考虑全卖" if qty < 200 else "14:50仍跌破MA5，减仓或卖出"
+        return "14:50仍跌破MA5，考虑全卖" if available_qty < 200 else "14:50仍跌破MA5，减仓或卖出"
     if deviation > 7:
-        return "远离MA5，考虑全卖" if qty < 200 else "远离MA5，考虑卖出一半"
+        return "远离MA5，考虑全卖" if available_qty < 200 else "远离MA5，考虑卖出一半"
     if deviation <= 2:
         return "回踩MA5未破，继续持有"
     return "趋势未破，持有观察"

@@ -15,7 +15,7 @@ from src.data import (
     save_watchlist,
     standardize_import_file,
 )
-from src.history import compute_all_reminders, fetch_and_cache
+from src.history import compute_all_reminders, diagnose_history, fetch_and_cache
 from src.portfolio import build_positions_from_trades
 from src.realtime import (
     fetch_auto_stock_pool,
@@ -370,8 +370,14 @@ def fetch_history_for_watchlist(code: str | None = None, fetch_all: bool = False
     frame = load_watchlist()
     if frame.empty:
         return {"success": True, "message": "股票池为空", "list": []}
+    all_codes = [clean_code(value) for value in frame["代码"].dropna().astype(str)]
+    all_codes = [value for value in all_codes if value]
     if fetch_all:
-        codes = [clean_code(value) for value in frame["代码"].dropna().astype(str)]
+        codes = [
+            value
+            for value in all_codes
+            if not diagnose_history(value)["is_valid"]
+        ]
     elif code:
         codes = [clean_code(code)]
     else:
@@ -382,7 +388,13 @@ def fetch_history_for_watchlist(code: str | None = None, fetch_all: bool = False
         ]
     codes = [value for value in codes if value]
 
-    summary = {"success": True, "fetched": 0, "failed": 0, "results": {}}
+    summary = {
+        "success": True,
+        "fetched": 0,
+        "failed": 0,
+        "skipped": max(0, len(all_codes) - len(codes)) if fetch_all else 0,
+        "results": {},
+    }
     for item_code in codes:
         try:
             result = fetch_and_cache(item_code)

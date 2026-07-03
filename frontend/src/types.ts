@@ -88,6 +88,7 @@ export interface Position {
   buyDate: string;           // 买入日期
   advice: string;            // 建议
   riskLevel: RiskLevel;      // 风险级别
+  tradeLink?: StockTradeLink;
 }
 
 export interface TradeRuleSnapshot {
@@ -99,6 +100,7 @@ export interface TradeRuleSnapshot {
   ma5Upward: boolean;
   cashSufficient: boolean;
   inTradingTime: boolean;
+  positionBeforeTrade?: Partial<Position>;
 }
 
 export interface TradeLog {
@@ -134,6 +136,54 @@ export interface AccountState {
   todayPnL?: number;
 }
 
+export type SelfDiagnosisType = "holding" | "todayBuy" | "todaySell" | "manual";
+
+export interface SelfDiagnosisItem {
+  code: string;
+  name: string;
+  judgment: string;
+  actionPlan: string;
+  notes?: string;
+  type?: SelfDiagnosisType | string;
+  sourceStep?: "step1" | "step2" | "step3";
+  sourceTitle?: string;
+  complianceTags?: string[];
+  linkedTradeIds?: string[];
+}
+
+export interface StockTradeLink {
+  code: string;
+  name: string;
+  position?: Position | null;
+  todayTrades?: TradeLog[];
+  allTrades?: TradeLog[];
+  lastBuy?: Partial<TradeLog> | null;
+  lastSell?: Partial<TradeLog> | null;
+  hasComplianceIssue?: boolean;
+  complianceTags?: string[];
+  tradeCount?: number;
+  reviewFocus?: string;
+  actionPlan?: string;
+}
+
+export interface ReviewScreenedStock {
+  code: string;
+  name: string;
+  price: number;
+  pct: number;
+  volume: number;
+  rank?: number;
+  volRatio?: number;
+  confidence?: number;
+  stars?: string;
+  reason?: string;
+  stage?: StockStage;
+  group?: StockGroup;
+  deviation5?: number;
+  concept?: string;
+  limitHeight?: string;
+}
+
 export interface ReviewReport {
   id: string;
   type: "daily" | "weekly" | "monthly";
@@ -147,6 +197,18 @@ export interface ReviewReport {
   summary: string;            // 心得总结
   tomorrowPlan: string;       // 明日计划/下周计划
   createdTime: string;
+  accountSnapshot?: AccountState;
+  todayTrades?: TradeLog[];
+  currentPositions?: Position[];
+  stockLinks?: StockTradeLink[];
+  linkedStockReviews?: StockTradeLink[];
+  summaryStats?: {
+    buyCount: number;
+    sellCount: number;
+    ruleComplianceRate: number;
+    realizedPnL: number;
+    portfolioRisk: string;
+  };
   
   // Standardized multi-dimensional review fields
   marketAnalysis?: {
@@ -160,6 +222,7 @@ export interface ReviewReport {
     cyVolume: string;
     cyFlow: string;
     systemicRisk: boolean;
+    marketConclusion?: string;
   };
   sectorAnalysis?: {
     reviewedEtfCount: number;
@@ -170,12 +233,28 @@ export interface ReviewReport {
     top200Reviewed: boolean;
     volRatioReviewed: boolean;
     limitUpReviewed: boolean;
-    diagnosedHoldings: Array<{ code: string; name: string; judgment: string; actionPlan: string }>;
+    step1Screened?: ReviewScreenedStock[];
+    step2Screened?: ReviewScreenedStock[];
+    step3Screened?: ReviewScreenedStock[];
+    selfDiagnostics?: SelfDiagnosisItem[];
+    diagnosedHoldings: SelfDiagnosisItem[];
+  };
+  stockScreening?: {
+    step1: { title: string; reviewed: boolean; stocks: ReviewScreenedStock[] };
+    step2: { title: string; reviewed: boolean; stocks: ReviewScreenedStock[] };
+    step3: { title: string; reviewed: boolean; stocks: ReviewScreenedStock[] };
+  };
+  selfDiagnosis?: {
+    items: SelfDiagnosisItem[];
   };
   actionAudit?: {
     sellCompliant: string;
     profitExperience: string;
     lossAnalysis: string;
+  };
+  reflection?: {
+    summary: string;
+    tomorrowPlan: string;
   };
 }
 
