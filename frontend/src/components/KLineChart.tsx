@@ -139,6 +139,30 @@ export default function KLineChart({ code, name }: KLineChartProps) {
   const formatLineValue = (value?: number) => (
     typeof value === "number" && Number.isFinite(value) && value > 0 ? value.toFixed(2) : "--"
   );
+  const quoteMetrics = activePoint ? [
+    {
+      label: "价格",
+      value: activePoint.close.toFixed(2),
+      valueClassName: activePoint.close >= activePoint.open ? "text-rose-600" : "text-emerald-600"
+    },
+    {
+      label: "涨跌幅",
+      value: `${activeChangePct >= 0 ? "+" : ""}${activeChangePct.toFixed(2)}%`,
+      valueClassName: activeChangePct >= 0 ? "text-rose-600" : "text-emerald-600"
+    },
+    { label: "开", value: activePoint.open.toFixed(2) },
+    { label: "高", value: activePoint.high.toFixed(2) },
+    { label: "低", value: activePoint.low.toFixed(2) },
+    {
+      label: "量",
+      value: `${(activePoint.volume / 10000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })}万手`
+    }
+  ] : [];
+  const maMetrics = [
+    { label: "MA5", value: formatLineValue(activePoint?.ma5), className: "text-amber-600", swatchClassName: "bg-amber-500" },
+    { label: "MA10", value: formatLineValue(activePoint?.ma10), className: "text-cyan-600", swatchClassName: "bg-cyan-400" },
+    { label: "MA20", value: formatLineValue(activePoint?.ma20), className: "text-pink-600", swatchClassName: "bg-pink-500" }
+  ];
 
   return (
     <div className="bg-white border border-slate-200 rounded-lg p-4 font-sans select-none text-slate-800 shadow-sm">
@@ -149,19 +173,31 @@ export default function KLineChart({ code, name }: KLineChartProps) {
           <span className="shrink-0 whitespace-nowrap rounded bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-600">{code}</span>
         </div>
         {activePoint && (
-          <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-xs text-slate-600 sm:grid-cols-3 xl:grid-cols-6">
-            <span className="whitespace-nowrap">价格: <strong className={activePoint.close >= activePoint.open ? "text-rose-600" : "text-emerald-600"}>{activePoint.close.toFixed(2)}</strong></span>
-            <span className="whitespace-nowrap">涨跌幅: <strong className={activeChangePct >= 0 ? "text-rose-600" : "text-emerald-600"}>{activeChangePct >= 0 ? "+" : ""}{activeChangePct.toFixed(2)}%</strong></span>
-            <span className="whitespace-nowrap">开: {activePoint.open.toFixed(2)}</span>
-            <span className="whitespace-nowrap">高: {activePoint.high.toFixed(2)}</span>
-            <span className="whitespace-nowrap">低: {activePoint.low.toFixed(2)}</span>
-            <span className="whitespace-nowrap">量: {(activePoint.volume / 10000).toFixed(1)}万手</span>
-          </div>
+          <dl
+            className="grid min-w-0 gap-x-3 gap-y-1.5 font-mono text-xs text-slate-600"
+            style={{ gridTemplateColumns: "repeat(auto-fit, minmax(7.5rem, 1fr))" }}
+          >
+            {quoteMetrics.map(metric => (
+              <div key={metric.label} className="flex min-w-0 items-baseline gap-1">
+                <dt className="shrink-0 text-slate-500">{metric.label}:</dt>
+                <dd className={`min-w-0 truncate font-semibold ${metric.valueClassName || "text-slate-700"}`}>
+                  {metric.value}
+                </dd>
+              </div>
+            ))}
+          </dl>
         )}
-        <div className="grid grid-cols-1 gap-x-3 gap-y-1 font-mono text-xs text-slate-500 sm:grid-cols-3">
-          <span className="flex items-center whitespace-nowrap text-amber-600"><span className="mr-1 h-0.5 w-2.5 bg-amber-500"></span>MA5: {formatLineValue(activePoint?.ma5)}</span>
-          <span className="flex items-center whitespace-nowrap text-cyan-600"><span className="mr-1 h-0.5 w-2.5 bg-cyan-400"></span>MA10: {formatLineValue(activePoint?.ma10)}</span>
-          <span className="flex items-center whitespace-nowrap text-pink-600"><span className="mr-1 h-0.5 w-2.5 bg-pink-500"></span>MA20: {formatLineValue(activePoint?.ma20)}</span>
+        <div
+          className="grid min-w-0 gap-x-3 gap-y-1.5 font-mono text-xs text-slate-500"
+          style={{ gridTemplateColumns: "repeat(auto-fit, minmax(6.5rem, 1fr))" }}
+        >
+          {maMetrics.map(metric => (
+            <span key={metric.label} className={`flex min-w-0 items-center gap-1 ${metric.className}`}>
+              <span className={`h-0.5 w-2.5 shrink-0 ${metric.swatchClassName}`}></span>
+              <span className="shrink-0">{metric.label}:</span>
+              <span className="min-w-0 truncate">{metric.value}</span>
+            </span>
+          ))}
         </div>
       </div>
 

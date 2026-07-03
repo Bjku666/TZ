@@ -25,7 +25,8 @@ import {
   ChevronRight,
   Sparkles,
   Coins,
-  Edit
+  Edit,
+  Clock3
 } from "lucide-react";
 import KLineChart from "./components/KLineChart";
 import { Stock, TradeLog, StockGroup, StockViewGroup, StockStage, Position, AccountState, ReviewReport, TurnoverChanges, TurnoverChangeStock, ReviewScreenedStock, SelfDiagnosisItem } from "./types";
@@ -50,6 +51,119 @@ const DEFAULT_FEE_SETTINGS: FeeSettings = {
   stampDutyRate: 0.0005,
   transferFeeRate: 0.00001
 };
+
+type ActivityLogEntry = {
+  time: string;
+  icon: string;
+  text: string;
+  rowClass: string;
+  iconClass: string;
+  textClass: string;
+};
+
+const ACTIVITY_SYMBOLS = [
+  "⚡",
+  "🚨",
+  "⏳",
+  "✅",
+  "❌",
+  "⚠️",
+  "💡",
+  "🔎",
+  "➕",
+  "🔄",
+  "💸",
+  "🗑️",
+  "✍️",
+  "📝",
+  "⚙️",
+  "📂",
+  "📈",
+  "📋",
+  "✓"
+];
+
+function formatActivityLogEntry(log: string): ActivityLogEntry {
+  const [, parsedTime, parsedText] = log.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*(.*)$/) || [];
+  const time = parsedTime || "--:--:--";
+  let text = (parsedText || log).trim();
+  let icon = "•";
+
+  const symbol = ACTIVITY_SYMBOLS.find(item => text.startsWith(item));
+  if (symbol) {
+    icon = symbol === "⏳" ? "🚨" : symbol;
+    text = text.slice(symbol.length).trim();
+  } else if (/自动刷新|行情刷新|买点区间/.test(text)) {
+    icon = "⚡";
+  }
+
+  const isRefreshHighlight = icon === "⚡" || /自动刷新|行情刷新完成|重新评估买点区间/.test(text);
+  const isFetching = icon === "🚨" || /正在|启动|开始|拉取|扫描/.test(text);
+
+  if (isRefreshHighlight) {
+    return {
+      time,
+      icon: "⚡",
+      text,
+      rowClass: "border-rose-500/10",
+      iconClass: "text-amber-300",
+      textClass: "text-rose-400 font-black"
+    };
+  }
+
+  if (icon === "❌") {
+    return {
+      time,
+      icon,
+      text,
+      rowClass: "border-rose-500/10",
+      iconClass: "text-rose-400",
+      textClass: "text-rose-300 font-bold"
+    };
+  }
+
+  if (icon === "⚠️") {
+    return {
+      time,
+      icon,
+      text,
+      rowClass: "border-amber-500/10",
+      iconClass: "text-amber-300",
+      textClass: "text-amber-200 font-bold"
+    };
+  }
+
+  if (icon === "✅" || icon === "✓") {
+    return {
+      time,
+      icon,
+      text,
+      rowClass: "border-emerald-500/10",
+      iconClass: "text-emerald-300",
+      textClass: "text-emerald-200 font-bold"
+    };
+  }
+
+  if (icon === "💡" || icon === "🔎" || icon === "📈" || icon === "📋") {
+    return {
+      time,
+      icon,
+      text,
+      rowClass: "border-cyan-500/10",
+      iconClass: "text-cyan-300",
+      textClass: "text-sky-200 font-semibold"
+    };
+  }
+
+  return {
+    time,
+    icon,
+    text,
+    rowClass: isFetching ? "border-slate-800/80" : "border-slate-800/60",
+    iconClass: isFetching ? "text-rose-400" : "text-slate-500",
+    textClass: "text-slate-400 font-semibold"
+  };
+}
 
 function trimCardSentencePeriod(text: string): string {
   return text
@@ -1749,6 +1863,8 @@ export default function App() {
   );
   const sortedPositions = sortedPositionsByExitPriority(positions);
   const marketInstructions = getMarketLinkedInstructions();
+  const marketIsTrading = isAStockTradingTime();
+  const currentTimeLabel = currentTime.toLocaleTimeString("zh-CN", { hour12: false });
   const isPortfolioRiskWindow = marketInstructions.phase.includes("尾盘持仓风控");
   const urgentPositionCount = sortedPositions.filter(position => buildPositionSellPlan(position).priority <= 1).length;
 
@@ -2395,8 +2511,8 @@ export default function App() {
     <div className="h-screen overflow-hidden bg-slate-950 text-slate-200 flex flex-col font-sans selection:bg-blue-500/20 selection:text-blue-200">
       
       {/* 顶部系统状态 Bar */}
-      <header className="shrink-0 bg-slate-900 border-b border-slate-800 py-3 px-4 flex flex-wrap items-center justify-between sticky top-0 z-40 shadow-sm text-white gap-3">
-        <div className="flex items-center space-x-3">
+      <header className="shrink-0 bg-slate-900 border-b border-slate-800 py-3 px-4 grid grid-cols-1 lg:grid-cols-[minmax(220px,1fr)_auto_minmax(140px,1fr)] items-center sticky top-0 z-40 shadow-sm text-white gap-3">
+        <div className="flex items-center space-x-3 min-w-0">
           <div className="bg-gradient-to-tr from-blue-600 to-indigo-500 p-1.5 rounded-lg shadow-inner">
             <ShieldAlert className="h-5 w-5 text-white" />
           </div>
@@ -2406,72 +2522,51 @@ export default function App() {
           </div>
         </div>
 
-        {/* 模式切换器 */}
-        <div className="flex items-center space-x-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
-          <button
-            onClick={() => handleToggleMode("simulation")}
-            className={`px-3 py-1 rounded text-xs font-semibold transition-all ${
-              currentMode === "simulation"
-                ? "bg-blue-600 text-white shadow-sm"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-            }`}
-          >
-            模拟训练
-          </button>
-          <button
-            onClick={() => handleToggleMode("real")}
-            className={`px-3 py-1 rounded text-xs font-semibold transition-all ${
-              currentMode === "real"
-                ? "bg-rose-600 text-white shadow-sm"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-            }`}
-          >
-            实盘记录
-          </button>
-        </div>
-
         {/* 同花顺风格账户资产栏 */}
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs font-mono py-1.5 px-4 bg-slate-950/70 border border-slate-800 rounded-lg">
+        <div className="justify-self-center flex flex-wrap items-center justify-center gap-x-5 gap-y-1 text-xs font-mono py-1.5 px-4 bg-slate-950/70 border border-slate-800 rounded-lg">
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[10px]">{currentMode === "real" ? "实盘总资产:" : "模拟总资产:"}</span>
-            <span className="font-bold text-slate-100 text-[12px]">{accountState.totalAssets.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+            <span className="text-slate-400 text-[12px]">{currentMode === "real" ? "实盘总资产:" : "模拟总资产:"}</span>
+            <span className="font-bold text-slate-100 text-[14px]">{accountState.totalAssets.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[10px]">总市值:</span>
-            <span className="font-bold text-amber-500 text-[12px]">{accountState.holdingValue.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+            <span className="text-slate-400 text-[12px]">总市值:</span>
+            <span className="font-bold text-amber-500 text-[14px]">{accountState.holdingValue.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[10px]">可用资金:</span>
-            <span className="font-bold text-slate-100 text-[12px]">{accountState.availableCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+            <span className="text-slate-400 text-[12px]">可用资金:</span>
+            <span className="font-bold text-slate-100 text-[14px]">{accountState.availableCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[10px]">总盈亏:</span>
-            <span className={`font-bold text-[12px] ${accountState.totalPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-              {accountState.totalPnL >= 0 ? "+" : ""}{accountState.totalPnL.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+            <span className="text-slate-400 text-[12px]">总盈亏:</span>
+            <span className={`font-bold text-[14px] ${accountState.totalPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
+              {signedCurrency(accountState.totalPnL)}
             </span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[10px]">当日盈亏:</span>
-            <span className={`font-bold text-[12px] ${todayTotalPnLForAccount >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
+            <span className="text-slate-400 text-[12px]">当日盈亏:</span>
+            <span className={`font-bold text-[14px] ${todayTotalPnLForAccount >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
               {signedCurrency(todayTotalPnLForAccount)}
             </span>
           </div>
           <div className="flex items-center space-x-1.5 last:border-0">
-            <span className="text-slate-400 text-[10px]">总收益率:</span>
-            <span className={`font-bold text-[12px] ${accountState.totalPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
+            <span className="text-slate-400 text-[12px]">总收益率:</span>
+            <span className={`font-bold text-[14px] ${accountState.totalPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
               {accountState.totalPnL >= 0 ? "+" : ""}{accountState.totalReturnPct.toFixed(2)}%
             </span>
           </div>
         </div>
 
         {/* A股开盘时间时钟 */}
-        <div className="flex items-center space-x-3 text-xs font-mono">
-          <div className="text-right">
-            <div className="text-slate-100 font-medium">{currentTime.toLocaleTimeString()}</div>
-            <div className="flex items-center space-x-1 justify-end mt-0.5">
-              <span className={`h-2 w-2 rounded-full ${isAStockTradingTime() ? "bg-rose-500 animate-pulse" : "bg-slate-700"}`}></span>
-              <span className="text-[10px] text-slate-400">{isAStockTradingTime() ? "A股交易时间中" : "A股已休市"}</span>
-            </div>
+        <div className="justify-self-end flex flex-col items-end gap-1.5 font-mono">
+          <div className="flex items-center gap-1.5 rounded-[16px] border border-slate-700/80 bg-slate-950/80 px-2.5 py-1.5 shadow-inner shadow-black/30">
+            <Clock3 className="h-3.5 w-3.5 shrink-0 text-amber-400" strokeWidth={2.25} />
+            <span className="tabular-nums text-[16px] font-black leading-none tracking-normal text-slate-100">
+              {currentTimeLabel}
+            </span>
+          </div>
+          <div className={`flex items-center gap-1 pr-1 text-[12px] font-bold ${marketIsTrading ? "text-rose-400" : "text-slate-500"}`}>
+            <span className={`h-2 w-2 rounded-full ${marketIsTrading ? "bg-rose-500 animate-pulse" : "bg-slate-600"}`}></span>
+            <span>{marketIsTrading ? "A股交易时间中" : "A股已休市"}</span>
           </div>
         </div>
       </header>
@@ -2480,7 +2575,29 @@ export default function App() {
       <div className="flex-1 min-h-0 flex flex-col md:flex-row overflow-hidden">
         
         {/* 左侧菜单导航 */}
-        <nav className="w-full md:w-56 min-h-0 bg-slate-900 border-b md:border-b-0 md:border-r border-slate-800 p-3 flex flex-row md:flex-col justify-around md:justify-start space-y-0 md:space-y-1.5 shrink-0 overflow-x-auto md:overflow-x-hidden md:overflow-y-hidden">
+        <nav className="w-full md:w-72 min-h-0 bg-slate-900 border-b md:border-b-0 md:border-r border-slate-800 p-3 flex flex-row md:flex-col justify-around md:justify-start space-y-0 md:space-y-1.5 shrink-0 overflow-x-auto md:overflow-x-hidden md:overflow-y-hidden">
+          <div className="flex items-center space-x-1 bg-slate-950 p-1 rounded-lg border border-slate-800 shrink-0 md:mb-2 md:w-full">
+            <button
+              onClick={() => handleToggleMode("simulation")}
+              className={`flex-1 px-3 py-1.5 rounded text-xs font-semibold transition-all ${
+                currentMode === "simulation"
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+              }`}
+            >
+              模拟训练
+            </button>
+            <button
+              onClick={() => handleToggleMode("real")}
+              className={`flex-1 px-3 py-1.5 rounded text-xs font-semibold transition-all ${
+                currentMode === "real"
+                  ? "bg-rose-600 text-white shadow-sm"
+                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+              }`}
+            >
+              实盘记录
+            </button>
+          </div>
           <div className="hidden md:block px-3 py-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider">纪律罗盘</div>
           
           <button
@@ -2532,16 +2649,43 @@ export default function App() {
           </button>
 
           {/* 实时运行操作日志 */}
-          <div className="hidden md:flex flex-col flex-1 mt-6 border-t border-slate-800/60 pt-4 overflow-hidden">
-            <span className="px-3 text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">事件流日志</span>
-            <div className="flex-1 bg-slate-950 border border-slate-850 rounded-lg p-2 font-mono text-[9px] text-slate-400 overflow-y-auto space-y-1.5 max-h-[350px] min-h-[220px]">
-              {actionLog.length === 0 ? (
-                <div className="text-center py-4 italic">暂无系统事件</div>
-              ) : (
-                actionLog.map((log, i) => (
-                  <div key={i} className="leading-relaxed border-b border-slate-900 pb-1 last:border-0">{log}</div>
-                ))
-              )}
+          <div className="hidden md:flex flex-col flex-1 min-h-0 mt-6 overflow-hidden">
+            <div className="flex min-h-0 flex-1 flex-col rounded-[18px] border border-slate-700/80 bg-[#070a12] px-3 py-3 shadow-[inset_0_1px_0_rgba(148,163,184,0.04)]">
+              <div className="flex items-center justify-between gap-2.5 border-b border-slate-800/90 pb-2.5">
+                <span className="text-[12px] font-black tracking-wide text-slate-300">事件流日志</span>
+                <button
+                  type="button"
+                  onClick={() => setActionLog([])}
+                  className="rounded px-1 py-0.5 text-[10px] font-semibold text-slate-500 transition hover:text-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                >
+                  重置
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto pr-1 font-mono">
+                {actionLog.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-[10px] italic text-slate-600">暂无系统事件</div>
+                ) : (
+                  actionLog.map((log, i) => {
+                    const entry = formatActivityLogEntry(log);
+                    return (
+                      <div
+                        key={`${log}-${i}`}
+                        className={`grid grid-cols-[4.25rem_1rem_minmax(0,1fr)] gap-x-1.5 border-b py-2.5 text-[10px] leading-relaxed last:border-0 ${entry.rowClass}`}
+                      >
+                        <span className="pt-0.5 text-[10px] font-semibold tracking-wide text-slate-500">
+                          {entry.time}
+                        </span>
+                        <span className={`pt-0.5 text-[11px] leading-none ${entry.iconClass}`} aria-hidden="true">
+                          {entry.icon}
+                        </span>
+                        <span className={`min-w-0 whitespace-normal break-words text-[10px] leading-[1.5] ${entry.textClass}`}>
+                          {entry.text}
+                        </span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
             </div>
           </div>
         </nav>
@@ -3489,11 +3633,11 @@ export default function App() {
                   <CardText className="text-[10px] text-slate-500 mt-2">买入和卖出规则不含违规标签的比例</CardText>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg">
-                  <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">全部已实现盈亏</span>
+                  <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">累计已平仓盈亏</span>
                   <span className={`text-2xl font-bold font-mono block mt-1 ${accountState.realizedPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-                    {accountState.realizedPnL >= 0 ? "+" : ""}{accountState.realizedPnL.toLocaleString()} 元
+                    {signedCurrency(accountState.realizedPnL, " 元")}
                   </span>
-                  <CardText className="text-[10px] text-slate-500 mt-2">扣除税费后的净卖出差额</CardText>
+                  <CardText className="text-[10px] text-slate-500 mt-2">只统计已卖出落袋部分，不含当前持仓浮盈亏</CardText>
                 </div>
               </div>
 
@@ -3636,14 +3780,15 @@ export default function App() {
                     </div>
 
                     <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg">
-                      <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">今日已实现盈亏</span>
+                      <span className="text-[10px] text-slate-500 font-bold uppercase block tracking-wider">今日已平仓盈亏</span>
                       <span className={`text-xl font-bold font-mono block mt-1 ${
                         todayRealizedPnL >= 0 
                           ? "text-rose-400" 
                           : "text-emerald-400"
                       }`}>
-                        {todayRealizedPnL >= 0 ? "+" : ""}{todayRealizedPnL.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 元
+                        {signedCurrency(todayRealizedPnL, " 元")}
                       </span>
+                      <CardText className="text-[10px] text-slate-500 mt-2">只看今日卖出结算，不含持仓市值变化</CardText>
                     </div>
                   </div>
 
@@ -4569,7 +4714,7 @@ export default function App() {
                           fetch("/api/trades/delete", {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ id: "ALL" }) // 如果有该路由
+                            body: JSON.stringify({ id: "ALL", mode: currentMode })
                           }).finally(() => {
                             logAction("⚙️ 账户数据已重置。");
                             loadAllData();

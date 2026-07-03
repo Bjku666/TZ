@@ -202,6 +202,7 @@ def trades_to_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
         result.append(
             {
                 "id": api_trade_id(index),
+                "accountMode": str(clean_value(row.get("账户模式"), "模拟训练")),
                 "code": clean_code(row.get("代码")),
                 "name": str(clean_value(row.get("名称"), "")),
                 "type": "SELL" if side == "卖出" else "BUY",

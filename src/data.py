@@ -79,6 +79,7 @@ HOLDING_COLUMNS = [
 ]
 
 TRADE_COLUMNS = [
+    "账户模式",
     "代码",
     "名称",
     "类型",
@@ -643,6 +644,24 @@ def trade_amount(price: object, quantity: object) -> object:
     return round(float(numeric_price) * float(numeric_quantity), 2)
 
 
+def trade_account_mode_name(value: object) -> str:
+    if value is None:
+        return "模拟训练"
+    try:
+        if pd.isna(value):
+            return "模拟训练"
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "实盘记录" if text in {"real", "live", "实盘记录"} else "模拟训练"
+
+
+def filter_trades_by_account_mode(df: pd.DataFrame, account_mode: object) -> pd.DataFrame:
+    out = normalize_trade_records(df)
+    mode_name = trade_account_mode_name(account_mode)
+    return out[out["账户模式"].map(trade_account_mode_name) == mode_name].reset_index(drop=True)
+
+
 def normalize_trade_records(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return empty_frame(TRADE_COLUMNS)
@@ -653,6 +672,7 @@ def normalize_trade_records(df: pd.DataFrame) -> pd.DataFrame:
         rows: list[dict[str, object]] = []
         for _, row in df.iterrows():
             base = {
+                "账户模式": row.get("账户模式", row.get("account_mode", "模拟训练")),
                 "代码": row.get("代码", ""),
                 "名称": row.get("名称", ""),
                 "数量": row.get("数量", pd.NA),
@@ -692,6 +712,7 @@ def normalize_trade_records(df: pd.DataFrame) -> pd.DataFrame:
     for column in TRADE_COLUMNS:
         if column not in out:
             out[column] = pd.NA
+    out["账户模式"] = out["账户模式"].map(trade_account_mode_name)
     out["代码"] = out["代码"].map(clean_code)
     out["名称"] = out["名称"].fillna("").astype(str).str.strip()
     out["类型"] = out["类型"].where(out["类型"].isin(["买入", "卖出"]), "买入")

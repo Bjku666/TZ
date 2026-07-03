@@ -6,7 +6,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.data import DATA_DIR, load_holdings, load_trades, load_watchlist, save_holdings
+from src.data import DATA_DIR, filter_trades_by_account_mode, load_holdings, load_trades, load_watchlist, save_holdings
 from src.history import load_cached_history
 from src.portfolio import (
     account_state_from_trades,
@@ -214,7 +214,13 @@ def _broker_style_today_pnl(
             + pd.to_numeric(today_buys["总费用"], errors="coerce").fillna(0)
         ).sum()
     )
-    sell_amount = float(pd.to_numeric(today_trades.loc[today_trades["类型"] == "卖出", "金额"], errors="coerce").fillna(0).sum())
+    today_sells = today_trades[today_trades["类型"] == "卖出"]
+    sell_amount = float(
+        (
+            pd.to_numeric(today_sells["金额"], errors="coerce").fillna(0)
+            - pd.to_numeric(today_sells["总费用"], errors="coerce").fillna(0)
+        ).sum()
+    )
     return round(current_value + sell_amount - buy_amount - opening_value, 2)
 
 
@@ -265,14 +271,14 @@ def _position_trade_link(code: str, grouped_trades: dict[str, list[dict[str, Any
 
 
 def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> dict[str, Any]:
-    trades = load_trades()
+    account_mode = account_mode_name(mode)
+    trades = filter_trades_by_account_mode(load_trades(), account_mode)
     watchlist = load_watchlist()
     legacy_holdings = load_holdings()
     positions = build_positions_from_trades(trades, watchlist, legacy_holdings)
     if sync_legacy:
         save_holdings(portfolio_to_legacy_holdings(positions))
 
-    account_mode = account_mode_name(mode)
     state = account_state_from_trades(trades, positions, initial_cash(mode), account_mode)
     today_pnl = _broker_style_today_pnl(trades, positions, watchlist, legacy_holdings)
     grouped_trades = _trades_by_code(trades)

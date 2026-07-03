@@ -6,13 +6,19 @@ from typing import Any
 
 import pandas as pd
 
-from src.data import load_trades, load_watchlist, save_trades
+from src.data import (
+    filter_trades_by_account_mode,
+    load_trades,
+    load_watchlist,
+    save_trades,
+    trade_account_mode_name,
+)
 from src.portfolio import calculate_trade_fees
 from src.realtime import china_now, is_a_share_trading_time
 from src.rules import clean_code, screening_result
 
 from backend.services.portfolio_service import portfolio_snapshot
-from backend.services.settings_service import trade_fee_settings
+from backend.services.settings_service import account_mode_name, trade_fee_settings
 from backend.storage import sqlite_store
 from backend.storage.csv_adapter import (
     api_trade_id,
@@ -27,10 +33,30 @@ from backend.storage.csv_adapter import (
 
 
 def list_trades(mode: str | None = None) -> dict[str, Any]:
-    frame = load_trades()
+    frame = filter_trades_by_account_mode(load_trades(), account_mode_name(mode))
     api_trades = trades_to_api(frame)
     sqlite_store.replace_trades(mode or "default", api_trades_for_sqlite(api_trades))
     return {"list": api_trades}
+
+
+def _mode_row_indices(frame: pd.DataFrame, mode: str | None) -> list[int]:
+    mode_name = account_mode_name(mode)
+    normalized = ensure_trade_frame(frame)
+    return [
+        int(index)
+        for index, value in normalized["账户模式"].items()
+        if trade_account_mode_name(value) == mode_name
+    ]
+
+
+def _source_index_for_trade_id(frame: pd.DataFrame, trade_id: str, mode: str | None) -> int:
+    index = trade_index_from_id(trade_id)
+    if index is None:
+        raise ValueError("交易流水ID无效")
+    mode_indices = _mode_row_indices(frame, mode)
+    if index < 0 or index >= len(mode_indices):
+        raise ValueError("未找到该笔交易记录")
+    return mode_indices[index]
 
 
 def _current_stock(code: str) -> dict[str, Any] | None:
@@ -143,7 +169,7 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
     if not code or not name or price <= 0 or quantity <= 0:
         raise ValueError("交易参数不完整")
 
-    active_mode = mode or str(payload.get("mode") or "default")
+    active_mode = mode or payload.get("mode")
     portfolio = portfolio_snapshot(active_mode)
     account_state = portfolio["accountState"]
     positions = {item["code"]: item for item in portfolio["positions"]}
@@ -182,6 +208,7 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
 
     frame = ensure_trade_frame(load_trades())
     new_row = {
+        "账户模式": account_mode_name(active_mode),
         "代码": code,
         "名称": name,
         "类型": side,
@@ -209,25 +236,26 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
 
 
 def delete_trade(trade_id: str, mode: str | None = None) -> dict[str, Any]:
+    active_mode = mode
     index = trade_index_from_id(trade_id)
-    if index is None:
-        raise ValueError("交易流水ID无效")
     frame = ensure_trade_frame(load_trades()).reset_index(drop=True)
-    if index < 0 or index >= len(frame):
-        raise ValueError("未找到该笔交易记录")
-    updated = frame.drop(index=index).reset_index(drop=True)
+    if str(trade_id or "").upper() == "ALL":
+        drop_indices = _mode_row_indices(frame, active_mode)
+        updated = frame.drop(index=drop_indices).reset_index(drop=True)
+    else:
+        if index is None:
+            raise ValueError("交易流水ID无效")
+        source_index = _source_index_for_trade_id(frame, trade_id, active_mode)
+        updated = frame.drop(index=source_index).reset_index(drop=True)
     save_trades(updated)
-    _sync_after_trade(mode)
+    _sync_after_trade(active_mode)
     return {"success": True}
 
 
 def update_trade(trade_id: str, payload: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
-    index = trade_index_from_id(trade_id)
-    if index is None:
-        raise ValueError("交易流水ID无效")
+    active_mode = mode
     frame = ensure_trade_frame(load_trades()).reset_index(drop=True)
-    if index < 0 or index >= len(frame):
-        raise ValueError("未找到该笔交易记录")
+    index = _source_index_for_trade_id(frame, trade_id, active_mode)
 
     column_map = {
         "code": "代码",
@@ -266,7 +294,10 @@ def update_trade(trade_id: str, payload: dict[str, Any], mode: str | None = None
             + number(frame.loc[index, "过户费"])
         )
     save_trades(frame)
-    _sync_after_trade(mode)
-    trade = trades_to_api(frame.iloc[[index]])[0]
-    trade["id"] = api_trade_id(index)
+    _sync_after_trade(active_mode)
+    mode_frame = filter_trades_by_account_mode(frame, account_mode_name(active_mode))
+    mode_indices = _mode_row_indices(frame, active_mode)
+    mode_index = mode_indices.index(index)
+    trade = trades_to_api(mode_frame.iloc[[mode_index]])[0]
+    trade["id"] = api_trade_id(mode_index)
     return {"success": True, "trade": trade}
