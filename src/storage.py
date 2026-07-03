@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -40,6 +47,21 @@ def ensure_storage_dirs() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 
+@contextmanager
+def file_write_lock(path: Path) -> Iterator[None]:
+    ensure_storage_dirs()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def backup_file(path: Path, *, label: str = "backup") -> Path | None:
     if not path.exists() or path.stat().st_size == 0:
         return None
@@ -58,16 +80,28 @@ def backup_file(path: Path, *, label: str = "backup") -> Path | None:
 def safe_write_csv(df: pd.DataFrame, path: Path, *, columns: list[str] | None = None) -> None:
     ensure_storage_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
-    backup_file(path)
-    out = df.copy()
-    if columns is not None:
-        for column in columns:
-            if column not in out:
-                out[column] = pd.NA
-        out = out[columns]
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    out.to_csv(tmp_path, index=False, encoding="utf-8-sig")
-    tmp_path.replace(path)
+    with file_write_lock(path):
+        backup_file(path)
+        out = df.copy()
+        if columns is not None:
+            for column in columns:
+                if column not in out:
+                    out[column] = pd.NA
+            out = out[columns]
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        out.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        tmp_path.replace(path)
+
+
+def safe_write_text(path: Path, content: str, *, backup: bool = True) -> None:
+    ensure_storage_dirs()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_write_lock(path):
+        if backup:
+            backup_file(path)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(path)
 
 
 def load_quote_snapshot() -> pd.DataFrame:
@@ -119,7 +153,4 @@ def load_last_refresh() -> dict[str, object]:
 
 
 def save_last_refresh(info: dict[str, object]) -> None:
-    ensure_storage_dirs()
-    tmp_path = LAST_REFRESH_FILE.with_name(f".{LAST_REFRESH_FILE.name}.tmp")
-    tmp_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(LAST_REFRESH_FILE)
+    safe_write_text(LAST_REFRESH_FILE, json.dumps(info, ensure_ascii=False, indent=2), backup=False)

@@ -577,7 +577,7 @@ def save_history_cache(history: pd.DataFrame) -> int:
     for code, group in history.groupby("代码"):
         if not code:
             continue
-        group.to_csv(history_dir / f"{code}.csv", index=False, encoding="utf-8-sig")
+        safe_write_csv(group, history_dir / f"{code}.csv")
         count += 1
     return count
 

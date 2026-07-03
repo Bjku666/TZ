@@ -8,10 +8,11 @@ from typing import Any
 from src.data import DATA_DIR
 
 from backend.services.portfolio_service import portfolio_snapshot
+from backend.services.risk_service import market_risk_snapshot, sector_summary
 from backend.services.trade_service import list_trades
 from backend.services.watchlist_service import list_watchlist
-from backend.storage.backup import backup_before_write
 from backend.storage.sqlite_store import register_report
+from src.storage import safe_write_text
 
 REPORT_ROOT = DATA_DIR / "reports"
 
@@ -24,11 +25,7 @@ def _report_dir(report_type: str) -> Path:
 
 
 def _safe_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    backup_before_write(path)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    safe_write_text(path, content)
 
 
 def _today() -> str:
@@ -163,7 +160,7 @@ def today_review(mode: str | None = None) -> dict[str, Any]:
     today = _today()
     trades = list_trades(mode)["list"]
     today_trades = [trade for trade in trades if str(trade.get("date")) == today]
-    portfolio = portfolio_snapshot(mode)
+    portfolio = portfolio_snapshot(mode, persist_risk_state=True)
     return {
         "date": today,
         "todayTrades": today_trades,
@@ -282,7 +279,7 @@ def report_markdown(report: dict[str, Any]) -> str:
         f"- 热点板块: {_clean_text(sector.get('hotSectors'))}",
         f"- 资金流与题材备注: {_clean_text(sector.get('etfFlowNotes'))}",
         "",
-        "## 四、全市场三步扫描",
+        "## 四、当前初筛池三步复查",
     ]
 
     for step_key, fallback_title in [
@@ -385,25 +382,12 @@ def list_reports(report_type: str = "daily") -> dict[str, Any]:
 def context(mode: str | None = None) -> dict[str, Any]:
     trades = list_trades(mode)["list"]
     watchlist = list_watchlist()["list"]
-    portfolio = portfolio_snapshot(mode)
+    portfolio = portfolio_snapshot(mode, persist_risk_state=True)
     today = _today()
     today_trades = [trade for trade in trades if str(trade.get("date")) == today]
 
-    total = len(watchlist)
-    up = len([stock for stock in watchlist if float(stock.get("pct") or 0) > 0])
-    down = len([stock for stock in watchlist if float(stock.get("pct") or 0) < 0])
-    above_ma5 = len(
-        [
-            stock
-            for stock in watchlist
-            if float(stock.get("ma5") or 0) > 0 and float(stock.get("price") or 0) > float(stock.get("ma5") or 0)
-        ]
-    )
-    rise_ratio = round(up / total * 100) if total else 0
-    above_ratio = round(above_ma5 / total * 100) if total else 0
-    bullish = round((rise_ratio + above_ratio) / 2) if total else 0
-
-    sectors = _sector_summary(watchlist)
+    market_snapshot = market_risk_snapshot(watchlist)
+    sectors = sector_summary(watchlist)
     holding_deviation = [
         {
             "code": pos.get("code"),
@@ -428,19 +412,7 @@ def context(mode: str | None = None) -> dict[str, Any]:
     return {
         "todayTrades": today_trades,
         "currentPositions": portfolio["positions"],
-        "marketSnapshot": {
-            "totalStocks": total,
-            "upStocks": up,
-            "downStocks": down,
-            "riseRatio": rise_ratio,
-            "aboveMA5Count": above_ma5,
-            "aboveMA5Ratio": above_ratio,
-            "bullishIndex": bullish,
-            "marketStrength": "强" if bullish > 60 else "弱" if bullish < 40 else "中",
-            "trendStrength": "strong" if bullish > 60 else "weak" if bullish < 40 else "neutral",
-            "riseCount": up,
-            "fallCount": down,
-        },
+        "marketSnapshot": market_snapshot,
         "sectors": sectors,
         "holdingDeviation": holding_deviation,
         "stockLinks": _stock_links(trades, portfolio["positions"], today),

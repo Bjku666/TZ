@@ -26,6 +26,7 @@ from src.realtime import (
 from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
 from src.storage import load_quote_snapshot, save_quote_snapshot
 
+from backend.services.risk_service import annotate_watchlist_risk
 from backend.services.settings_service import account_mode_name, get_settings, initial_cash
 from backend.storage.csv_adapter import (
     FRONTEND_GROUP_TO_STAGE,
@@ -34,6 +35,10 @@ from backend.storage.csv_adapter import (
 )
 
 PINNED_GROUPS = {"观察", "待买", "持仓"}
+
+
+def _watchlist_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    return annotate_watchlist_risk(watchlist_to_api(frame))
 
 
 def _empty_watchlist() -> pd.DataFrame:
@@ -106,7 +111,7 @@ def recompute_watchlist(frame: pd.DataFrame, cash: float | None = None) -> pd.Da
 
 def list_watchlist() -> dict[str, Any]:
     frame = recompute_watchlist(load_watchlist())
-    return {"list": watchlist_to_api(frame)}
+    return {"list": _watchlist_api(frame)}
 
 
 def generate_watchlist() -> dict[str, Any]:
@@ -119,7 +124,7 @@ def generate_watchlist() -> dict[str, Any]:
         return {
             "success": False,
             "message": pool.attrs.get("message", "行情源未返回股票池，保留本地缓存"),
-            "list": watchlist_to_api(cached),
+            "list": _watchlist_api(cached),
         }
 
     existing = load_watchlist()
@@ -146,7 +151,7 @@ def generate_watchlist() -> dict[str, Any]:
     return {
         "success": True,
         "message": f"已生成并锁定今日初筛池 {len(frame)} 只，批次 {batch_id}",
-        "list": watchlist_to_api(frame),
+        "list": _watchlist_api(frame),
     }
 
 
@@ -180,7 +185,7 @@ def import_watchlist_file(content: bytes, filename: str, fetch_history: bool = F
             "message": refresh_result.get("message", ""),
         },
         "history": history_result,
-        "list": watchlist_to_api(frame),
+        "list": _watchlist_api(frame),
     }
 
 
@@ -199,7 +204,7 @@ def refresh_quotes() -> dict[str, Any]:
             quotes = cached
             message = message or "行情源失败，已使用最近缓存"
         else:
-            return {"success": False, "message": message or "行情刷新失败，且没有可用缓存", "list": watchlist_to_api(frame)}
+            return {"success": False, "message": message or "行情刷新失败，且没有可用缓存", "list": _watchlist_api(frame)}
     else:
         save_quote_snapshot(
             quotes,
@@ -211,7 +216,7 @@ def refresh_quotes() -> dict[str, Any]:
     merged = merge_quotes_into_watchlist(frame, quotes)
     merged = recompute_watchlist(merged)
     save_watchlist(merged)
-    return {"success": True, "message": message, "list": watchlist_to_api(merged)}
+    return {"success": True, "message": message, "list": _watchlist_api(merged)}
 
 
 def scan_turnover_changes() -> dict[str, Any]:
@@ -225,7 +230,7 @@ def scan_turnover_changes() -> dict[str, Any]:
             "success": False,
             "message": live_pool.attrs.get("message", "行情源未返回实时成交额前30"),
             "changes": {"newEntries": [], "dropped": [], "rankUp": [], "rankDown": []},
-            "list": watchlist_to_api(frame),
+            "list": _watchlist_api(frame),
         }
 
     current_codes = {clean_code(value) for value in frame.get("代码", pd.Series(dtype=str)).dropna().astype(str)}
@@ -300,7 +305,7 @@ def scan_turnover_changes() -> dict[str, Any]:
             f"排名上升 {len(rank_up)} 只，排名下降 {len(rank_down)} 只。当前初筛池未被替换。"
         ),
         "changes": changes,
-        "list": watchlist_to_api(frame),
+        "list": _watchlist_api(frame),
     }
 
 
@@ -373,7 +378,7 @@ def include_turnover_stock(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "success": True,
         "message": f"已手动纳入今日初筛池：{code}",
-        "list": watchlist_to_api(frame),
+        "list": _watchlist_api(frame),
     }
 
 
@@ -424,7 +429,7 @@ def fetch_history_for_watchlist(code: str | None = None, fetch_all: bool = False
 
     updated = recompute_watchlist(frame)
     save_watchlist(updated)
-    summary["list"] = watchlist_to_api(updated)
+    summary["list"] = _watchlist_api(updated)
     return summary
 
 
@@ -464,4 +469,4 @@ def update_stock(payload: dict[str, Any]) -> dict[str, Any]:
 
     frame = ensure_watchlist_frame(frame)
     save_watchlist(frame)
-    return {"success": True, "stock": watchlist_to_api(frame.iloc[[index]])[0]}
+    return {"success": True, "stock": _watchlist_api(frame.iloc[[index]])[0]}

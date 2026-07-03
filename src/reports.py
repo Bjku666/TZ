@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.data import DATA_DIR
+from src.storage import safe_write_text
 
 REPORT_ROOT = DATA_DIR / "reports"
 
@@ -32,7 +33,7 @@ def load_report_note(report_type: str, key: str) -> str:
 
 def save_report_note(report_type: str, key: str, content: str) -> Path:
     path = report_path(report_type, key)
-    path.write_text(content, encoding="utf-8")
+    safe_write_text(path, content)
     return path
 
 

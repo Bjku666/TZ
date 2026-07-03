@@ -41,6 +41,11 @@ export interface Stock {
   bigCandlePct: number; // 最近20日内最大阳线涨幅 (%)
   ma5Upward: boolean;   // 5日线是否向上，仅作参考
   canBuy: boolean;      // 是否满足待买观察条件 (MA5偏离率0%-2.5%、资金与风险约束通过)
+  marketTradeAllowed?: boolean;
+  marketRisk?: boolean;
+  marketRiskReasons?: string[];
+  sectorName?: string;
+  sectorWeak?: boolean;
   lotCost?: number;
   stopPrice?: number;
   riskAmount?: number;
@@ -110,6 +115,10 @@ export interface TradeRuleSnapshot {
   inTradingTime: boolean;
   inBuyWindow?: boolean;
   marketRisk?: boolean;
+  marketRiskSource?: string;
+  marketRiskReasons?: string[];
+  marketSnapshot?: Record<string, unknown>;
+  sectorSnapshot?: Record<string, unknown>;
   stopPrice?: number;
   riskAmount?: number;
   maxRiskAmount?: number;
@@ -224,6 +233,9 @@ export interface ReviewReport {
     buyCount: number;
     sellCount: number;
     ruleComplianceRate: number;
+    buyComplianceRate?: number;
+    sellComplianceRate?: number;
+    tradeComplianceRate?: number;
     realizedPnL: number;
     portfolioRisk: string;
   };

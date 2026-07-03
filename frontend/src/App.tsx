@@ -899,14 +899,14 @@ export default function App() {
 
   const handleManualScreening = () => {
     setIsScreening(true);
-    logAction("⏳ 正在重新执行全市场三步扫描...");
+    logAction("⏳ 正在复查当前成交额前30初筛池...");
     window.setTimeout(() => {
       const result = performAutoScreening(watchlist);
       setTop200Reviewed(true);
       setVolRatioReviewed(true);
       setLimitUpReviewed(true);
       setIsScreening(false);
-      logAction(`✅ 全市场三步扫描完成：步骤1 ${result.step1Count} 只，步骤2 ${result.step2Count} 只，步骤3 ${result.step3Count} 只。`);
+      logAction(`✅ 当前初筛池三步复查完成：步骤1 ${result.step1Count} 只，步骤2 ${result.step2Count} 只，步骤3 ${result.step3Count} 只。`);
     }, 300);
   };
 
@@ -1427,7 +1427,8 @@ export default function App() {
           reason: tradeReason,
           remark: tradeRemark,
           mode: currentMode,
-          systemicRisk
+          systemicRisk,
+          marketRisk: tradeTarget.marketTradeAllowed === false || tradeTarget.marketRisk === true
         })
       });
 
@@ -1770,11 +1771,12 @@ export default function App() {
   const activeTradePosition = tradeTarget ? positions.find(pos => pos.code === tradeTarget.code) : null;
   const activeAvailableQuantity = activeTradePosition ? Math.max(0, Math.floor(Number(activeTradePosition.availableQuantity) || 0)) : 0;
   const currentInBuyWindow = isAllowedBuyWindow(currentTime);
+  const activeMarketRisk = systemicRisk || tradeTarget?.marketTradeAllowed === false || tradeTarget?.marketRisk === true;
   const tradeDeviationAtPrice = tradeTarget?.ma5 ? ((tradePrice - tradeTarget.ma5) / tradeTarget.ma5) * 100 : Number.NaN;
   const buyFormHasHardRisk = tradeType === "BUY" && (
     !tradeTarget?.canBuy ||
     !currentInBuyWindow ||
-    systemicRisk ||
+    activeMarketRisk ||
     tradeQuantity < 100 ||
     accountState.availableCash < tradePrice * 100 ||
     tradeDeviationAtPrice < 0 ||
@@ -2282,7 +2284,7 @@ export default function App() {
         </div>
         <button
           onClick={() => openBuyModal(stock)}
-          disabled={!stock.canBuy || !currentInBuyWindow || systemicRisk}
+          disabled={!stock.canBuy || !currentInBuyWindow || systemicRisk || stock.marketTradeAllowed === false || stock.marketRisk === true}
           className="shrink-0 rounded bg-rose-600 px-3 py-1.5 text-xs font-black text-white shadow-sm transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500"
         >
           盘中确认
@@ -3619,7 +3621,7 @@ export default function App() {
                                     {watchlistGroup === "待买" && (
                                       <button
                                         onClick={() => openBuyModal(s)}
-                                        disabled={!s.canBuy || !currentInBuyWindow || systemicRisk}
+                                        disabled={!s.canBuy || !currentInBuyWindow || systemicRisk || s.marketTradeAllowed === false || s.marketRisk === true}
                                         className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold text-[10px] rounded"
                                       >
                                         盘中确认
@@ -4456,7 +4458,7 @@ export default function App() {
                     <div className="border-b border-slate-800 pb-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                       <div>
                         <h3 className="text-xs font-black text-cyan-400 uppercase tracking-widest">
-                          全市场三步扫描
+                          当前初筛池三步复查
                         </h3>
                         <CardText className="text-[11px] text-slate-400 mt-1">步骤1-3保留完整扫描结果，只有点击“加入自我诊断”的股票才会进入步骤4。</CardText>
                       </div>
@@ -4467,7 +4469,7 @@ export default function App() {
                         className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-bold text-[11px] rounded shadow transition flex items-center justify-center gap-1.5 shrink-0"
                       >
                         <RefreshCw className={`h-3.5 w-3.5 ${isScreening ? "animate-spin" : ""}`} />
-                        <span>{isScreening ? "正在扫描..." : "重新运行三步扫描"}</span>
+                        <span>{isScreening ? "正在复查..." : "重新复查初筛池"}</span>
                       </button>
                     </div>
 

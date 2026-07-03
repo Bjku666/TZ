@@ -10,6 +10,7 @@ import pandas as pd
 from src.data import HOLDING_COLUMNS
 from src.history import load_cached_history
 from src.rules import clean_code, holding_advice, ma5_deviation
+from src.storage import safe_write_text
 
 ROOT = Path(__file__).resolve().parents[1]
 BELOW_MA5_STATE_FILE = ROOT / "data" / "runtime" / "below_ma5_state.json"
@@ -84,15 +85,65 @@ def _save_below_ma5_state(state: dict[str, dict[str, Any]], active_codes: set[st
         for code, value in state.items()
         if code in active_codes and int(number_or(value.get("below_ma5_days"), 0)) > 0
     }
-    tmp = BELOW_MA5_STATE_FILE.with_name(f".{BELOW_MA5_STATE_FILE.name}.tmp")
-    tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(BELOW_MA5_STATE_FILE)
+    safe_write_text(BELOW_MA5_STATE_FILE, json.dumps(cleaned, ensure_ascii=False, indent=2), backup=False)
+
+
+def _below_ma5_days_from_history(
+    code: str,
+    current_price: float,
+    current_ma5: Any,
+    today: pd.Timestamp,
+) -> int | None:
+    history = load_cached_history(code)
+    if history is None or history.empty or "收盘" not in history:
+        return None
+
+    out = history.copy()
+    last_history_date: date | None = None
+    if "日期" in out:
+        out["日期"] = pd.to_datetime(out["日期"], errors="coerce")
+        out = out.dropna(subset=["日期"]).sort_values("日期")
+        if not out.empty:
+            last_history_date = out.iloc[-1]["日期"].date()
+    close = pd.to_numeric(out.get("收盘"), errors="coerce")
+    ma5 = pd.to_numeric(out.get("MA5"), errors="coerce") if "MA5" in out else close.rolling(5).mean()
+    valid = pd.DataFrame({"close": close, "ma5": ma5}).dropna()
+    if valid.empty:
+        return None
+
+    current_ma5_f = pd.to_numeric(current_ma5, errors="coerce")
+    should_append_snapshot = (
+        last_history_date is not None
+        and last_history_date < today.date()
+        and today.weekday() < 5
+    )
+    if should_append_snapshot and pd.notna(current_ma5_f) and current_price > 0 and float(current_price) < float(current_ma5_f):
+        if current_price != float(valid.iloc[-1]["close"]):
+            valid = pd.concat(
+                [
+                    valid,
+                    pd.DataFrame(
+                        [{"close": float(current_price), "ma5": float(current_ma5_f)}],
+                        index=[len(valid)],
+                    ),
+                ]
+            )
+
+    days = 0
+    for _, row in valid.iloc[::-1].iterrows():
+        if float(row["close"]) < float(row["ma5"]):
+            days += 1
+            continue
+        break
+    return days
 
 
 def _below_ma5_days_for_snapshot(
     code: str,
     deviation: float | None,
     context_days: Any,
+    current_price: float,
+    ma5: Any,
     today: pd.Timestamp,
     state: dict[str, dict[str, Any]],
     persist: bool,
@@ -100,6 +151,29 @@ def _below_ma5_days_for_snapshot(
     context_count = int(number_or(context_days, 0))
     if deviation is None:
         return context_count
+    if deviation >= 0:
+        if persist:
+            today_text = today.date().isoformat()
+            state[code] = {
+                "below_ma5_start_date": None,
+                "below_ma5_days": 0,
+                "last_check_date": today_text,
+                "source": "snapshot",
+            }
+        return 0
+
+    history_count = _below_ma5_days_from_history(code, current_price, ma5, today)
+    if history_count is not None:
+        if persist:
+            today_text = today.date().isoformat()
+            state[code] = {
+                "below_ma5_start_date": today_text if history_count > 0 else None,
+                "below_ma5_days": int(history_count),
+                "last_check_date": today_text,
+                "source": "history",
+            }
+        return int(history_count)
+
     if not persist:
         return max(1, context_count) if deviation < 0 else 0
 
@@ -323,6 +397,8 @@ def build_positions_from_trades(
             code,
             deviation,
             context.get("跌破MA5天数"),
+            current_price,
+            ma5,
             today,
             below_ma5_state,
             persist_below_ma5_state,

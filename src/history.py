@@ -19,6 +19,7 @@ from src.trading_rules_config import (
 
 from src.data import ROOT, DATA_DIR, clean_code
 from src.rules import recent_big_candle_pct
+from src.storage import safe_write_csv
 
 HISTORY_DIR = DATA_DIR / "history"
 EASTMONEY_HISTORY_HOSTS = [
@@ -454,7 +455,7 @@ def save_history_cache(df: pd.DataFrame) -> int:
         if not code or not clean_code(str(code)):
             continue
         path = history_cache_path(str(code))
-        group.to_csv(path, index=False, encoding="utf-8-sig")
+        safe_write_csv(group, path)
         count += 1
     return count
 

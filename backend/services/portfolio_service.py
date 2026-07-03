@@ -274,7 +274,11 @@ def _position_trade_link(code: str, grouped_trades: dict[str, list[dict[str, Any
     }
 
 
-def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> dict[str, Any]:
+def portfolio_snapshot(
+    mode: str | None = None,
+    sync_legacy: bool = False,
+    persist_risk_state: bool = False,
+) -> dict[str, Any]:
     account_mode = account_mode_name(mode)
     trades = filter_trades_by_account_mode(load_trades(), account_mode)
     watchlist = load_watchlist()
@@ -283,7 +287,7 @@ def portfolio_snapshot(mode: str | None = None, sync_legacy: bool = False) -> di
         trades,
         watchlist,
         legacy_holdings,
-        persist_below_ma5_state=sync_legacy,
+        persist_below_ma5_state=sync_legacy or persist_risk_state,
     )
     if sync_legacy:
         save_holdings(portfolio_to_legacy_holdings(positions))

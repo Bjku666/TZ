@@ -30,6 +30,7 @@ from src.trading_rules_config import (
 )
 
 from backend.services.portfolio_service import portfolio_snapshot
+from backend.services.risk_service import market_trade_filter
 from backend.services.settings_service import account_mode_name, initial_cash, trade_fee_settings
 from backend.storage import sqlite_store
 from backend.storage.csv_adapter import (
@@ -92,6 +93,7 @@ def _audit_buy(
     estimated_sell_fee: float,
     now: datetime,
     market_risk: bool = False,
+    market_risk_reasons: list[str] | None = None,
 ) -> tuple[str, list[str], dict[str, Any]]:
     tags: list[str] = []
     passed, reason = screening_result(code, name)
@@ -100,7 +102,8 @@ def _audit_buy(
     if not is_allowed_buy_window(now):
         tags.append("不在允许买入时间窗口")
     if market_risk:
-        tags.append("大盘或板块弱，不允许开新仓")
+        reason_text = "、".join(market_risk_reasons or []) or "大盘或板块弱"
+        tags.append(f"{reason_text}，不允许开新仓")
     risk_context: dict[str, Any] = {
         "stopPrice": 0,
         "riskAmount": 0,
@@ -175,11 +178,18 @@ def _audit_sell(position: dict[str, Any] | None, quantity: float, reason: str, a
     hit_max_loss = account_initial_cash > 0 and current_loss_amount >= account_initial_cash * MAX_SINGLE_TRADE_RISK_PCT
     hit_next_day = hold_days <= 1 and any(key in reason_text for key in ["次日", "10点", "10:00", "不强", "冲高", "退出"])
 
-    if ma5 <= 0:
+    allowed_trigger = (
+        hit_ma5_risk
+        or hit_clear
+        or hit_take_profit_watch
+        or hit_take_profit_priority
+        or hit_max_loss
+        or hit_next_day
+    )
+
+    if ma5 <= 0 and not hit_max_loss:
         tags.append("缺少MA5卖出依据")
-    if hit_max_loss:
-        tags.append("单笔最大亏损风控")
-    if not (hit_ma5_risk or hit_clear or hit_take_profit_watch or hit_take_profit_priority or hit_max_loss or hit_next_day):
+    if not allowed_trigger:
         tags.append("未触发卖出纪律")
 
     if not tags:
@@ -222,7 +232,7 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
         raise ValueError("交易参数不完整")
 
     active_mode = mode or payload.get("mode")
-    portfolio = portfolio_snapshot(active_mode)
+    portfolio = portfolio_snapshot(active_mode, persist_risk_state=True)
     account_state = portfolio["accountState"]
     positions = {item["code"]: item for item in portfolio["positions"]}
     fees = calculate_trade_fees(side, price, quantity, trade_fee_settings(active_mode))
@@ -242,7 +252,12 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
     trade_date = str(payload.get("date") or now.date().isoformat())
     trade_time = str(payload.get("time") or now.strftime("%H:%M:%S"))
     stock = _current_stock(code)
-    market_risk = bool(payload.get("systemicRisk") or payload.get("marketRisk"))
+    market_filter = market_trade_filter(code)
+    manual_market_risk = bool(payload.get("systemicRisk") or payload.get("marketRisk"))
+    market_risk = manual_market_risk or bool(market_filter.get("marketRisk"))
+    market_reasons = list(market_filter.get("reasons") or [])
+    if manual_market_risk and not market_reasons:
+        market_reasons = ["手动确认系统性风险"]
     account_initial_cash = initial_cash(active_mode)
     estimated_sell_fee = calculate_trade_fees("卖出", price, quantity, trade_fee_settings(active_mode))["total_fee"]
     buy_risk_context: dict[str, Any] = {}
@@ -257,6 +272,10 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
         "inTradingTime": is_a_share_trading_time(now),
         "inBuyWindow": is_allowed_buy_window(now),
         "marketRisk": market_risk,
+        "marketRiskSource": "manual+auto" if manual_market_risk and market_filter.get("marketRisk") else "manual" if manual_market_risk else "auto",
+        "marketRiskReasons": market_reasons,
+        "marketSnapshot": market_filter.get("marketSnapshot", {}),
+        "sectorSnapshot": market_filter.get("sectorSnapshot", {}),
         "buyWindow": "09:35-10:00 / 14:30-14:55",
         "riskLimitPct": MAX_SINGLE_TRADE_RISK_PCT * 100,
         "positionBeforeTrade": _position_snapshot(position),
@@ -273,6 +292,7 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
             estimated_sell_fee,
             now,
             market_risk=market_risk,
+            market_risk_reasons=market_reasons,
         )
         snapshot.update(buy_risk_context)
     else:

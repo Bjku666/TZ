@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.data import ROOT, clean_code
+from src.storage import safe_write_csv
 
 DATA_DIR = ROOT / "data"
 ACCOUNT_FILE = DATA_DIR / "account_snapshots.csv"
@@ -156,7 +157,7 @@ def load_account_snapshots() -> pd.DataFrame:
 
 def save_account_snapshots(frame: pd.DataFrame) -> None:
     ACCOUNT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    frame[ACCOUNT_COLUMNS].to_csv(ACCOUNT_FILE, index=False, encoding="utf-8-sig")
+    safe_write_csv(frame[ACCOUNT_COLUMNS], ACCOUNT_FILE, columns=ACCOUNT_COLUMNS)
 
 
 def append_account_snapshots(frame: pd.DataFrame) -> None:
@@ -222,7 +223,7 @@ def normalize_positions(raw: pd.DataFrame, account_mode: str) -> pd.DataFrame:
 
 def save_positions_snapshot(frame: pd.DataFrame) -> None:
     POSITION_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    frame[POSITION_COLUMNS].to_csv(POSITION_SNAPSHOT_FILE, index=False, encoding="utf-8-sig")
+    safe_write_csv(frame[POSITION_COLUMNS], POSITION_SNAPSHOT_FILE, columns=POSITION_COLUMNS)
 
 
 def load_positions_snapshot(account_mode: str | None = None) -> pd.DataFrame:
@@ -254,4 +255,4 @@ def normalize_trade_flow(raw: pd.DataFrame, account_mode: str) -> pd.DataFrame:
 
 def save_trade_flow(frame: pd.DataFrame) -> None:
     TRADE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    frame[TRADE_FLOW_COLUMNS].to_csv(TRADE_LOG_FILE, index=False, encoding="utf-8-sig")
+    safe_write_csv(frame[TRADE_FLOW_COLUMNS], TRADE_LOG_FILE, columns=TRADE_FLOW_COLUMNS)

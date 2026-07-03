@@ -11,10 +11,9 @@ router = APIRouter(prefix="/api", tags=["portfolio"])
 
 @router.get("/portfolio")
 def get_portfolio(mode: str | None = Query(default=None)) -> dict[str, Any]:
-    return portfolio_snapshot(mode)
+    return portfolio_snapshot(mode, persist_risk_state=True)
 
 
 @router.get("/account")
 def get_account(mode: str | None = Query(default=None)) -> dict[str, Any]:
-    return portfolio_snapshot(mode)["accountState"]
-
+    return portfolio_snapshot(mode, persist_risk_state=True)["accountState"]

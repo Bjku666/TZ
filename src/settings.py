@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from src.storage import safe_write_text
+
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_FILE = ROOT / "data" / "settings.json"
 
@@ -119,7 +121,4 @@ def load_settings() -> dict[str, Any]:
 def save_settings(settings: dict[str, Any]) -> None:
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     normalized = normalize_settings(settings)
-    SETTINGS_FILE.write_text(
-        json.dumps(normalized, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    safe_write_text(SETTINGS_FILE, json.dumps(normalized, ensure_ascii=False, indent=2))
