@@ -1,8 +1,17 @@
-# 强势回踩系统
+# 强势回踩短线交易纪律系统
 
 主板强势股 5 日线回踩纪律工作台。
 
+当前版本：`v2.1 Discipline Desk`
+
 系统定位：本地交易纪律与复盘工具。不连接券商，不自动下单，不构成投资建议。
+
+## 本版更新
+
+- 参考前端版重做视觉风格：深色纪律导航、浅色工作区、紧凑卡片、青蓝动作色和红绿交易语义。
+- 今日看板增加纪律概览条，集中展示待买确认、缺K线、风险持仓和未复盘交易。
+- 侧栏增加事件流，记录刷新、股票池分析和交易流水保存等关键动作。
+- 股票分组页增加代码/名称搜索，便于快速定位股票。
 
 ## 系统功能
 
@@ -54,8 +63,8 @@ ST / *ST
 
 1. 在「持仓监控」检查 MA5 风控提醒。
 2. 在「资产看板」查看资产和风险暴露。
-3. 在「交易复盘」查看规则审计。
-4. 在「报告中心」填写日报。
+3. 在「复盘报告」查看规则审计。
+4. 在「复盘报告」填写日报。
 
 周末：
 
@@ -114,7 +123,7 @@ data/trades/trade_log.csv
 
 ## 报告生成
 
-报告中心支持：
+复盘报告支持：
 
 - 日报：`data/reports/daily/`
 - 周报：`data/reports/weekly/`
@@ -123,6 +132,42 @@ data/trades/trade_log.csv
 当日没有买入卖出时，不生成交易分析，但仍可记录观察和心得。
 
 ## 启动方式
+
+### 新本地前后端工作台
+
+后端为本地 Python/FastAPI，前端为 `frontend/` 下的 React/Vite UI。核心交易、持仓、行情缓存、复盘和落盘都由 Python 后端负责。
+
+安装或更新 Python 依赖：
+
+```bash
+cd /Users/lulu/Desktop/touzi
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+启动 Python API：
+
+```bash
+cd /Users/lulu/Desktop/touzi
+export PYTHONPATH=/Users/lulu/Desktop/touzi
+.venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+启动 React 前端：
+
+```bash
+cd /Users/lulu/Desktop/touzi/frontend
+npm install
+npm run dev
+```
+
+访问：
+
+```text
+API: http://127.0.0.1:8000/api/health
+Web: http://127.0.0.1:5173
+```
+
+### 旧 Streamlit 版本
 
 在 Finder 中打开 `/Users/lulu/Desktop/touzi`，双击：
 

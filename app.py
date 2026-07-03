@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, time
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -39,6 +40,7 @@ from src.account import (
     save_trade_flow,
 )
 from src.rules import (
+    OBSERVATION_STAGES,
     PIPELINE_STAGES,
     evaluate_stock,
     holding_advice,
@@ -77,8 +79,11 @@ from src.reports import load_report_note, report_markdown, save_report_note
 from src.settings import load_settings, save_settings
 from src.ui_style import page_css, money_display, percent_display
 
+APP_NAME = "强势回踩短线交易纪律系统"
+APP_VERSION = "v2.1 Discipline Desk"
+
 st.set_page_config(
-    page_title="强势回踩系统",
+    page_title=APP_NAME,
     page_icon=":material/show_chart:",
     layout="wide",
     initial_sidebar_state="auto",
@@ -190,21 +195,92 @@ def account_summary(
 
 def page_header(title: str, subtitle: str) -> None:
     st.markdown(
-        '<div class="eyebrow">STRONG PULLBACK · DISCIPLINE DESK</div>',
+        f'<div class="eyebrow">STRONG PULLBACK · DISCIPLINE DESK'
+        f'<span class="version-badge">{APP_VERSION}</span></div>',
         unsafe_allow_html=True,
     )
     st.title(title)
     st.markdown(f'<div class="page-goal">本页目标：{subtitle}</div>', unsafe_allow_html=True)
 
 
-def render_trading_mode_panel() -> None:
+def log_activity(message: str) -> None:
+    """Add a compact event to the sidebar activity stream."""
+    timestamp = china_now().strftime("%H:%M:%S")
+    entries = list(st.session_state.get("activity_log", []))
+    st.session_state.activity_log = [f"{timestamp}｜{message}", *entries][:8]
+
+
+def render_activity_log() -> None:
+    logs = list(st.session_state.get("activity_log", []))
+    if logs:
+        items = "".join(f"<li>{escape(str(log))}</li>" for log in logs[:6])
+    else:
+        items = '<li class="empty">暂无系统事件</li>'
+    st.markdown(
+        f"""
+        <div class="activity-log">
+          <div class="activity-title">事件流</div>
+          <ul>{items}</ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def filter_stock_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    query = str(query or "").strip()
+    if df.empty or not query:
+        return df
+    mask = pd.Series(False, index=df.index)
+    for column in ["代码", "名称"]:
+        if column in df:
+            mask = mask | df[column].astype(str).str.contains(
+                query,
+                case=False,
+                na=False,
+                regex=False,
+            )
+    return df[mask].copy()
+
+
+def render_dashboard_brief(
+    today_key: str,
+    quote_status: str,
+    funds_source: str,
+    today_buy_watch: int,
+    missing_history: int,
+    risk_holding_count: int,
+    unreviewed_trades: int,
+) -> None:
+    risk_class = "brief-metric risk" if risk_holding_count else "brief-metric"
+    st.markdown(
+        f"""
+        <section class="dashboard-brief">
+          <div>
+            <div class="brief-kicker">TODAY DISCIPLINE · {escape(today_key)}</div>
+            <h2>只处理待补数据、待买确认、持仓风险和复盘归档。</h2>
+            <p>{escape(quote_status)} · {escape(funds_source)} · 交易动作仍以手动确认为准。</p>
+          </div>
+          <div class="brief-metrics">
+            <div class="brief-metric hot"><strong>{today_buy_watch}</strong><span>待买确认</span></div>
+            <div class="brief-metric"><strong>{missing_history}</strong><span>缺K线</span></div>
+            <div class="{risk_class}"><strong>{risk_holding_count}</strong><span>风险持仓</span></div>
+            <div class="brief-metric"><strong>{unreviewed_trades}</strong><span>未复盘交易</span></div>
+          </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_trading_mode_panel(available_cash_value: float) -> None:
     st.markdown(
         f"""
         <section class="mode-panel">
           <div>
-            <div class="mode-kicker">当前交易模式</div>
+            <div class="mode-kicker">Active Playbook</div>
             <h3>主板成交额前排强势股的 5 日线回踩低吸模式</h3>
-            <p>强势先入观察，贴近 5 日线才进待买；本金不足可以提示，但确认买入时必须拦截。</p>
+            <p>只在强势确认后等待 MA5 附近回踩；进入待买也必须经过资金、时间和风控校验。</p>
           </div>
           <div class="mode-grid">
             <div class="mode-item">
@@ -215,12 +291,12 @@ def render_trading_mode_panel() -> None:
             <div class="mode-item">
               <span>强势确认</span>
               <b>近 10-20 日有 ≥5% 阳线</b>
-              <small>同时看 MA5 向上、股价在 MA5 上方、成交额前排。</small>
+              <small>最近 20 个交易日内出现过单日涨幅 ≥5% 且收盘高于开盘的阳线。</small>
             </div>
             <div class="mode-item">
               <span>买点区间</span>
               <b>距 MA5 0%-2%</b>
-              <small>2%-5%继续观察，5%-7%偏高，>7%远离不追，<0%跌破不买。</small>
+              <small>0%-2%接近买点，2%-7%等回踩，>7%远离不追，<0%风险排除。</small>
             </div>
             <div class="mode-item">
               <span>买入时间</span>
@@ -229,8 +305,8 @@ def render_trading_mode_panel() -> None:
             </div>
             <div class="mode-item">
               <span>资金约束</span>
-              <b>当前本金 {money_display(available_cash)}</b>
-              <small>一手金额 = 当前价 x 100；待买阶段标注资金状态，确认买入时校验现金。</small>
+              <b>当前可用 {money_display(available_cash_value)}</b>
+              <small>一手金额 = 当前价 x 100；资金不参与漏斗分层，只在交易记录时校验现金。</small>
             </div>
             <div class="mode-item">
               <span>卖出纪律</span>
@@ -351,6 +427,7 @@ def trigger_global_refresh() -> None:
     st.session_state.manual_quote_refresh = int(st.session_state.get("manual_quote_refresh", 0)) + 1
     st.session_state.force_quote_refresh = True
     st.session_state.reminder_computed = False
+    log_activity("手动刷新行情并重新计算规则")
     st.cache_data.clear()
     st.rerun()
 
@@ -438,8 +515,6 @@ def audit_trades_against_rules(trades: pd.DataFrame) -> pd.DataFrame:
             else:
                 if pd.isna(max_big_line) or float(max_big_line) < 5:
                     issues.append("买入前近20日缺少5%强势阳线")
-                if not bool(context.get("MA5向上", False)):
-                    issues.append("买入时MA5未向上")
                 if deviation is None or pd.isna(deviation):
                     issues.append("无法计算买入价与MA5偏离")
                 elif float(deviation) < 0:
@@ -759,9 +834,10 @@ def count_risk_positions(positions: pd.DataFrame) -> int:
 
 
 def observation_result(row: pd.Series) -> tuple[bool, str]:
-    deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
     has_history = pd.notna(row.get("MA5"))
     has_big_line = number_or(row.get("最近大阳线%"), 0) >= 5
+    ma5_up = is_truthy(row.get("MA5向上"))
+    deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
     passed, reason = screening_result(str(row.get("代码", "")), str(row.get("名称", "")))
     if not passed:
         return False, reason
@@ -769,27 +845,27 @@ def observation_result(row: pd.Series) -> tuple[bool, str]:
         return False, "缺少历史K线，待补充"
     if not has_big_line:
         return False, "缺少5%阳线启动信号"
+    if not ma5_up:
+        return False, "MA5未向上"
     if deviation is None:
         return False, "无法计算MA5偏离率"
-    return True, "进入观察池，盘中等待贴近MA5"
+    if deviation < 0:
+        return False, "当前价在MA5下方"
+    return True, "近20日有5%阳线启动信号"
 
 
 def capital_result(row: pd.Series) -> tuple[bool, str]:
     deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
     ma5_up = is_truthy(row.get("MA5向上"))
     if not ma5_up:
-        return False, "观察中：MA5未向上"
+        return False, "MA5未向上"
     if deviation is None:
-        return False, "观察中：无法计算MA5偏离率"
+        return False, "无法计算MA5偏离率"
     if deviation < 0:
-        return False, "观察中：当前价在MA5下方"
+        return False, "当前价在MA5下方"
     if deviation > 2:
-        return False, "观察中：等待回踩到MA5 0%-2%"
-    if str(row.get("本金是否可买", "")) != "可以买":
-        return True, "符合待买形态，但当前本金不足"
-    if is_truthy(row.get("是否超过单笔比例", False)):
-        return True, "符合待买形态，但超过单笔仓位"
-    return True, "符合待买形态和本金约束"
+        return False, "等待回踩到MA5 0%-2%"
+    return True, "接近买点，盘中手动确认"
 
 
 def build_pipeline(df: pd.DataFrame) -> pd.DataFrame:
@@ -819,12 +895,17 @@ def pipeline_views(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     if "分组" not in source:
         source["分组"] = source["流程阶段"].map(stage_to_group)
     views = {stage: source[source["流程阶段"] == stage].copy() for stage in PIPELINE_STAGES}
-    views["初筛"] = source[source["分组"] == "初筛"].copy()
-    views["观察"] = source[source["分组"] == "观察"].copy()
+    stage_text = source.get("流程阶段", pd.Series("", index=source.index)).fillna("").astype(str)
+    observe_mask = stage_text.isin(OBSERVATION_STAGES)
+    volume_break = source.get("放量跌破MA5", pd.Series(False, index=source.index)).map(is_truthy)
+    buy_mask = stage_text.eq("接近买点") & ~volume_break
+    views["初筛"] = source.copy()
+    views["观察"] = source[observe_mask].copy()
     views["持仓"] = source[source["分组"] == "持仓"].copy()
-    views["待买"] = views["待买观察"]
-    views["观察未待买"] = source[source["流程阶段"].isin(["重点观察", "等回踩", "资金不足观察"])].copy()
-    views["未达规则"] = source[source["流程阶段"].isin(["缺少历史K线", "淘汰"])].copy()
+    views["待买"] = source[buy_mask].copy()
+    views["待买观察"] = views["待买"].copy()
+    views["观察未待买"] = source[observe_mask & ~buy_mask].copy()
+    views["未达规则"] = source[stage_text.isin(["未达规则", "风险排除", "淘汰"])].copy()
     views["淘汰分组"] = source[source["分组"] == "淘汰"].copy()
     return views
 
@@ -973,11 +1054,14 @@ def _run_analysis(uploaded, incoming: pd.DataFrame, fetch_missing: bool = False)
     st.session_state.reminder_computed = True
     st.session_state.last_reminder_cash = available_cash
     summary = pipeline_views(analyzed)
+    log_activity(
+        f"股票池分析完成：待买{len(summary['待买'])}，"
+        f"观察{len(summary['观察'])}，"
+        f"未达规则{len(summary['未达规则'])}"
+    )
     st.success(
-        f"分析完成。初筛通过 {len(summary['初筛通过'])}，重点观察 {len(summary['重点观察'])}，"
-        f"等回踩 {len(summary['等回踩'])}，待买观察 {len(summary['待买观察'])}，"
-        f"资金不足 {len(summary['资金不足观察'])}，缺少历史K线 {len(summary['缺少历史K线'])}，"
-        f"淘汰 {len(summary['淘汰'])}。"
+        f"分析完成。初筛 {len(summary['初筛'])}，观察 {len(summary['观察'])}，"
+        f"待买观察 {len(summary['待买'])}，未达规则 {len(summary['未达规则'])}。"
     )
 
 
@@ -1039,7 +1123,7 @@ def lookup_trade_context(
                 "当前价": row.get("现价", row.get("当前价", pd.NA)),
                 "MA5": row.get("MA5", pd.NA),
                 "流程阶段": row.get("流程阶段", row.get("状态", "")),
-                "是否待买观察": row.get("流程阶段", row.get("状态", "")) == "待买观察",
+                "是否待买观察": row.get("流程阶段", row.get("状态", "")) == "接近买点",
                 "一手金额": row.get("一手金额", pd.NA),
                 "source": "当前股票池",
             })
@@ -1132,6 +1216,8 @@ def rule_snapshot_for_trade(
             tags.append("其他")
     if not big_line:
         tags.append("无5%阳线")
+    if not ma5_up:
+        tags.append("MA5未向上")
     if deviation is None or pd.isna(deviation):
         tags.append("未回踩MA5")
     else:
@@ -1142,15 +1228,13 @@ def rule_snapshot_for_trade(
             tags.append("远离MA5追高")
         elif deviation_f > 2:
             tags.append("未回踩MA5")
-    if not ma5_up:
-        tags.append("其他")
     if not principal_ok:
         tags.append("本金不足仍买")
     if not time_ok:
         tags.append("非计划时间买入")
 
     unique_tags = list(dict.fromkeys(tags))
-    severe = {"非主板", "ST", "京东方A", "无5%阳线", "跌破MA5仍买", "远离MA5追高", "本金不足仍买"}
+    severe = {"非主板", "ST", "京东方A", "无5%阳线", "MA5未向上", "跌破MA5仍买", "远离MA5追高", "本金不足仍买"}
     if not unique_tags:
         conclusion = "符合规则"
     elif severe.intersection(unique_tags) or len(unique_tags) >= 3:
@@ -1202,6 +1286,7 @@ def save_trade_record(existing_trades: pd.DataFrame, new_trade: pd.DataFrame) ->
     )
     st.session_state.holdings = portfolio_to_legacy_holdings(positions)
     save_holdings(st.session_state.holdings)
+    log_activity("交易流水已保存，持仓和资产已重算")
 
 
 def render_trade_form(existing_trades: pd.DataFrame) -> None:
@@ -1446,6 +1531,8 @@ if "reminder_computed" not in st.session_state:
     st.session_state.reminder_computed = False
 if "manual_quote_refresh" not in st.session_state:
     st.session_state.manual_quote_refresh = 0
+if "activity_log" not in st.session_state:
+    st.session_state.activity_log = []
 if "page_navigation" not in st.session_state:
     st.session_state.page_navigation = "今日看板"
 pending_page_navigation = st.session_state.get("pending_page_navigation")
@@ -1459,7 +1546,22 @@ elif st.session_state.get("page_navigation") in {"交易复盘", "报告中心"}
 
 # ── Sidebar ──
 with st.sidebar:
-    st.markdown("## 强势回踩")
+    st.markdown(
+        f"""
+        <div class="sidebar-brand">
+          <div class="brand-row">
+            <span class="brand-mark"></span>
+            <div>
+              <strong>{APP_NAME}</strong>
+              <small>主板前排 · MA5 回踩 · 纪律工作台</small>
+            </div>
+          </div>
+          <small>不连接券商，不自动下单，只做规则约束与复盘存证。</small>
+          <span class="version-pill">{APP_VERSION}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     settings = st.session_state.settings.copy()
     mode_index = 0 if settings.get("account_mode", "模拟训练") == "模拟训练" else 1
@@ -1481,12 +1583,14 @@ with st.sidebar:
     if st.button("刷新行情 / 重新计算", key="sidebar_global_refresh", use_container_width=True):
         trigger_global_refresh()
     st.divider()
+    st.markdown('<div class="sidebar-section-title">纪律罗盘</div>', unsafe_allow_html=True)
     page = st.radio(
         "导航",
         ["今日看板", "数据导入", "股票分组", "盘中观察", "待买", "交易记录", "持仓监控", "资产看板", "复盘报告", "系统设置"],
         label_visibility="collapsed",
         key="page_navigation",
     )
+    render_activity_log()
 
 page = st.session_state.get("page_navigation", "今日看板")
 settings = st.session_state.settings.copy()
@@ -1652,9 +1756,9 @@ if page not in valid_pages:
 # PAGE: 今日看板
 # ══════════════════════════════════════════════════════════════════
 if page == "今日看板":
-    page_header("强势回踩系统", "今天只确认该补什么、看什么、买不买、记不记。")
+    page_header(APP_NAME, "今天只确认该补什么、看什么、买不买、记不记。")
 
-    missing_history = len(views["缺少历史K线"])
+    missing_history = int((watchlist.get("history_status", pd.Series("", index=watchlist.index)) == "缺少历史K线").sum())
     today_buy_watch = len(views["待买观察"])
     risk_holding_count = count_risk_positions(portfolio_positions)
     today_key = date.today().isoformat()
@@ -1669,6 +1773,16 @@ if page == "今日看板":
         if st.button("刷新行情 / 重新计算", type="primary", use_container_width=True):
             trigger_global_refresh()
     top_cols[1].caption(f"{quote_status} · {funds_source} · 页面切换不自动联网，盘中手动轻刷新。")
+
+    render_dashboard_brief(
+        today_key,
+        quote_status,
+        funds_source,
+        today_buy_watch,
+        missing_history,
+        risk_holding_count,
+        unreviewed_trades,
+    )
 
     st.markdown("#### 账户状态")
     account_cols = st.columns(4)
@@ -1714,7 +1828,7 @@ if page == "今日看板":
         nav_button("写复盘", "复盘报告", key="dash_step_review")
 
     with st.expander("查看强势回踩交易规则", expanded=False):
-        render_trading_mode_panel()
+        render_trading_mode_panel(available_cash)
 
     refresh_mode = settings.get("quote_refresh_mode", "手动")
     if refresh_mode != "手动":
@@ -1925,11 +2039,20 @@ elif page == "数据导入":
 elif page == "股票分组":
     page_header("股票分组", "按初筛、观察、待买、持仓四个工作分组盯盘。")
 
+    search_cols = st.columns([2, 3])
+    with search_cols[0]:
+        stock_search_query = st.text_input(
+            "搜索股票",
+            value="",
+            placeholder="输入代码或名称",
+            key="stock_group_search",
+        )
+    search_cols[1].caption("搜索只影响当前页面展示，不修改股票池分组和规则计算结果。")
+
     group_tabs = st.tabs([
         f"初筛（{counts.get('初筛', 0)}）",
         f"观察（{counts.get('观察', 0)}）",
         f"待买（{counts.get('待买', 0)}）",
-        f"持仓（{len(portfolio_positions)}）",
     ])
 
     tab_specs = [
@@ -1937,23 +2060,15 @@ elif page == "股票分组":
         ("观察", views["观察"], STOCK_TABLE_COLUMNS, "stock_group_observe"),
         ("待买", views["待买"], STOCK_TABLE_COLUMNS, "stock_group_buy"),
     ]
-    for tab, (label, frame, columns, key) in zip(group_tabs[:3], tab_specs):
+    for tab, (label, frame, columns, key) in zip(group_tabs, tab_specs):
         with tab:
+            visible_frame = filter_stock_search(frame, stock_search_query)
             if frame.empty:
                 st.info(f"暂无{label}股票。")
-            selected = render_workbench_table(frame, columns, key=key, height=500)
+            elif visible_frame.empty:
+                st.info("没有匹配当前搜索条件的股票。")
+            selected = render_workbench_table(visible_frame, columns, key=key, height=500)
             render_kline_for_selection(selected)
-
-    with group_tabs[3]:
-        if portfolio_positions.empty:
-            st.info("暂无持仓。持仓由交易记录自动推导。")
-        selected_holding = render_workbench_table(
-            portfolio_positions,
-            HOLDING_TABLE_COLUMNS,
-            key="stock_group_holding",
-            height=500,
-        )
-        render_kline_for_selection(selected_holding)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1976,12 +2091,8 @@ elif page == "盘中观察":
     intraday_parts = []
     if not views["待买观察"].empty:
         intraday_parts.append(views["待买"].assign(盯盘阶段="待买观察"))
-    if not views["重点观察"].empty:
-        intraday_parts.append(views["重点观察"].assign(盯盘阶段="重点观察"))
-    if not views["等回踩"].empty:
-        intraday_parts.append(views["等回踩"].assign(盯盘阶段="等回踩"))
-    if not views["资金不足观察"].empty:
-        intraday_parts.append(views["资金不足观察"].assign(盯盘阶段="资金不足"))
+    if not views["观察未待买"].empty:
+        intraday_parts.append(views["观察未待买"].assign(盯盘阶段="观察"))
 
     if intraday_parts:
         intraday = pd.concat(intraday_parts, ignore_index=True)
@@ -1990,10 +2101,10 @@ elif page == "盘中观察":
 
         metric_cols = st.columns(5)
         metric_cols[0].metric("待买观察", len(views["待买观察"]))
-        metric_cols[1].metric("重点观察", len(views["重点观察"]))
+        metric_cols[1].metric("观察", len(views["观察"]))
         metric_cols[2].metric("等回踩", len(views["等回踩"]))
-        metric_cols[3].metric("跌破MA5", int(pd.to_numeric(intraday["MA5偏离率%"], errors="coerce").lt(0).sum()))
-        metric_cols[4].metric("资金不足", len(views["资金不足观察"]))
+        metric_cols[3].metric("远离不追", len(views["远离不追"]))
+        metric_cols[4].metric("未达规则", len(views["未达规则"]))
 
         selected_intraday = render_workbench_table(
             intraday,
@@ -2015,7 +2126,7 @@ elif page == "盘中观察":
 # PAGE: 待买
 # ══════════════════════════════════════════════════════════════════
 elif page == "待买":
-    page_header("待买", "确认待买观察是否真的满足买入条件。")
+    page_header("待买", "盘中手动确认待买观察是否仍满足规则。")
 
     buy_candidates = views["待买"]
     if not buy_candidates.empty:
@@ -2039,7 +2150,7 @@ elif page == "待买":
                 lot_cost = number_or(selected.get("一手金额"), 0)
                 st.warning(
                     f"{selected['名称']} 一手金额 ¥{lot_cost:,.2f}，"
-                    f"当前可用现金 ¥{available_cash:,.2f}，暂时不能确认买入。"
+                    f"当前可用现金 ¥{available_cash:,.2f}，暂时不能记录交易。"
                 )
             with st.form("buy_form"):
                 col1, col2, col3, col4 = st.columns(4)
@@ -2062,7 +2173,7 @@ elif page == "待买":
                     f"印花税 {money_display(0)}，过户费 {money_display(buy_fee_values['transfer_fee'])}"
                 )
 
-                if st.form_submit_button("确认买入", type="primary"):
+                if st.form_submit_button("盘中手动确认", type="primary"):
                     buy_qty = int(buy_qty)
                     buy_amount = round(float(buy_price) * buy_qty, 2)
                     buy_fee_values = calculate_trade_fees("买入", buy_price, buy_qty, settings)

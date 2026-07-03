@@ -5,17 +5,20 @@ import re
 from typing import Any
 
 ALLOWED_PREFIXES = ("600", "601", "603", "605", "000", "001", "002")
+BIG_CANDLE_LOOKBACK_DAYS = 20
+BIG_CANDLE_THRESHOLD_PCT = 5.0
 PIPELINE_STAGES = [
     "初筛通过",
-    "重点观察",
+    "接近买点",
     "等回踩",
-    "待买观察",
-    "资金不足观察",
-    "缺少历史K线",
+    "远离不追",
+    "未达规则",
+    "风险排除",
     "淘汰",
 ]
 GROUPS = PIPELINE_STAGES
-MAIN_GROUPS = ["初筛", "观察", "待买", "持仓", "淘汰"]
+MAIN_GROUPS = ["初筛", "观察", "待买", "持仓"]
+OBSERVATION_STAGES = {"接近买点", "等回踩", "远离不追"}
 
 
 def stage_to_group(stage: Any) -> str:
@@ -23,10 +26,8 @@ def stage_to_group(stage: Any) -> str:
     text = str(stage or "").strip()
     if text == "待买观察":
         return "待买"
-    if text in {"重点观察", "等回踩", "资金不足观察"}:
+    if text in OBSERVATION_STAGES:
         return "观察"
-    if text == "淘汰":
-        return "淘汰"
     return "初筛"
 
 
@@ -73,10 +74,10 @@ def buy_signal(deviation: float | None) -> str:
     if deviation < 0:
         return "跌破5日线，不买"
     if deviation <= 2:
-        return "待买观察"
-    if deviation <= 5:
-        return "重点观察"
-    return "远离5日线，不追，等回踩"
+        return "接近买点"
+    if deviation <= 7:
+        return "等回踩"
+    return "远离不追"
 
 
 def affordability(price: Any, capital: float = 10000) -> tuple[bool, float | None]:
@@ -103,7 +104,7 @@ def score_stock(row: dict[str, Any]) -> tuple[int, str]:
         score += 2
     if not bool(row.get("放量跌破MA5", False)):
         score += 2
-    level = "重点观察" if score >= 8 else "初筛通过" if score >= 6 else "淘汰"
+    level = "接近买点" if score >= 8 else "初筛通过"
     return score, level
 
 
@@ -118,6 +119,42 @@ def truthy(value: Any) -> bool:
 
 def recent_big_line(row: dict[str, Any]) -> bool:
     return is_number(row.get("最近大阳线%")) and float(row.get("最近大阳线%")) >= 5
+
+
+def recent_big_candle_pct(history: Any, lookback: int = BIG_CANDLE_LOOKBACK_DAYS) -> float | None:
+    """Return the max recent daily gain on a true bullish candle.
+
+    A valid start signal is within the most recent 20 trading days by default,
+    with daily gain >= 5% and close > open. The returned value is the max gain
+    among recent bullish candles; callers decide whether it passes the 5% line.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+
+    if history is None or getattr(history, "empty", True):
+        return None
+    if "开盘" not in history or "收盘" not in history:
+        return None
+
+    frame = history.copy()
+    close = pd.to_numeric(frame.get("收盘"), errors="coerce")
+    open_price = pd.to_numeric(frame.get("开盘"), errors="coerce")
+    if "单日涨幅%" in frame:
+        daily_pct = pd.to_numeric(frame.get("单日涨幅%"), errors="coerce")
+    else:
+        daily_pct = close.pct_change() * 100
+
+    recent = frame.tail(lookback).copy()
+    recent_close = close.reindex(recent.index)
+    recent_open = open_price.reindex(recent.index)
+    recent_pct = daily_pct.reindex(recent.index)
+    bullish_mask = recent_close > recent_open
+    max_up = recent_pct.where(bullish_mask).max()
+    if pd.notna(max_up):
+        return float(max_up)
+    return None
 
 
 def rank_top_30(row: dict[str, Any]) -> bool:
@@ -152,42 +189,38 @@ def stock_stage_result(row: dict[str, Any]) -> tuple[str, str, str]:
 
     history_status = str(row.get("history_status", "") or "")
     if history_status in {"自动获取失败", "缺少历史K线"}:
-        return "缺少历史K线", "缺少有效历史K线", "缺少历史K线，暂不能判断MA5"
+        return "未达规则", "缺少有效历史K线", "缺少历史K线，暂不进入观察池"
     if history_status == "缓存过旧":
         error = str(row.get("history_error", "") or "历史K线缓存过旧")
-        return "缺少历史K线", "缓存过旧", error
+        return "未达规则", "缓存过旧", error
     if history_status == "数据不足":
         error = str(row.get("history_error", "") or "历史K线数据不足")
-        return "缺少历史K线", "历史K线数据不足", error
+        return "未达规则", "历史K线数据不足", error
     if not valid_history(row):
-        return "缺少历史K线", "历史K线数据不足", "历史K线数据不足，至少需要20条有效收盘价"
+        return "未达规则", "历史K线数据不足", "历史K线数据不足，至少需要20条有效收盘价"
 
     has_big_line = recent_big_line(row)
     ma5_up = truthy(row.get("MA5向上"))
     deviation = row.get("MA5偏离率%")
     if not is_number(deviation):
         deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
-    affordable = str(row.get("本金是否可买", row.get("资金可买", ""))) == "可以买"
-
     if truthy(row.get("放量跌破MA5")):
-        return "淘汰", "放量跌破MA5", "放量跌破MA5，不纳入观察"
+        return "风险排除", "放量跌破MA5", "放量跌破MA5，不进入观察池"
     if not has_big_line:
-        return "淘汰", "无5%阳线启动信号", "近10-20日无5%强势阳线"
+        return "未达规则", "无5%阳线启动信号", "近20日无5%阳线启动信号，不进入观察池"
     if not ma5_up:
-        return "淘汰", "MA5向下", "MA5未向上，不参与"
+        return "未达规则", "MA5未向上", "MA5未向上，不进入观察池"
     if deviation is None or not is_number(deviation):
-        return "初筛通过", "等待MA5偏离率", "初筛通过，等待补充MA5偏离率"
+        return "未达规则", "等待MA5偏离率", "无法计算MA5偏离率，暂不进入观察池"
 
     deviation_f = float(deviation)
     if deviation_f < 0:
-        return "淘汰", "跌破MA5", "跌破MA5，不买"
+        return "风险排除", "跌破MA5", "当前价跌破MA5，不进入观察池"
     if deviation_f <= 2:
-        if affordable:
-            return "待买观察", "回踩MA5 0%-2%，本金可买", "接近5日线，盘中确认"
-        return "资金不足观察", "形态接近但本金买不起一手", "形态接近，但本金买不起一手"
-    if deviation_f <= 5:
-        return "重点观察", "MA5偏离率2%-5%", "强势在线，继续观察回踩"
-    return "等回踩", "远离5日线，不追", "远离5日线，不追，等回踩"
+        return "接近买点", "MA5偏离率0%-2%", "接近5日线，盘中重点观察是否回踩不破。"
+    if deviation_f <= 7:
+        return "等回踩", "MA5偏离率2%-7%", "趋势仍强，但还没回踩到位，继续等回踩。"
+    return "远离不追", "MA5偏离率>7%", "远离5日线，不追，等后续回踩。"
 
 
 def evaluate_stock(row: dict[str, Any]) -> dict[str, Any]:
@@ -197,10 +230,10 @@ def evaluate_stock(row: dict[str, Any]) -> dict[str, Any]:
     """
     stage, reason, reminder = stock_stage_result(row)
     group = stage_to_group(stage)
-    can_buy = stage == "待买观察"
+    can_buy = stage == "接近买点" and not truthy(row.get("放量跌破MA5"))
     if stage == "淘汰":
         risk_level = "danger"
-    elif stage in {"缺少历史K线", "资金不足观察"}:
+    elif stage in {"未达规则", "风险排除"}:
         risk_level = "warning"
     else:
         risk_level = "normal"
@@ -257,8 +290,7 @@ def can_be_watchlist_candidate(
     - 最近有5%阳线
     - MA5向上
     - 当前价在MA5上方 (偏离率 >= 0)
-    - MA5偏离率在0%-2%
-    - 当前本金买得起一手
+    - MA5偏离率在0%-2%，当前价未有效跌破MA5
 
     Returns:
         (qualifies, reason)
@@ -285,9 +317,6 @@ def can_be_watchlist_candidate(
     if deviation > 2:
         return False, "偏离MA5超过2%"
 
-    if not affordable:
-        return False, "形态符合，但本金买不起一手"
-
     return True, "符合待买条件"
 
 
@@ -299,7 +328,7 @@ def can_be_observation_candidate(
     ma5_up: bool,
     deviation: float | None,
 ) -> tuple[bool, str]:
-    """Determine if a stock passes the non-capital rule constraints."""
+    """Determine if a stock qualifies for the observation layer."""
     passed, reason = screening_result(code, name)
     if not passed:
         return False, reason
@@ -319,9 +348,6 @@ def can_be_observation_candidate(
     if deviation < 0:
         return False, "当前价在MA5下方"
 
-    if deviation > 2:
-        return False, "偏离MA5超过2%"
-
     return True, "符合观察规则"
 
 
@@ -336,27 +362,24 @@ def determine_group(
     current_group: str | None = None,
 ) -> str:
     """Backward-compatible group classifier."""
-    if current_group == "淘汰":
-        return "淘汰"
-
     qualifies, _ = can_be_watchlist_candidate(
-        code, name, has_history, has_big_line, ma5_up, deviation, affordable
+        code, name, has_history, has_big_line, ma5_up, deviation, True
     )
     if qualifies:
-        return "待买观察"
+        return "接近买点"
 
     observation_ok, _ = can_be_observation_candidate(
         code, name, has_history, has_big_line, ma5_up, deviation
     )
     if observation_ok:
-        if deviation is not None and deviation > 5:
-            return "等回踩"
-        return "重点观察"
+        if deviation is not None and is_number(deviation) and 0 <= float(deviation) <= 2:
+            return "接近买点"
+        if deviation is not None and is_number(deviation) and float(deviation) > 7:
+            return "远离不追"
+        return "等回踩"
 
     if not has_history:
-        return "缺少历史K线"
-    if not affordable and deviation is not None and 0 <= deviation <= 2:
-        return "资金不足观察"
+        return "未达规则"
     return "初筛通过"
 
 

@@ -6,7 +6,16 @@ from typing import BinaryIO
 
 import pandas as pd
 
-from src.rules import GROUPS, affordability, buy_signal, clean_code, ma5_deviation, screening_result, stage_to_group
+from src.rules import (
+    GROUPS,
+    affordability,
+    buy_signal,
+    clean_code,
+    ma5_deviation,
+    recent_big_candle_pct,
+    screening_result,
+    stage_to_group,
+)
 from src.storage import backup_file, safe_write_csv
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,12 +109,12 @@ LEGACY_TRADE_COLUMNS = [
 ]
 
 ALIASES = {
-    "代码": ["代码", "股票代码", "证券代码"],
-    "名称": ["名称", "股票简称", "股票名称", "证券简称"],
-    "现价": ["现价", "现价(元)", "最新价", "收盘价"],
-    "涨跌幅%": ["涨跌幅%", "涨跌幅(%)", "涨跌幅"],
-    "成交额": ["成交额", "成交额(元)", "总金额"],
-    "成交额排名": ["成交额排名名次", "成交额排名", "排名"],
+    "代码": ["代码", "股票代码", "证券代码", "股票代码代码", "证券代码代码"],
+    "名称": ["名称", "股票简称", "股票名称", "证券简称", "简称"],
+    "现价": ["现价", "现价(元)", "最新价", "最新", "收盘价", "价格"],
+    "涨跌幅%": ["涨跌幅%", "涨跌幅(%)", "涨跌幅", "涨幅%", "涨幅"],
+    "成交额": ["成交额", "成交额(元)", "成交金额", "金额", "总金额", "成交额(万)", "成交额(亿)"],
+    "成交额排名": ["成交额排名名次", "成交额排名", "排名", "名次", "成交额排行"],
     "上市板块": ["上市板块", "板块"],
     "日期": ["日期", "交易日期", "时间"],
     "开盘": ["开盘", "开盘价"],
@@ -114,6 +123,8 @@ ALIASES = {
     "收盘": ["收盘", "收盘价", "现价"],
     "成交量": ["成交量", "总手"],
 }
+
+HEADER_HINTS = ["代码", "证券代码", "股票代码", "名称", "股票简称", "证券简称", "现价", "成交额", "涨跌幅"]
 
 # Simplified internal directories
 REQUIRED_DIRS = [
@@ -140,32 +151,198 @@ def empty_frame(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
+def _read_csv_bytes(raw: bytes, header: int | list[int] = 0) -> pd.DataFrame:
+    for encoding in ("utf-8-sig", "gb18030", "gbk"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=encoding, header=header, dtype=object)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(io.BytesIO(raw), header=header, dtype=object)
+
+
+def _flatten_header(columns: pd.Index) -> list[str]:
+    flattened: list[str] = []
+    seen: dict[str, int] = {}
+    for column in columns:
+        if isinstance(column, tuple):
+            parts = [
+                str(part).strip()
+                for part in column
+                if pd.notna(part) and not str(part).startswith("Unnamed:")
+            ]
+            text = " ".join(parts)
+        else:
+            text = "" if pd.isna(column) else str(column).strip()
+        text = text or "未命名列"
+        count = seen.get(text, 0)
+        seen[text] = count + 1
+        flattened.append(f"{text}_{count + 1}" if count else text)
+    return flattened
+
+
+def _sheet_score(frame: pd.DataFrame) -> int:
+    if frame.empty:
+        return 0
+    columns_text = " ".join(str(column) for column in frame.columns)
+    hits = sum(1 for hint in HEADER_HINTS if hint in columns_text)
+    code_col = find_column(list(frame.columns), ALIASES["代码"])
+    name_col = find_column(list(frame.columns), ALIASES["名称"])
+    if code_col:
+        hits += int(frame[code_col].map(clean_code).str.len().eq(6).sum())
+    if name_col:
+        hits += int(frame[name_col].notna().sum() > 0)
+    return hits
+
+
+def _candidate_headers(raw: bytes | str | Path | BinaryIO, suffix: str, sheet_name: str | int | None = 0) -> list[pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    for header in (0, 1, 2, 3, 4, [0, 1]):
+        try:
+            if suffix in {".xlsx", ".xls"}:
+                frame = pd.read_excel(raw, sheet_name=sheet_name, header=header, dtype=object)
+            else:
+                if not isinstance(raw, bytes):
+                    continue
+                frame = _read_csv_bytes(raw, header=header)
+        except (ValueError, OSError, UnicodeDecodeError, pd.errors.ParserError):
+            continue
+        frame = frame.dropna(how="all")
+        frame.columns = _flatten_header(frame.columns)
+        frames.append(frame)
+    return frames
+
+
 def read_tabular(source: str | Path | BinaryIO, filename: str | None = None) -> pd.DataFrame:
     name = filename or str(source)
     suffix = Path(name).suffix.lower()
+    raw_bytes: bytes | None = None
+    if hasattr(source, "read"):
+        raw = source.read()
+        raw_bytes = raw.encode() if isinstance(raw, str) else raw
+
     if suffix in {".xlsx", ".xls"}:
-        return pd.read_excel(source, dtype=object)
+        excel_source: str | Path | io.BytesIO = io.BytesIO(raw_bytes) if raw_bytes is not None else source
+        excel = pd.ExcelFile(excel_source)
+        candidates: list[pd.DataFrame] = []
+        for sheet_name in excel.sheet_names:
+            sheet_source: str | Path | io.BytesIO = io.BytesIO(raw_bytes) if raw_bytes is not None else source
+            candidates.extend(_candidate_headers(sheet_source, suffix, sheet_name))
+        if not candidates:
+            return pd.read_excel(excel_source, dtype=object)
+        return max(candidates, key=_sheet_score)
     if suffix == ".csv":
-        raw = source.read() if hasattr(source, "read") else Path(source).read_bytes()
-        if isinstance(raw, str):
-            raw = raw.encode()
-        for encoding in ("utf-8-sig", "gb18030", "gbk"):
-            try:
-                return pd.read_csv(io.BytesIO(raw), encoding=encoding, dtype=object)
-            except UnicodeDecodeError:
-                continue
-        return pd.read_csv(io.BytesIO(raw), dtype=object)
+        raw = raw_bytes if raw_bytes is not None else Path(source).read_bytes()
+        candidates = _candidate_headers(raw, suffix)
+        if candidates:
+            return max(candidates, key=_sheet_score)
+        return _read_csv_bytes(raw)
     raise ValueError("仅支持 .xlsx、.xls 或 .csv 文件")
 
 
 def find_column(columns: list[str], aliases: list[str]) -> str | None:
-    normalized = {str(col).replace("\n", "").replace(" ", ""): col for col in columns}
+    normalized = {
+        str(col)
+        .replace("\n", "")
+        .replace("\r", "")
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", ""): col
+        for col in columns
+    }
     for alias in aliases:
-        key = alias.replace("\n", "").replace(" ", "")
+        key = alias.replace("\n", "").replace(" ", "").replace("_", "").replace("-", "")
         for normalized_name, original in normalized.items():
-            if normalized_name == key or normalized_name.startswith(key):
+            if normalized_name == key or normalized_name.startswith(key) or key in normalized_name:
                 return original
     return None
+
+
+def parse_number(value: object) -> float | None:
+    if pd.isna(value):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "").replace("，", "")
+    if not text or text in {"--", "-", "None", "nan"}:
+        return None
+    multiplier = 1.0
+    if text.endswith("%"):
+        text = text[:-1]
+    if "万" in text:
+        multiplier = 10000.0
+        text = text.replace("万元", "").replace("万", "")
+    elif "亿" in text:
+        multiplier = 100000000.0
+        text = text.replace("亿元", "").replace("亿", "")
+    if "/" in text:
+        text = text.split("/", 1)[0]
+    numeric = pd.to_numeric(text, errors="coerce")
+    return float(numeric) * multiplier if pd.notna(numeric) else None
+
+
+def parse_rank(value: object) -> float | None:
+    parsed = parse_number(value)
+    if parsed is not None:
+        return parsed
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if "/" in text:
+        return parse_number(text.split("/", 1)[0])
+    return None
+
+
+def normalize_imported_candidates(df: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
+    out = df.copy()
+    out["代码"] = out["代码"].map(clean_code)
+    out["名称"] = out["名称"].fillna("").astype(str).str.strip()
+    out = out[out["代码"].str.len() == 6].copy()
+    passed = out.apply(
+        lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
+        axis=1,
+    )
+    out = out[passed].copy()
+    for column in ["现价", "涨跌幅%", "成交额"]:
+        out[column] = out[column].map(parse_number)
+    out["成交额排名"] = out["成交额排名"].map(parse_rank)
+    out["_rank_sort"] = pd.to_numeric(out["成交额排名"], errors="coerce").fillna(999999)
+    out["_turnover_sort"] = pd.to_numeric(out["成交额"], errors="coerce").fillna(-1)
+    out = (
+        out.sort_values(["_rank_sort", "_turnover_sort"], ascending=[True, False], kind="stable")
+        .drop_duplicates("代码", keep="first")
+        .head(limit)
+        .drop(columns=["_rank_sort", "_turnover_sort"])
+        .copy()
+    )
+    out["成交额排名"] = range(1, len(out) + 1)
+    out["上市板块"] = out["上市板块"].fillna("主板").replace("", "主板")
+    return out.reset_index(drop=True)
+
+
+def imported_codes_summary(raw: pd.DataFrame) -> dict[str, int]:
+    source = find_column(list(raw.columns), ALIASES["代码"])
+    if not source:
+        return {"rawRows": int(len(raw)), "codeRows": 0, "mainBoardRows": 0}
+    codes = raw[source].map(clean_code)
+    code_rows = int(codes.str.len().eq(6).sum())
+    names_source = find_column(list(raw.columns), ALIASES["名称"])
+    names = raw[names_source].fillna("").astype(str) if names_source else pd.Series([""] * len(raw))
+    main_board_rows = 0
+    for code, name in zip(codes, names):
+        if screening_result(code, name)[0]:
+            main_board_rows += 1
+    return {"rawRows": int(len(raw)), "codeRows": code_rows, "mainBoardRows": main_board_rows}
+
+
+def archive_import_file(content: bytes, filename: str) -> Path:
+    ensure_data_dir()
+    suffix = Path(filename).suffix.lower() or ".dat"
+    stem = Path(filename).stem or "import"
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem)[:80]
+    stamp = pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y%m%d_%H%M%S")
+    target = DATA_DIR / "raw" / "stock_pool" / f"{stamp}_{safe_stem}{suffix}"
+    target.write_bytes(content)
+    return target
 
 
 def standardize_candidates(raw: pd.DataFrame) -> pd.DataFrame:
@@ -176,11 +353,7 @@ def standardize_candidates(raw: pd.DataFrame) -> pd.DataFrame:
         source = find_column(list(raw.columns), ALIASES.get(target, [target]))
         mapped[target] = raw[source] if source else pd.Series([pd.NA] * len(raw))
     df = pd.DataFrame(mapped)
-    df["代码"] = df["代码"].map(clean_code)
-    df["名称"] = df["名称"].fillna("").astype(str).str.strip()
-    df = df[df["代码"].str.len() == 6].copy()
-    for column in ["现价", "涨跌幅%", "成交额", "成交额排名"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = normalize_imported_candidates(df)
     df["状态"] = "初筛通过"
     df["分组"] = "初筛"
     df["流程阶段"] = "初筛通过"
@@ -194,6 +367,14 @@ def standardize_candidates(raw: pd.DataFrame) -> pd.DataFrame:
                 df[col] = pd.NA
 
     return df[WATCHLIST_COLUMNS].drop_duplicates("代码", keep="first").reset_index(drop=True)
+
+
+def standardize_import_file(content: bytes, filename: str) -> tuple[pd.DataFrame, dict[str, int]]:
+    raw = read_tabular(io.BytesIO(content), filename)
+    summary = imported_codes_summary(raw)
+    frame = standardize_candidates(raw)
+    summary["imported"] = int(len(frame))
+    return frame, summary
 
 
 def load_watchlist() -> pd.DataFrame:
@@ -218,10 +399,14 @@ def load_watchlist() -> pd.DataFrame:
     df["代码"] = df["代码"].map(clean_code)
     stage_aliases = {
         "初筛": "初筛通过",
-        "观察": "重点观察",
-        "待买": "待买观察",
-        "持仓": "重点观察",
-        "待买观察": "待买观察",
+        "观察": "等回踩",
+        "待买": "接近买点",
+        "持仓": "等回踩",
+        "待买观察": "接近买点",
+        "重点观察": "等回踩",
+        "偏高不追": "远离不追",
+        "资金不足观察": "未达规则",
+        "缺少历史K线": "未达规则",
     }
     df["状态"] = df["状态"].replace(stage_aliases)
     df["状态"] = df["状态"].where(df["状态"].isin(GROUPS), "初筛通过")
@@ -233,7 +418,7 @@ def load_watchlist() -> pd.DataFrame:
     df["_rank_sort"] = rank.fillna(999999)
     df["_turnover_sort"] = turnover.fillna(-1)
     df = (
-        df.sort_values(["_rank_sort", "_turnover_sort"], ascending=[True, False])
+        df.sort_values(["_rank_sort", "_turnover_sort"], ascending=[True, False], kind="stable")
         .head(30)
         .drop(columns=["_rank_sort", "_turnover_sort"])
         .copy()
@@ -509,7 +694,6 @@ def apply_latest_history(watchlist: pd.DataFrame, history: pd.DataFrame) -> pd.D
     if history.empty:
         return watchlist
     latest = history.groupby("代码", as_index=False).tail(1).set_index("代码")
-    recent_big = history.groupby("代码")["单日涨幅%"].max()
     out = watchlist.set_index("代码").copy()
     for code in out.index.intersection(latest.index):
         row = latest.loc[code]
@@ -518,5 +702,6 @@ def apply_latest_history(watchlist: pd.DataFrame, history: pd.DataFrame) -> pd.D
         out.loc[code, "MA10"] = row["MA10"]
         out.loc[code, "MA20"] = row["MA20"]
         out.loc[code, "MA5向上"] = bool(row["MA5向上"])
-        out.loc[code, "最近大阳线%"] = recent_big.get(code, pd.NA)
+        max_up = recent_big_candle_pct(history[history["代码"] == code])
+        out.loc[code, "最近大阳线%"] = max_up if max_up is not None else pd.NA
     return out.reset_index()[WATCHLIST_COLUMNS]

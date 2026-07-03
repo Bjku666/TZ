@@ -11,6 +11,7 @@ import urllib.request
 import pandas as pd
 
 from src.data import ROOT, DATA_DIR, clean_code
+from src.rules import recent_big_candle_pct
 
 HISTORY_DIR = DATA_DIR / "history"
 
@@ -320,11 +321,9 @@ def get_ma5_from_cache(code: str) -> dict[str, Any]:
     result["MA5向上"] = bool(latest.get("MA5向上", False))
     result["最新收盘"] = latest.get("收盘")
 
-    # Compute 最近大阳线%
-    if "单日涨幅%" in cache.columns:
-        max_up = cache["单日涨幅%"].max()
-        if pd.notna(max_up):
-            result["最近大阳线%"] = float(max_up)
+    max_up = recent_big_candle_pct(cache)
+    if max_up is not None:
+        result["最近大阳线%"] = round(float(max_up), 2)
 
     return result
 
@@ -396,11 +395,9 @@ def compute_reminder_from_history(code: str, price: float | None,
         result["MA10"] = latest.get("MA10")
         result["MA20"] = latest.get("MA20")
         result["MA5向上"] = bool(latest.get("MA5向上", False))
-        recent = cache.tail(20)
-        if "单日涨幅%" in recent.columns:
-            max_up = pd.to_numeric(recent["单日涨幅%"], errors="coerce").max()
-            if pd.notna(max_up):
-                result["最近大阳线%"] = round(float(max_up), 2)
+        max_up = recent_big_candle_pct(cache)
+        if max_up is not None:
+            result["最近大阳线%"] = round(float(max_up), 2)
 
         # Latest price from history if not provided
         if price is None or pd.isna(price):
@@ -432,27 +429,23 @@ def compute_reminder_text(info: dict, price: float | None = None) -> str:
     ma5 = info.get("MA5")
     deviation = info.get("MA5偏离率%")
     has_big_line = info.get("最近大阳线%") is not None and float(info.get("最近大阳线%", 0) or 0) >= 5
-    affordable = info.get("资金可买") == "可以买"
+
+    if not has_big_line:
+        return "近20日无5%阳线启动信号，不进入观察池"
+
+    if not bool(info.get("MA5向上", False)):
+        return "MA5未向上，不进入观察池"
 
     if deviation is not None:
         if deviation < 0:
-            reminder = "跌破5日线，不纳入待买"
+            return "当前价跌破MA5，不进入观察池"
         elif deviation <= 2:
-            reminder = "接近5日线，待买观察"
-        elif deviation <= 5:
-            reminder = "继续观察，等回踩"
+            return "接近5日线，盘中重点观察是否回踩不破。"
         elif deviation <= 7:
-            reminder = "偏高，不追"
-        else:
-            reminder = "远离5日线，不追"
-        if not affordable:
-            return f"{reminder}；当前本金买不起一手"
-        return reminder
+            return "趋势仍强，但还没回踩到位，继续等回踩。"
+        return "远离5日线，不追，等后续回踩。"
 
-    if not has_big_line:
-        return "缺少强势启动信号"
-
-    return ""
+    return "无法计算MA5偏离率，暂不进入观察池"
 
 
 def compute_all_reminders(watchlist: pd.DataFrame,
@@ -512,23 +505,19 @@ def classify_reminder(reminder_text: str) -> str:
     if not reminder_text:
         return "待补充"
     if "缺少历史K线" in reminder_text:
-        return "缺少历史K线"
+        return "未达规则"
     if "数据不足" in reminder_text:
-        return "历史K线数据不足"
+        return "未达规则"
     if "缓存过旧" in reminder_text or "过旧" in reminder_text:
-        return "缓存过旧"
+        return "未达规则"
     if "跌破5日线" in reminder_text or "跌破" in reminder_text:
-        return "跌破不买"
-    if "接近5日线" in reminder_text or "重点观察" in reminder_text:
+        return "风险排除"
+    if "接近5日线" in reminder_text:
         return "接近买点"
     if "等回踩" in reminder_text:
         return "等回踩"
-    if "偏高" in reminder_text:
-        return "偏高不追"
     if "远离" in reminder_text:
         return "远离不追"
-    if "强势启动" in reminder_text:
-        return "缺少启动信号"
-    if "买不起一手" in reminder_text or "本金" in reminder_text:
-        return "本金买不起一手"
-    return "继续观察"
+    if "阳线启动信号" in reminder_text or "MA5未向上" in reminder_text or "无法计算" in reminder_text:
+        return "未达规则"
+    return "未达规则"

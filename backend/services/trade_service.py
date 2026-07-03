@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import json
+from datetime import date
+from typing import Any
+
+import pandas as pd
+
+from src.data import load_trades, load_watchlist, save_trades
+from src.portfolio import calculate_trade_fees
+from src.realtime import china_now, is_a_share_trading_time
+from src.rules import clean_code, screening_result
+
+from backend.services.portfolio_service import portfolio_snapshot
+from backend.services.settings_service import get_settings
+from backend.storage import sqlite_store
+from backend.storage.csv_adapter import (
+    api_trade_id,
+    api_trades_for_sqlite,
+    ensure_trade_frame,
+    number,
+    parse_tags,
+    trade_index_from_id,
+    trades_to_api,
+    watchlist_to_api,
+)
+
+
+def list_trades(mode: str | None = None) -> dict[str, Any]:
+    frame = load_trades()
+    api_trades = trades_to_api(frame)
+    sqlite_store.replace_trades(mode or "default", api_trades_for_sqlite(api_trades))
+    return {"list": api_trades}
+
+
+def _current_stock(code: str) -> dict[str, Any] | None:
+    watchlist = load_watchlist()
+    if watchlist.empty:
+        return None
+    matches = watchlist[watchlist["代码"].astype(str).map(clean_code) == clean_code(code)]
+    if matches.empty:
+        return None
+    return watchlist_to_api(matches.iloc[[0]])[0]
+
+
+def _audit_buy(stock: dict[str, Any] | None, code: str, name: str, price: float, available_cash: float) -> tuple[str, list[str]]:
+    tags: list[str] = []
+    passed, reason = screening_result(code, name)
+    if not passed:
+        tags.append(reason)
+    if stock is None:
+        tags.append("不在股票池")
+    else:
+        if stock.get("historyStatus") != "已有缓存":
+            tags.append("缺少有效历史K线")
+        if not stock.get("ma5Upward"):
+            tags.append("MA5未向上")
+        if number(stock.get("bigCandlePct")) < 5:
+            tags.append("无5%大阳线")
+        deviation = number(stock.get("deviation5"))
+        if deviation < 0:
+            tags.append("跌破MA5买入")
+        elif deviation > 2:
+            tags.append("偏离MA5超过2%")
+    if available_cash < price * 100:
+        tags.append("现金不足一手")
+    if not tags:
+        return "符合规则", []
+    if len(tags) <= 2:
+        return "部分不符", tags
+    return "违规交易", tags
+
+
+def _sync_after_trade(mode: str | None = None) -> None:
+    portfolio_snapshot(mode, sync_legacy=True)
+    list_trades(mode)
+
+
+def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
+    code = clean_code(payload.get("code"))
+    name = str(payload.get("name") or "")
+    side_raw = str(payload.get("type") or payload.get("side") or "BUY").upper()
+    side = "卖出" if side_raw in {"SELL", "卖出"} else "买入"
+    price = number(payload.get("price"))
+    quantity = number(payload.get("quantity"))
+    if not code or not name or price <= 0 or quantity <= 0:
+        raise ValueError("交易参数不完整")
+
+    active_mode = mode or str(payload.get("mode") or "default")
+    portfolio = portfolio_snapshot(active_mode)
+    account_state = portfolio["accountState"]
+    positions = {item["code"]: item for item in portfolio["positions"]}
+    fees = calculate_trade_fees(side, price, quantity, get_settings())
+    total_cost = fees["amount"] + fees["total_fee"]
+    if side == "买入" and number(account_state.get("availableCash")) < total_cost:
+        raise ValueError(f"可用资金不足，需要 {total_cost:.2f} 元")
+    if side == "卖出":
+        owned = number((positions.get(code) or {}).get("quantity"))
+        if owned < quantity:
+            raise ValueError(f"持仓不足，当前仅持有 {owned:.0f} 股")
+
+    now = china_now()
+    trade_date = str(payload.get("date") or now.date().isoformat())
+    trade_time = str(payload.get("time") or now.strftime("%H:%M:%S"))
+    stock = _current_stock(code)
+    snapshot = {
+        "group": (stock or {}).get("group", "初筛"),
+        "stage": (stock or {}).get("stage", "初筛通过"),
+        "ma5": number((stock or {}).get("ma5")),
+        "deviation5": number((stock or {}).get("deviation5")),
+        "bigCandlePct": number((stock or {}).get("bigCandlePct")),
+        "ma5Upward": bool((stock or {}).get("ma5Upward")),
+        "cashSufficient": number(account_state.get("availableCash")) >= price * 100,
+        "inTradingTime": is_a_share_trading_time(now),
+    }
+    if side == "买入":
+        conclusion, tags = _audit_buy(stock, code, name, price, number(account_state.get("availableCash")))
+    else:
+        conclusion, tags = "符合规则", []
+
+    frame = ensure_trade_frame(load_trades())
+    new_row = {
+        "代码": code,
+        "名称": name,
+        "类型": side,
+        "日期": trade_date,
+        "时间": trade_time,
+        "价格": price,
+        "数量": quantity,
+        "金额": fees["amount"],
+        "手续费": fees["commission"],
+        "印花税": fees["stamp_tax"],
+        "过户费": fees["transfer_fee"],
+        "总费用": fees["total_fee"],
+        "原因": str(payload.get("reason") or ""),
+        "备注": str(payload.get("remark") or ""),
+        "规则快照": json.dumps(snapshot, ensure_ascii=False),
+        "规则结论": conclusion,
+        "违规标签": json.dumps(tags, ensure_ascii=False),
+    }
+    updated = pd.concat([frame, pd.DataFrame([new_row])], ignore_index=True)
+    save_trades(updated)
+    _sync_after_trade(active_mode)
+    trade = trades_to_api(updated.iloc[[-1]])[0]
+    trade["id"] = api_trade_id(len(updated) - 1)
+    return {"success": True, "trade": trade}
+
+
+def delete_trade(trade_id: str, mode: str | None = None) -> dict[str, Any]:
+    index = trade_index_from_id(trade_id)
+    if index is None:
+        raise ValueError("交易流水ID无效")
+    frame = ensure_trade_frame(load_trades()).reset_index(drop=True)
+    if index < 0 or index >= len(frame):
+        raise ValueError("未找到该笔交易记录")
+    updated = frame.drop(index=index).reset_index(drop=True)
+    save_trades(updated)
+    _sync_after_trade(mode)
+    return {"success": True}
+
+
+def update_trade(trade_id: str, payload: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
+    index = trade_index_from_id(trade_id)
+    if index is None:
+        raise ValueError("交易流水ID无效")
+    frame = ensure_trade_frame(load_trades()).reset_index(drop=True)
+    if index < 0 or index >= len(frame):
+        raise ValueError("未找到该笔交易记录")
+
+    column_map = {
+        "code": "代码",
+        "name": "名称",
+        "date": "日期",
+        "time": "时间",
+        "price": "价格",
+        "quantity": "数量",
+        "reason": "原因",
+        "remark": "备注",
+        "rulesConclusion": "规则结论",
+    }
+    for api_key, column in column_map.items():
+        if api_key in payload:
+            frame.loc[index, column] = payload[api_key]
+    if "type" in payload:
+        frame.loc[index, "类型"] = "卖出" if str(payload["type"]).upper() in {"SELL", "卖出"} else "买入"
+    if "commission" in payload:
+        frame.loc[index, "手续费"] = number(payload["commission"])
+    if "stampDuty" in payload:
+        frame.loc[index, "印花税"] = number(payload["stampDuty"])
+    if "transferFee" in payload:
+        frame.loc[index, "过户费"] = number(payload["transferFee"])
+    if "violationTags" in payload:
+        frame.loc[index, "违规标签"] = json.dumps(parse_tags(payload["violationTags"]), ensure_ascii=False)
+
+    price = number(frame.loc[index, "价格"])
+    quantity = number(frame.loc[index, "数量"])
+    frame.loc[index, "金额"] = round(price * quantity, 2)
+    if "totalFee" in payload:
+        frame.loc[index, "总费用"] = number(payload["totalFee"])
+    else:
+        frame.loc[index, "总费用"] = (
+            number(frame.loc[index, "手续费"])
+            + number(frame.loc[index, "印花税"])
+            + number(frame.loc[index, "过户费"])
+        )
+    save_trades(frame)
+    _sync_after_trade(mode)
+    trade = trades_to_api(frame.iloc[[index]])[0]
+    trade["id"] = api_trade_id(index)
+    return {"success": True, "trade": trade}
