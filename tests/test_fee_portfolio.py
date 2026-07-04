@@ -7,6 +7,7 @@ import pandas as pd
 
 from backend.main import create_app
 from backend.services import portfolio_service
+from backend.storage import trade_repository
 from src.data import HOLDING_COLUMNS, TRADE_COLUMNS, WATCHLIST_COLUMNS
 from src.portfolio import account_state_from_trades, build_positions_from_trades, calculate_trade_fees
 from src.settings import mode_fee_settings, normalize_settings
@@ -134,6 +135,30 @@ class FeePortfolioTests(TestCase):
         self.assertEqual(edited_fees["min_commission"], 5.0)
         self.assertEqual(edited_fees["stamp_tax_rate"], 0.0005)
         self.assertEqual(edited_fees["transfer_fee_rate"], 0.00001)
+
+    def test_recalculate_fees_keeps_buy_fees_in_position_cost(self) -> None:
+        trades = _acceptance_trades()
+        fee_settings = {
+            "commission_rate": 0.00031,
+            "min_commission": 0.0,
+            "stamp_tax_rate": 0.0005,
+            "transfer_fee_rate": 0.00001,
+        }
+
+        with (
+            patch.object(trade_repository, "load_trade_frame", return_value=trades),
+            patch.object(trade_repository, "save_api_trades") as save_api_trades,
+        ):
+            api_trades = trade_repository.recalculate_api_trade_fees(
+                "simulation",
+                "模拟训练",
+                fee_settings,
+            )
+
+        china_jushi = api_trades[2]
+        self.assertEqual(china_jushi["totalFee"], 2.28)
+        self.assertEqual(round((china_jushi["amount"] + china_jushi["totalFee"]) / china_jushi["quantity"], 3), 71.473)
+        save_api_trades.assert_called_once()
 
     def test_portfolio_snapshot_defaults_to_last_trade_date_and_matches_ths_today_pnl(self) -> None:
         trades = _acceptance_trades()

@@ -73,39 +73,16 @@ const CARD_TEXT_ENDING_PERIOD = /([。．]|(?<!\.)\.)([”’"'）)\]】》]*)\s
 type AccountMode = "simulation" | "real";
 type QuoteRefreshTrigger = "manual" | "auto";
 type TurnoverScanTrigger = "manual" | "auto";
-type FeeProfile = "ths_simulation" | "zero_fee" | "custom" | "real_a_share";
 type FeeSettings = {
-  feeProfile: FeeProfile;
   commissionRate: number;
   minCommission: number;
   stampDutyRate: number;
   transferFeeRate: number;
 };
 
-const ZERO_FEE_SETTINGS = {
-  commissionRate: 0,
-  minCommission: 0,
-  stampDutyRate: 0,
-  transferFeeRate: 0
-};
-
 const DEFAULT_FEE_SETTINGS: FeeSettings = {
-  feeProfile: "ths_simulation",
   commissionRate: 0.00031,
   minCommission: 0,
-  stampDutyRate: 0.0005,
-  transferFeeRate: 0.00001
-};
-
-const ZERO_FEE_PROFILE_SETTINGS: FeeSettings = {
-  feeProfile: "zero_fee",
-  ...ZERO_FEE_SETTINGS
-};
-
-const REAL_A_SHARE_FEE_SETTINGS: FeeSettings = {
-  feeProfile: "real_a_share",
-  commissionRate: 0.00025,
-  minCommission: 5,
   stampDutyRate: 0.0005,
   transferFeeRate: 0.00001
 };
@@ -263,16 +240,8 @@ function numberSetting(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function feeProfileFromApi(value: unknown): FeeProfile {
-  return value === "real_a_share" || value === "zero_fee" || value === "custom"
-    ? value
-    : "ths_simulation";
-}
-
 function feeSettingsFromApi(settings: any): FeeSettings {
-  const feeProfile = feeProfileFromApi(settings?.feeProfile);
   return {
-    feeProfile,
     commissionRate: numberSetting(settings?.commissionRate, DEFAULT_FEE_SETTINGS.commissionRate),
     minCommission: numberSetting(settings?.minCommission, DEFAULT_FEE_SETTINGS.minCommission),
     stampDutyRate: numberSetting(settings?.stampDutyRate, DEFAULT_FEE_SETTINGS.stampDutyRate),
@@ -280,40 +249,12 @@ function feeSettingsFromApi(settings: any): FeeSettings {
   };
 }
 
-function isZeroFeeSettings(settings: FeeSettings): boolean {
-  return (
-    settings.commissionRate === 0 &&
-    settings.minCommission === 0 &&
-    settings.stampDutyRate === 0 &&
-    settings.transferFeeRate === 0
-  );
+function feeSettingsWithValue(settings: FeeSettings, key: keyof FeeSettings, value: number): FeeSettings {
+  return { ...settings, [key]: value };
 }
 
-function feeProfileForValues(settings: FeeSettings): FeeProfile {
-  return settings.feeProfile === "ths_simulation"
-    ? "ths_simulation"
-    : isZeroFeeSettings(settings)
-      ? "zero_fee"
-      : settings.feeProfile === "real_a_share"
-        ? "real_a_share"
-        : "custom";
-}
-
-function feeSettingsWithValue(settings: FeeSettings, key: keyof Omit<FeeSettings, "feeProfile">, value: number): FeeSettings {
-  const next = { ...settings, [key]: value };
-  return { ...next, feeProfile: "custom" };
-}
-
-function feeSettingsForProfile(profile: FeeProfile): FeeSettings {
-  if (profile === "ths_simulation") return { ...DEFAULT_FEE_SETTINGS };
-  if (profile === "zero_fee") return { ...ZERO_FEE_PROFILE_SETTINGS };
-  return { ...REAL_A_SHARE_FEE_SETTINGS, feeProfile: profile };
-}
-
-function feeSettingsLabel(settings: FeeSettings, mode: AccountMode): string {
-  if (settings.feeProfile === "ths_simulation") return "同花顺模拟隐含费用口径";
-  if (isZeroFeeSettings(settings)) return "费用全 0 口径";
-  return mode === "real" ? "实盘/A股费用口径" : "自定义费用口径";
+function feeSettingsLabel(_settings: FeeSettings, mode: AccountMode): string {
+  return mode === "real" ? "实盘费用参数" : "模拟费用参数";
 }
 
 function percentFeeLabel(value: number): string {
@@ -1834,7 +1775,6 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...newFees,
-          feeProfile: feeProfileForValues(newFees),
           currentMode
         })
       });
@@ -5072,42 +5012,6 @@ export default function App() {
                   <span className="font-mono text-slate-500">
                     佣金 {percentFeeLabel(feeSettings.commissionRate)} / 最低 {feeSettings.minCommission.toFixed(2)} / 印花税 {percentFeeLabel(feeSettings.stampDutyRate)} / 过户费 {percentFeeLabel(feeSettings.transferFeeRate)}
                   </span>
-                </div>
-
-                <div className="grid grid-cols-3 rounded border border-slate-700 bg-slate-950 p-1">
-                  <button
-                    type="button"
-                    onClick={() => setFeeSettings(feeSettingsForProfile("ths_simulation"))}
-                    className={`px-3 py-2 text-xs font-semibold rounded transition ${
-                      feeSettings.feeProfile === "ths_simulation"
-                        ? "bg-cyan-600 text-white"
-                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-                    }`}
-                  >
-                    同花顺隐含费用
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFeeSettings(feeSettingsForProfile("zero_fee"))}
-                    className={`px-3 py-2 text-xs font-semibold rounded transition ${
-                      feeSettings.feeProfile === "zero_fee"
-                        ? "bg-cyan-600 text-white"
-                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-                    }`}
-                  >
-                    费用全 0
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFeeSettings(feeSettingsForProfile("custom"))}
-                    className={`px-3 py-2 text-xs font-semibold rounded transition ${
-                      feeSettings.feeProfile === "custom" || feeSettings.feeProfile === "real_a_share"
-                        ? "bg-cyan-600 text-white"
-                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-                    }`}
-                  >
-                    自定义费用
-                  </button>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
