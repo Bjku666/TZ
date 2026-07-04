@@ -22,7 +22,7 @@ from src.trading_rules_config import (
 )
 from src.storage import load_last_refresh, load_quote_snapshot
 
-from backend.services.settings_service import account_mode_name, current_mode, initial_cash
+from backend.services.settings_service import account_mode_name, current_mode, get_settings, initial_cash
 from backend.storage.csv_adapter import number, trades_to_api
 from backend.storage import trade_repository
 
@@ -425,10 +425,58 @@ def portfolio_snapshot(
         "totalAssets": round(number(state.get("当前总资产")), 2),
         "realizedPnL": round(number(state.get("已实现盈亏")), 2),
         "floatingPnL": round(number(state.get("浮动盈亏")), 2),
+        "holdingPnL": round(number(state.get("浮动盈亏")), 2),
         "totalPnL": round(number(state.get("总盈亏")), 2),
+        "accountPnL": round(number(state.get("总盈亏")), 2),
         "totalReturnPct": round(number(state.get("总收益率%")), 2),
         "todayPnL": round(today_pnl, 2),
         "todayRealizedPnL": round(today_realized_pnl, 2),
         "asOfDate": settlement_date.isoformat(),
     }
+    settings = get_settings()
+    reconciliation = settings.get("thsReconciliation") or {}
+    if active_mode == "simulation" and reconciliation.get("enabled"):
+        discipline_capital = number(state.get("初始本金"))
+        broker_capital = number(reconciliation.get("accountCapital"), 200000)
+        capital_offset = broker_capital - discipline_capital
+        total_assets = number(reconciliation.get("totalAssets")) - capital_offset
+        available_cash = number(reconciliation.get("availableCash")) - capital_offset
+        holding_value = number(reconciliation.get("holdingValue"))
+        holding_pnl = number(reconciliation.get("holdingPnL"))
+        account_pnl = total_assets - discipline_capital
+        account_state.update(
+            {
+                "availableCash": round(available_cash, 2),
+                "holdingValue": round(holding_value, 2),
+                "totalAssets": round(total_assets, 2),
+                "floatingPnL": round(holding_pnl, 2),
+                "holdingPnL": round(holding_pnl, 2),
+                "totalPnL": round(account_pnl, 2),
+                "accountPnL": round(account_pnl, 2),
+                "totalReturnPct": round(account_pnl / discipline_capital * 100, 2)
+                if discipline_capital
+                else 0,
+                "todayPnL": round(number(reconciliation.get("todayPnL")), 2),
+                "reconciliationMode": True,
+            }
+        )
+        if len(api_positions) == 1:
+            position = api_positions[0]
+            quantity = number(position.get("quantity"))
+            if quantity > 0:
+                reconciled_cost = (holding_value - holding_pnl) / quantity
+                current_price = number(position.get("currentPrice"))
+                position.update(
+                    {
+                        "avgCost": round(reconciled_cost, 3),
+                        "marketValue": round(holding_value, 2),
+                        "floatingPnL": round(holding_pnl, 2),
+                        "floatingPnLPct": round(holding_pnl / (reconciled_cost * quantity) * 100, 2)
+                        if reconciled_cost
+                        else 0,
+                        "currentLossAmount": round(max(0.0, (reconciled_cost - current_price) * quantity), 2),
+                    }
+                )
+    else:
+        account_state["reconciliationMode"] = False
     return {"accountState": account_state, "positions": api_positions, "asOfDate": settlement_date.isoformat()}

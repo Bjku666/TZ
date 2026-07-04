@@ -192,11 +192,14 @@ export interface AccountState {
   totalAssets: number;
   realizedPnL: number;
   floatingPnL: number;
+  holdingPnL: number;
   totalPnL: number;
+  accountPnL: number;
   totalReturnPct: number;
   todayPnL?: number;
   todayRealizedPnL?: number;
   asOfDate?: string;
+  reconciliationMode?: boolean;
 }
 
 export type SelfDiagnosisType = "holding" | "todayBuy" | "todaySell" | "manual";

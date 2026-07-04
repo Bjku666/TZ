@@ -11,11 +11,13 @@ from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_grou
 from src.settings import (
     FEE_API_ALIASES,
     FEE_DEFAULTS,
+    FEE_PROFILE_CUSTOM,
     FEE_PROFILE_REAL_A_SHARE,
     FEE_PROFILE_THS_SIMULATION,
     account_mode_from_api,
     api_mode_from_account_mode,
     fee_prefix_for_mode,
+    fee_defaults_for_profile,
     mode_fee_settings,
     normalize_fee_profile,
     profile_from_fee_values,
@@ -143,6 +145,15 @@ def frontend_settings(settings: dict[str, Any]) -> dict[str, Any]:
             "stampDutyRate": real_fees["stamp_tax_rate"],
             "transferFeeRate": real_fees["transfer_fee_rate"],
         },
+        "thsReconciliation": {
+            "enabled": bool(settings.get("ths_reconciliation_enabled", False)),
+            "accountCapital": number(settings.get("ths_account_capital"), 200000),
+            "totalAssets": number(settings.get("ths_total_assets"), 199806.13),
+            "availableCash": number(settings.get("ths_available_cash"), 192716.13),
+            "holdingValue": number(settings.get("ths_holding_value"), 7090),
+            "holdingPnL": number(settings.get("ths_holding_pnl"), -57.28),
+            "todayPnL": number(settings.get("ths_today_pnl"), -242.27),
+        },
     }
 
 
@@ -154,6 +165,19 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
         out["simulation_capital"] = number(updates["initialCash"], number(current.get("simulation_capital"), 10000))
     if "realInitialCash" in updates:
         out["live_capital"] = number(updates["realInitialCash"], number(current.get("live_capital"), 5000))
+    if isinstance(updates.get("thsReconciliation"), dict):
+        reconciliation = updates["thsReconciliation"]
+        out["ths_reconciliation_enabled"] = bool(reconciliation.get("enabled", False))
+        for api_key, internal_key, default in (
+            ("accountCapital", "ths_account_capital", 200000),
+            ("totalAssets", "ths_total_assets", 199806.13),
+            ("availableCash", "ths_available_cash", 192716.13),
+            ("holdingValue", "ths_holding_value", 7090),
+            ("holdingPnL", "ths_holding_pnl", -57.28),
+            ("todayPnL", "ths_today_pnl", -242.27),
+        ):
+            if api_key in reconciliation:
+                out[internal_key] = number(reconciliation[api_key], default)
 
     mode_for_fee = updates.get("currentMode") or api_mode_from_account_mode(out.get("account_mode"))
     fee_prefix = fee_prefix_for_mode(mode_for_fee)
@@ -162,12 +186,9 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
     if explicit_profile_update and not fee_value_update:
         profile = normalize_fee_profile(updates.get("feeProfile", updates.get("fee_profile")), fee_prefix)
         out[f"{fee_prefix}_fee_profile"] = profile
-        if profile == FEE_PROFILE_THS_SIMULATION:
-            for internal_key in FEE_DEFAULTS:
-                out[f"{fee_prefix}_{internal_key}"] = 0.0
-        elif profile == FEE_PROFILE_REAL_A_SHARE:
-            for internal_key, default in FEE_DEFAULTS.items():
-                out[f"{fee_prefix}_{internal_key}"] = number(updates.get(_api_key_for_fee(internal_key)), default)
+        defaults = fee_defaults_for_profile(profile)
+        for internal_key, default in defaults.items():
+            out[f"{fee_prefix}_{internal_key}"] = number(updates.get(_api_key_for_fee(internal_key)), default)
 
     for api_key, internal_key in FEE_API_ALIASES.items():
         if api_key in updates:
@@ -175,8 +196,8 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
             mode_key = f"{fee_prefix}_{internal_key}"
             out[mode_key] = number(updates[api_key], number(current.get(mode_key), default))
     if fee_value_update:
-        out[f"{fee_prefix}_fee_profile"] = profile_from_fee_values(
-            {key: out.get(f"{fee_prefix}_{key}") for key in FEE_DEFAULTS},
+        out[f"{fee_prefix}_fee_profile"] = normalize_fee_profile(
+            updates.get("feeProfile", updates.get("fee_profile", FEE_PROFILE_CUSTOM)),
             fee_prefix,
         )
 
@@ -187,10 +208,6 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
             out.get(f"{active_prefix}_{internal_key}"),
             FEE_DEFAULTS[internal_key],
         )
-    out["fee_profile"] = profile_from_fee_values(
-        {key: out.get(key) for key in FEE_DEFAULTS},
-        active_prefix,
-    )
     return out
 
 

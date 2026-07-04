@@ -126,10 +126,10 @@ class FeePortfolioTests(TestCase):
         )
         edited_fees = mode_fee_settings(edited, "simulation")
 
-        self.assertEqual(default_fees["commission_rate"], 0)
+        self.assertEqual(default_fees["commission_rate"], 0.00031)
         self.assertEqual(default_fees["min_commission"], 0)
-        self.assertEqual(default_fees["stamp_tax_rate"], 0)
-        self.assertEqual(default_fees["transfer_fee_rate"], 0)
+        self.assertEqual(default_fees["stamp_tax_rate"], 0.0005)
+        self.assertEqual(default_fees["transfer_fee_rate"], 0.00001)
         self.assertEqual(edited_fees["commission_rate"], 0.0003)
         self.assertEqual(edited_fees["min_commission"], 5.0)
         self.assertEqual(edited_fees["stamp_tax_rate"], 0.0005)
@@ -152,6 +152,7 @@ class FeePortfolioTests(TestCase):
             patch.object(portfolio_service, "load_quote_snapshot", return_value=pd.DataFrame()),
             patch.object(portfolio_service, "load_last_refresh", return_value={}),
             patch.object(portfolio_service, "load_cached_history", return_value=shilan_history),
+            patch.object(portfolio_service, "get_settings", return_value={"thsReconciliation": {"enabled": False}}),
             patch.object(
                 portfolio_service,
                 "_reference_from_quote_archives",
@@ -184,6 +185,7 @@ class FeePortfolioTests(TestCase):
             patch.object(portfolio_service, "load_quote_snapshot", return_value=pd.DataFrame()),
             patch.object(portfolio_service, "load_last_refresh", return_value={}),
             patch.object(portfolio_service, "load_cached_history", return_value=stale_history),
+            patch.object(portfolio_service, "get_settings", return_value={"thsReconciliation": {"enabled": False}}),
             patch.object(
                 portfolio_service,
                 "_reference_from_quote_archives",
@@ -195,3 +197,41 @@ class FeePortfolioTests(TestCase):
 
         self.assertEqual(snapshot["accountState"]["totalPnL"], -186.00)
         self.assertEqual(snapshot["accountState"]["todayPnL"], -236.00)
+
+    def test_ths_reconciliation_converts_broker_capital_to_discipline_capital(self) -> None:
+        trades = _acceptance_trades()
+        reconciliation_settings = {
+            "thsReconciliation": {
+                "enabled": True,
+                "accountCapital": 200000,
+                "totalAssets": 199806.13,
+                "availableCash": 192716.13,
+                "holdingValue": 7090,
+                "holdingPnL": -57.28,
+                "todayPnL": -242.27,
+            }
+        }
+
+        with (
+            patch.object(portfolio_service.trade_repository, "load_trade_frame", return_value=trades),
+            patch.object(portfolio_service, "load_watchlist", return_value=_watchlist()),
+            patch.object(portfolio_service, "load_holdings", return_value=pd.DataFrame(columns=HOLDING_COLUMNS)),
+            patch.object(portfolio_service, "load_quote_snapshot", return_value=pd.DataFrame()),
+            patch.object(portfolio_service, "load_last_refresh", return_value={}),
+            patch.object(portfolio_service, "load_cached_history", return_value=pd.DataFrame()),
+            patch.object(portfolio_service, "initial_cash", return_value=10000),
+            patch.object(portfolio_service, "get_settings", return_value=reconciliation_settings),
+        ):
+            snapshot = portfolio_service.portfolio_snapshot("simulation")
+
+        account = snapshot["accountState"]
+        self.assertEqual(snapshot["asOfDate"], "2026-07-03")
+        self.assertEqual(account["totalAssets"], 9806.13)
+        self.assertEqual(account["holdingValue"], 7090.00)
+        self.assertEqual(account["availableCash"], 2716.13)
+        self.assertEqual(account["holdingPnL"], -57.28)
+        self.assertEqual(account["todayPnL"], -242.27)
+        self.assertEqual(account["accountPnL"], -193.87)
+        self.assertEqual(account["totalPnL"], -193.87)
+        self.assertEqual(account["totalReturnPct"], -1.94)
+        self.assertEqual(snapshot["positions"][0]["avgCost"], 71.473)

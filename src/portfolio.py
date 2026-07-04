@@ -483,7 +483,9 @@ def account_state_from_trades(
         "当前总资产": total_assets,
         "已实现盈亏": realized_pnl,
         "浮动盈亏": floating_pnl,
+        "持仓总盈亏": floating_pnl,
         "总盈亏": total_pnl,
+        "账户累计盈亏": total_pnl,
         "总收益率%": total_return_pct,
         "更新时间": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
     }

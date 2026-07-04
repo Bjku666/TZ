@@ -73,7 +73,7 @@ const CARD_TEXT_ENDING_PERIOD = /([。．]|(?<!\.)\.)([”’"'）)\]】》]*)\s
 type AccountMode = "simulation" | "real";
 type QuoteRefreshTrigger = "manual" | "auto";
 type TurnoverScanTrigger = "manual" | "auto";
-type FeeProfile = "ths_simulation" | "real_a_share";
+type FeeProfile = "ths_simulation" | "zero_fee" | "custom" | "real_a_share";
 type FeeSettings = {
   feeProfile: FeeProfile;
   commissionRate: number;
@@ -91,6 +91,14 @@ const ZERO_FEE_SETTINGS = {
 
 const DEFAULT_FEE_SETTINGS: FeeSettings = {
   feeProfile: "ths_simulation",
+  commissionRate: 0.00031,
+  minCommission: 0,
+  stampDutyRate: 0.0005,
+  transferFeeRate: 0.00001
+};
+
+const ZERO_FEE_PROFILE_SETTINGS: FeeSettings = {
+  feeProfile: "zero_fee",
   ...ZERO_FEE_SETTINGS
 };
 
@@ -256,7 +264,9 @@ function numberSetting(value: unknown, fallback: number): number {
 }
 
 function feeProfileFromApi(value: unknown): FeeProfile {
-  return value === "real_a_share" ? "real_a_share" : "ths_simulation";
+  return value === "real_a_share" || value === "zero_fee" || value === "custom"
+    ? value
+    : "ths_simulation";
 }
 
 function feeSettingsFromApi(settings: any): FeeSettings {
@@ -280,21 +290,30 @@ function isZeroFeeSettings(settings: FeeSettings): boolean {
 }
 
 function feeProfileForValues(settings: FeeSettings): FeeProfile {
-  return isZeroFeeSettings(settings) ? "ths_simulation" : "real_a_share";
+  return settings.feeProfile === "ths_simulation"
+    ? "ths_simulation"
+    : isZeroFeeSettings(settings)
+      ? "zero_fee"
+      : settings.feeProfile === "real_a_share"
+        ? "real_a_share"
+        : "custom";
 }
 
 function feeSettingsWithValue(settings: FeeSettings, key: keyof Omit<FeeSettings, "feeProfile">, value: number): FeeSettings {
   const next = { ...settings, [key]: value };
-  return { ...next, feeProfile: feeProfileForValues(next) };
+  return { ...next, feeProfile: "custom" };
 }
 
 function feeSettingsForProfile(profile: FeeProfile): FeeSettings {
-  return profile === "ths_simulation" ? { ...DEFAULT_FEE_SETTINGS } : { ...REAL_A_SHARE_FEE_SETTINGS };
+  if (profile === "ths_simulation") return { ...DEFAULT_FEE_SETTINGS };
+  if (profile === "zero_fee") return { ...ZERO_FEE_PROFILE_SETTINGS };
+  return { ...REAL_A_SHARE_FEE_SETTINGS, feeProfile: profile };
 }
 
 function feeSettingsLabel(settings: FeeSettings, mode: AccountMode): string {
-  if (isZeroFeeSettings(settings)) return "同花顺模拟口径（全部费用为0）";
-  return mode === "real" ? "实盘/A股费用口径（按当前配置计算）" : "模拟训练费率（按当前配置计算）";
+  if (settings.feeProfile === "ths_simulation") return "同花顺模拟隐含费用口径";
+  if (isZeroFeeSettings(settings)) return "费用全 0 口径";
+  return mode === "real" ? "实盘/A股费用口径" : "自定义费用口径";
 }
 
 function percentFeeLabel(value: number): string {
@@ -698,7 +717,9 @@ export default function App() {
     totalAssets: 10000,
     realizedPnL: 0,
     floatingPnL: 0,
+    holdingPnL: 0,
     totalPnL: 0,
+    accountPnL: 0,
     totalReturnPct: 0,
     todayPnL: 0,
     todayRealizedPnL: 0,
@@ -766,6 +787,15 @@ export default function App() {
 
   // 交易费用配置 state
   const [feeSettings, setFeeSettings] = useState<FeeSettings>(DEFAULT_FEE_SETTINGS);
+  const [thsReconciliation, setThsReconciliation] = useState({
+    enabled: false,
+    accountCapital: 200000,
+    totalAssets: 199806.13,
+    availableCash: 192716.13,
+    holdingValue: 7090,
+    holdingPnL: -57.28,
+    todayPnL: -242.27
+  });
   const [tradingRules, setTradingRules] = useState<TradingRulesConfig>(DEFAULT_TRADING_RULES);
 
   // 5个复盘视图状态与聚合数据 state
@@ -1069,6 +1099,9 @@ export default function App() {
   const applyRuntimeSettings = (settings: any) => {
     setCurrentMode(modeFromApi(settings?.currentMode));
     setFeeSettings(feeSettingsFromApi(settings));
+    if (settings?.thsReconciliation) {
+      setThsReconciliation(settings.thsReconciliation);
+    }
   };
 
   const loadRulesConfig = async () => {
@@ -1825,6 +1858,23 @@ export default function App() {
       }
     } catch (err) {
       logAction("❌ 保存费率配置通信失败");
+    }
+  };
+
+  const handleSaveThsReconciliation = async () => {
+    try {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thsReconciliation })
+      });
+      if (!res.ok) throw new Error("保存失败");
+      const settings = await res.json();
+      applyRuntimeSettings(settings);
+      await loadAllData(true);
+      logAction(`⚙️ 同花顺对账模式已${thsReconciliation.enabled ? "启用" : "关闭"}。`);
+    } catch {
+      alert("同花顺对账设置保存失败");
     }
   };
 
@@ -2983,21 +3033,27 @@ export default function App() {
             <span className="font-bold text-slate-100 text-[14px]">{accountState.availableCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[12px]">总盈亏:</span>
-            <span className={`font-bold text-[14px] ${accountState.totalPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-              {signedCurrency(accountState.totalPnL)}
+            <span className="text-slate-400 text-[12px]" title="当前全部持仓浮动盈亏之和；对应同花顺模拟账户的总盈亏">持仓总盈亏:</span>
+            <span className={`font-bold text-[14px] ${accountState.holdingPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
+              {signedCurrency(accountState.holdingPnL)}
             </span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[12px]" title={accountState.asOfDate ? `结算日 ${accountState.asOfDate}` : undefined}>当日盈亏:</span>
+            <span className="text-slate-400 text-[12px]" title={accountState.asOfDate ? `最近交易日 ${accountState.asOfDate}` : undefined}>当日参考盈亏:</span>
             <span className={`font-bold text-[14px] ${todayTotalPnLForAccount >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
               {signedCurrency(todayTotalPnLForAccount)}
             </span>
           </div>
+          <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
+            <span className="text-slate-400 text-[12px]">账户累计盈亏:</span>
+            <span className={`font-bold text-[14px] ${accountState.accountPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
+              {signedCurrency(accountState.accountPnL)}
+            </span>
+          </div>
           <div className="flex items-center space-x-1.5 last:border-0">
             <span className="text-slate-400 text-[12px]">总收益率:</span>
-            <span className={`font-bold text-[14px] ${accountState.totalPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-              {accountState.totalPnL >= 0 ? "+" : ""}{accountState.totalReturnPct.toFixed(2)}%
+            <span className={`font-bold text-[14px] ${accountState.accountPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
+              {accountState.accountPnL >= 0 ? "+" : ""}{accountState.totalReturnPct.toFixed(2)}%
             </span>
           </div>
         </div>
@@ -5024,7 +5080,7 @@ export default function App() {
                   </span>
                 </div>
 
-                <div className="grid grid-cols-2 rounded border border-slate-700 bg-slate-950 p-1">
+                <div className="grid grid-cols-3 rounded border border-slate-700 bg-slate-950 p-1">
                   <button
                     type="button"
                     onClick={() => setFeeSettings(feeSettingsForProfile("ths_simulation"))}
@@ -5034,18 +5090,29 @@ export default function App() {
                         : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
                     }`}
                   >
-                    同花顺模拟
+                    同花顺隐含费用
                   </button>
                   <button
                     type="button"
-                    onClick={() => setFeeSettings(feeSettingsForProfile("real_a_share"))}
+                    onClick={() => setFeeSettings(feeSettingsForProfile("zero_fee"))}
                     className={`px-3 py-2 text-xs font-semibold rounded transition ${
-                      feeSettings.feeProfile === "real_a_share"
+                      feeSettings.feeProfile === "zero_fee"
                         ? "bg-cyan-600 text-white"
                         : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
                     }`}
                   >
-                    A股费用
+                    费用全 0
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFeeSettings(feeSettingsForProfile("custom"))}
+                    className={`px-3 py-2 text-xs font-semibold rounded transition ${
+                      feeSettings.feeProfile === "custom" || feeSettings.feeProfile === "real_a_share"
+                        ? "bg-cyan-600 text-white"
+                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                    }`}
+                  >
+                    自定义费用
                   </button>
                 </div>
 
@@ -5101,14 +5168,6 @@ export default function App() {
 
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-end gap-2 pt-2 border-t border-slate-800/60">
                   <button
-                    type="button"
-                    onClick={() => handleSaveFees(feeSettingsForProfile("ths_simulation"), true)}
-                    className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-cyan-950 hover:bg-cyan-900 border border-cyan-800 text-cyan-200 rounded text-xs font-semibold transition"
-                  >
-                    <CheckCircle2 className="h-3.5 w-3.5" />
-                    <span>一键对齐同花顺</span>
-                  </button>
-                  <button
                     onClick={() => handleRecalculateFees(false)}
                     className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-slate-950 hover:bg-slate-900 border border-slate-700 text-slate-300 rounded text-xs font-semibold transition"
                   >
@@ -5123,6 +5182,67 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+              {currentMode === "simulation" && (
+                <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-4">
+                  <div className="flex items-center justify-between gap-3 border-b border-slate-800 pb-3">
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-200">同花顺对账模式</h3>
+                      <CardText className="mt-1 text-[10px] text-slate-500">
+                        手工录入截图数字；总资产和可用资金按纪律本金换算，市值与盈亏保持原值。
+                      </CardText>
+                    </div>
+                    <label className="inline-flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={thsReconciliation.enabled}
+                        onChange={event => setThsReconciliation(previous => ({ ...previous, enabled: event.target.checked }))}
+                        className="h-4 w-4 accent-cyan-500"
+                      />
+                      启用
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    {[
+                      ["accountCapital", "同花顺账户本金"],
+                      ["totalAssets", "同花顺总资产"],
+                      ["availableCash", "同花顺可用资金"],
+                      ["holdingValue", "总市值"],
+                      ["holdingPnL", "持仓总盈亏"],
+                      ["todayPnL", "当日参考盈亏"]
+                    ].map(([key, label]) => (
+                      <label key={key} className="text-xs font-bold text-slate-300">
+                        {label}
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={thsReconciliation[key as keyof typeof thsReconciliation] as number}
+                          onChange={event => setThsReconciliation(previous => ({
+                            ...previous,
+                            [key]: Number(event.target.value)
+                          }))}
+                          className="mt-1 w-full rounded border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-300 focus:border-cyan-500 focus:outline-none"
+                        />
+                      </label>
+                    ))}
+                  </div>
+
+                  <div className="flex items-center justify-between gap-3 border-t border-slate-800 pt-3 text-xs">
+                    <span className="text-slate-500">
+                      当前纪律本金 {accountState.initialCash.toFixed(2)}，资金偏移 {(thsReconciliation.accountCapital - accountState.initialCash).toFixed(2)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleSaveThsReconciliation}
+                      className="inline-flex items-center gap-1.5 rounded bg-cyan-600 px-4 py-2 font-semibold text-white hover:bg-cyan-500"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      保存对账设置
+                    </button>
+                  </div>
+                </div>
+              )}
 
               <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-4">
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
