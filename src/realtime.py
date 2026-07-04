@@ -31,10 +31,23 @@ QUOTE_COLUMNS = [
 
 EASTMONEY_SPOT_HOSTS = [
     "push2.eastmoney.com",
+    "push2his.eastmoney.com",
     "82.push2.eastmoney.com",
+    "88.push2.eastmoney.com",
 ]
 
-QUOTE_SOURCE_OPTIONS = ["自动切换", "东方财富", "新浪行情", "AKShare", "手动上传/不刷新"]
+EASTMONEY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Referer": "https://quote.eastmoney.com/",
+    "Connection": "close",
+}
+
+QUOTE_SOURCE_OPTIONS = ["自动切换", "东方财富", "efinance", "新浪行情", "AKShare", "手动上传/不刷新"]
 
 
 def china_now() -> datetime:
@@ -77,7 +90,21 @@ def _short_error(exc: Exception) -> str:
     text = str(exc).strip()
     if not text:
         text = exc.__class__.__name__
-    return text[:180]
+
+    normalized = text.lower()
+    if "remote end closed connection" in normalized:
+        return "行情源远端主动断开，可能是临时限流或网络不稳定"
+    if "max retries exceeded" in normalized:
+        return "行情源多次重试失败，当前暂不可用"
+    if "read timed out" in normalized or "timed out" in normalized:
+        return "行情源请求超时"
+    if "connection reset" in normalized:
+        return "行情源连接被重置"
+    if "name or service not known" in normalized or "nodename nor servname" in normalized:
+        return "行情源域名解析失败"
+    if "ssl" in normalized:
+        return "行情源 SSL 连接失败"
+    return text[:80]
 
 
 def _clean_numeric(value: object) -> object:
@@ -119,6 +146,8 @@ def fetch_realtime_quotes(
 
     if source == "AKShare":
         return fetch_realtime_quotes_akshare(wanted)
+    if source == "efinance":
+        return fetch_realtime_quotes_efinance(wanted)
     if source == "东方财富":
         return fetch_realtime_quotes_eastmoney(wanted, timeout=timeout)
     if source == "新浪行情":
@@ -137,6 +166,7 @@ def fetch_realtime_quotes_auto(wanted: set[str], timeout: int = 8) -> pd.DataFra
 
     for source_name, fetcher in [
         ("东方财富", lambda values: fetch_realtime_quotes_eastmoney(values, timeout=timeout)),
+        ("efinance", fetch_realtime_quotes_efinance),
         ("AKShare", fetch_realtime_quotes_akshare),
         ("新浪行情", lambda values: fetch_realtime_quotes_sina(values, timeout=timeout)),
     ]:
@@ -193,6 +223,24 @@ def fetch_realtime_quotes_eastmoney(wanted: set[str], timeout: int = 8) -> pd.Da
     return _with_status(frame[QUOTE_COLUMNS].reset_index(drop=True), "东方财富", "东方财富行情已更新")
 
 
+def _eastmoney_json_request(url: str, timeout: int = 8, retries: int = 3) -> dict:
+    last_error: Exception | None = None
+
+    for attempt in range(retries):
+        request = urllib.request.Request(url, headers=EASTMONEY_HEADERS)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries - 1:
+                time_module.sleep(0.4 * (attempt + 1))
+
+    if last_error is not None:
+        raise last_error
+    return {}
+
+
 def _eastmoney_clist_request(host: str, page: int, page_size: int, timeout: int) -> dict:
     params = {
         "pn": str(page),
@@ -207,15 +255,7 @@ def _eastmoney_clist_request(host: str, page: int, page_size: int, timeout: int)
         "fields": "f12,f14,f2,f3,f6,f17,f18,f15,f16",
     }
     url = f"https://{host}/api/qt/clist/get?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://quote.eastmoney.com/",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return _eastmoney_json_request(url, timeout=timeout)
 
 
 def _eastmoney_turnover_rank_request(host: str, page: int, page_size: int, timeout: int) -> dict:
@@ -232,27 +272,7 @@ def _eastmoney_turnover_rank_request(host: str, page: int, page_size: int, timeo
         "fields": "f12,f14,f2,f3,f6,f17,f18,f15,f16",
     }
     url = f"https://{host}/api/qt/clist/get?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://quote.eastmoney.com/",
-            "Connection": "close",
-        },
-    )
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except Exception as exc:
-            last_error = exc
-            if attempt < 2:
-                time_module.sleep(0.25 * (attempt + 1))
-    if last_error is not None:
-        raise last_error
-    return {}
+    return _eastmoney_json_request(url, timeout=timeout)
 
 
 def _eastmoney_ulist_request(host: str, secids: list[str], timeout: int) -> dict:
@@ -264,15 +284,7 @@ def _eastmoney_ulist_request(host: str, secids: list[str], timeout: int) -> dict
         "secids": ",".join(secids),
     }
     url = f"https://{host}/api/qt/ulist.np/get?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://quote.eastmoney.com/",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return _eastmoney_json_request(url, timeout=timeout)
 
 
 def _standardize_eastmoney_rows(rows: list[dict]) -> pd.DataFrame:
@@ -318,6 +330,50 @@ def _pool_candidates_from_quotes(quotes: pd.DataFrame, limit: int) -> pd.DataFra
         .dropna(subset=["成交额"])
         .sort_values("成交额", ascending=False)
         .head(limit)
+    )
+
+
+def _build_pool_result(pool: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFrame:
+    pool = pool.reset_index(drop=True)
+    result = pd.DataFrame({
+        "代码": pool["代码"],
+        "名称": pool["名称"],
+        "现价": pool["最新价"],
+        "涨跌幅%": pool["涨跌幅%"],
+        "成交额": pool["成交额"],
+        "成交额排名": range(1, len(pool) + 1),
+        "上市板块": "主板",
+    })
+    return _with_status(
+        result.reset_index(drop=True),
+        quotes.attrs.get("source", "自动切换"),
+        quotes.attrs.get("message", "自动股票池已生成"),
+    )
+
+
+def _build_pool_from_source_frames(
+    source_frames: list[pd.DataFrame],
+    safe_limit: int,
+    source: str,
+) -> pd.DataFrame:
+    if not source_frames:
+        return pd.DataFrame()
+
+    combined = (
+        pd.concat(source_frames, ignore_index=True)
+        .drop_duplicates("代码", keep="first")
+        .reset_index(drop=True)
+    )
+    pool = _pool_candidates_from_quotes(combined, safe_limit)
+    if len(pool) >= safe_limit:
+        return _build_pool_result(
+            pool,
+            _with_status(combined, "多源合并", "多源合并生成股票池"),
+        )
+    return _with_status(
+        pd.DataFrame(),
+        "多源合并" if source == "自动切换" else source_frames[0].attrs.get("source", source),
+        f"只获取到 {len(pool)}/{safe_limit} 只主板成交额候选，为避免覆盖为不完整名单，已停止生成",
     )
 
 
@@ -481,6 +537,8 @@ def fetch_full_market_quotes(source: str = "自动切换") -> pd.DataFrame:
         return _empty_full_quotes("当前设置为手动上传/不刷新", source)
     if source == "AKShare":
         return fetch_full_market_quotes_akshare()
+    if source == "efinance":
+        return fetch_full_market_quotes_efinance()
     if source == "东方财富":
         return fetch_full_market_quotes_eastmoney()
     if source == "新浪行情":
@@ -489,12 +547,17 @@ def fetch_full_market_quotes(source: str = "自动切换") -> pd.DataFrame:
     eastmoney = fetch_full_market_quotes_eastmoney()
     if not eastmoney.empty:
         return eastmoney
+    efinance = fetch_full_market_quotes_efinance()
+    if not efinance.empty:
+        return efinance
     akshare = fetch_full_market_quotes_akshare()
     if not akshare.empty:
         return akshare
     return _empty_full_quotes(
         "东方财富: "
         + eastmoney.attrs.get("message", "失败")
+        + "；efinance: "
+        + efinance.attrs.get("message", "失败")
         + "；AKShare: "
         + akshare.attrs.get("message", "失败"),
         "自动切换",
@@ -536,69 +599,123 @@ def fetch_realtime_quotes_akshare(wanted: set[str]) -> pd.DataFrame:
     return _with_status(result, "AKShare", "AKShare 行情已更新")
 
 
+def fetch_realtime_quotes_efinance(wanted: set[str]) -> pd.DataFrame:
+    quotes = fetch_full_market_quotes_efinance()
+    if quotes.empty:
+        return empty_quotes(quotes.attrs.get("message", "efinance 未返回数据"), "efinance")
+    result = quotes[quotes["代码"].isin(wanted)].copy()
+    if result.empty:
+        return empty_quotes("efinance 未返回指定股票", "efinance")
+    return _with_status(result[QUOTE_COLUMNS].reset_index(drop=True), "efinance", "efinance 行情已更新")
+
+
+def fetch_full_market_quotes_efinance() -> pd.DataFrame:
+    try:
+        import efinance as ef
+
+        raw = ef.stock.get_realtime_quotes()
+    except Exception as exc:
+        return _empty_full_quotes(_short_error(exc), "efinance")
+
+    if raw is None or raw.empty:
+        return _empty_full_quotes("efinance 返回空数据", "efinance")
+
+    aliases = {
+        "代码": ["股票代码", "代码"],
+        "名称": ["股票名称", "名称"],
+        "最新价": ["最新价"],
+        "涨跌幅%": ["涨跌幅"],
+        "成交额": ["成交额"],
+        "开盘": ["今开", "开盘"],
+        "昨收": ["昨日收盘", "昨收"],
+        "最高": ["最高"],
+        "最低": ["最低"],
+    }
+
+    out = pd.DataFrame()
+    for target, names in aliases.items():
+        source = next((name for name in names if name in raw.columns), None)
+        out[target] = raw[source] if source else pd.NA
+
+    for column in QUOTE_COLUMNS:
+        if column not in out:
+            out[column] = pd.NA
+
+    out["代码"] = out["代码"].map(clean_code)
+    for column in ["最新价", "涨跌幅%", "成交额", "开盘", "昨收", "最高", "最低"]:
+        out[column] = pd.to_numeric(out[column].map(_clean_numeric), errors="coerce")
+
+    return _with_status(
+        out[QUOTE_COLUMNS].drop_duplicates("代码", keep="first").reset_index(drop=True),
+        "efinance",
+        "efinance 全市场行情已更新",
+    )
+
+
 def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.DataFrame:
     """Generate a main-board stock pool ranked by turnover amount."""
     safe_limit = max(int(limit or 30), 1)
-    rank_quotes = pd.DataFrame()
-    attempted_rank_quotes = False
+
+    if source == "手动上传/不刷新":
+        return _with_status(pd.DataFrame(), source, "当前设置为手动上传/不刷新")
+    if source == "新浪行情":
+        return _with_status(pd.DataFrame(), source, "新浪行情只能刷新已知股票，不能生成全市场股票池")
+
+    source_frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+
     if source in {"自动切换", "东方财富"}:
-        attempted_rank_quotes = True
         rank_quotes = fetch_turnover_rank_quotes_eastmoney(limit=safe_limit)
-
-    quotes = rank_quotes
-    if quotes.empty:
-        if source == "自动切换":
-            quotes = fetch_full_market_quotes_akshare()
-            if quotes.empty:
-                return _with_status(
-                    pd.DataFrame(),
-                    "自动切换",
-                    "东方财富成交额榜: "
-                    + rank_quotes.attrs.get("message", "失败")
-                    + "；AKShare: "
-                    + quotes.attrs.get("message", "失败"),
-                )
-        elif source == "AKShare":
-            quotes = fetch_full_market_quotes_akshare()
-        elif source == "东方财富":
-            return _with_status(
-                pd.DataFrame(),
-                rank_quotes.attrs.get("source", source),
-                rank_quotes.attrs.get("message", "东方财富成交额榜未返回数据"),
-            )
+        if not rank_quotes.empty:
+            pool = _pool_candidates_from_quotes(rank_quotes, safe_limit)
+            if len(pool) >= safe_limit:
+                return _build_pool_result(pool, rank_quotes)
+            source_frames.append(rank_quotes)
         else:
-            quotes = fetch_full_market_quotes(source)
+            errors.append("东方财富成交额榜: " + rank_quotes.attrs.get("message", "失败"))
 
-    if quotes.empty:
-        return _with_status(pd.DataFrame(), quotes.attrs.get("source", source), quotes.attrs.get("message", "自动股票池行情为空"))
+    if source in {"自动切换", "efinance"}:
+        efinance_quotes = fetch_full_market_quotes_efinance()
+        if not efinance_quotes.empty:
+            pool = _pool_candidates_from_quotes(efinance_quotes, safe_limit)
+            if len(pool) >= safe_limit:
+                return _build_pool_result(pool, efinance_quotes)
+            source_frames.append(efinance_quotes)
+        else:
+            errors.append("efinance: " + efinance_quotes.attrs.get("message", "失败"))
 
-    pool = _pool_candidates_from_quotes(quotes, safe_limit)
-    if pool.empty:
-        return _with_status(pd.DataFrame(), quotes.attrs.get("source", source), "全市场数据中没有符合主板过滤条件的股票")
-    if len(pool) < safe_limit:
-        if source == "自动切换" and attempted_rank_quotes:
-            fallback_quotes = fetch_full_market_quotes_akshare()
-            fallback_pool = _pool_candidates_from_quotes(fallback_quotes, safe_limit)
-            if len(fallback_pool) >= safe_limit:
-                quotes = fallback_quotes
-                pool = fallback_pool
-        if len(pool) < safe_limit:
-            return _with_status(
-                pd.DataFrame(),
-                quotes.attrs.get("source", source),
-                f"只获取到 {len(pool)}/{safe_limit} 只主板成交额候选，为避免覆盖为不完整名单，已停止生成",
-            )
+    if source in {"自动切换", "AKShare"}:
+        akshare_quotes = fetch_full_market_quotes_akshare()
+        if not akshare_quotes.empty:
+            pool = _pool_candidates_from_quotes(akshare_quotes, safe_limit)
+            if len(pool) >= safe_limit:
+                return _build_pool_result(pool, akshare_quotes)
+            source_frames.append(akshare_quotes)
+        else:
+            errors.append("AKShare: " + akshare_quotes.attrs.get("message", "失败"))
 
-    result = pd.DataFrame({
-        "代码": pool["代码"],
-        "名称": pool["名称"],
-        "现价": pool["最新价"],
-        "涨跌幅%": pool["涨跌幅%"],
-        "成交额": pool["成交额"],
-        "成交额排名": range(1, len(pool) + 1),
-        "上市板块": "主板",
-    })
-    return _with_status(result.reset_index(drop=True), quotes.attrs.get("source", source), quotes.attrs.get("message", "自动股票池已生成"))
+    combined_pool = _build_pool_from_source_frames(source_frames, safe_limit, source)
+    if not combined_pool.empty:
+        return combined_pool
+
+    if source in {"自动切换", "东方财富"}:
+        eastmoney_full_quotes = fetch_full_market_quotes_eastmoney()
+        if not eastmoney_full_quotes.empty:
+            pool = _pool_candidates_from_quotes(eastmoney_full_quotes, safe_limit)
+            if len(pool) >= safe_limit:
+                return _build_pool_result(pool, eastmoney_full_quotes)
+            source_frames.append(eastmoney_full_quotes)
+        else:
+            errors.append("东方财富全市场: " + eastmoney_full_quotes.attrs.get("message", "失败"))
+
+    combined_pool = _build_pool_from_source_frames(source_frames, safe_limit, source)
+    if source_frames:
+        return combined_pool
+
+    message = "自动行情源暂不可用，未覆盖当前初筛池"
+    if errors:
+        message += "；" + "；".join(errors[:3])
+    return _with_status(pd.DataFrame(), source, message)
 
 
 def fetch_full_market_quotes_akshare() -> pd.DataFrame:

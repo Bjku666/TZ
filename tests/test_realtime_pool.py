@@ -74,6 +74,7 @@ class RealtimePoolTests(TestCase):
 
         with (
             patch.object(realtime, "fetch_turnover_rank_quotes_eastmoney", return_value=rank_quotes),
+            patch.object(realtime, "fetch_full_market_quotes_efinance") as efinance_market,
             patch.object(realtime, "fetch_full_market_quotes") as full_market,
             patch.object(realtime, "fetch_full_market_quotes_akshare") as akshare_market,
         ):
@@ -81,18 +82,44 @@ class RealtimePoolTests(TestCase):
 
         self.assertEqual(len(pool), 30)
         self.assertEqual(pool["成交额排名"].tolist(), list(range(1, 31)))
+        efinance_market.assert_not_called()
         full_market.assert_not_called()
         akshare_market.assert_not_called()
 
     def test_auto_stock_pool_does_not_generate_partial_pool(self) -> None:
         partial_quotes = quote_frame(12)
+        empty_efinance = realtime._empty_full_quotes("efinance 失败", "efinance")
         empty_fallback = realtime._empty_full_quotes("AKShare 失败", "AKShare")
 
         with (
             patch.object(realtime, "fetch_turnover_rank_quotes_eastmoney", return_value=partial_quotes),
+            patch.object(realtime, "fetch_full_market_quotes_efinance", return_value=empty_efinance),
             patch.object(realtime, "fetch_full_market_quotes_akshare", return_value=empty_fallback),
+            patch.object(realtime, "fetch_full_market_quotes_eastmoney", return_value=realtime._empty_full_quotes("东方财富全市场失败", "东方财富")),
         ):
             pool = realtime.fetch_auto_stock_pool(limit=30, source="自动切换")
 
         self.assertTrue(pool.empty)
         self.assertIn("只获取到 12/30", pool.attrs["message"])
+
+    def test_auto_stock_pool_merges_partial_sources(self) -> None:
+        rank_quotes = quote_frame(12)
+        efinance_quotes = quote_frame(12)
+        efinance_quotes["代码"] = [f"600{i:03d}" for i in range(12, 24)]
+        efinance_quotes["成交额"] = [9_000_000 - i for i in range(12)]
+        efinance_quotes = realtime._with_status(efinance_quotes, "efinance", "efinance 测试数据")
+        akshare_quotes = quote_frame(12)
+        akshare_quotes["代码"] = [f"600{i:03d}" for i in range(24, 36)]
+        akshare_quotes["成交额"] = [8_000_000 - i for i in range(12)]
+        akshare_quotes = realtime._with_status(akshare_quotes, "AKShare", "AKShare 测试数据")
+
+        with (
+            patch.object(realtime, "fetch_turnover_rank_quotes_eastmoney", return_value=rank_quotes),
+            patch.object(realtime, "fetch_full_market_quotes_efinance", return_value=efinance_quotes),
+            patch.object(realtime, "fetch_full_market_quotes_akshare", return_value=akshare_quotes),
+        ):
+            pool = realtime.fetch_auto_stock_pool(limit=30, source="自动切换")
+
+        self.assertEqual(len(pool), 30)
+        self.assertEqual(pool.attrs["source"], "多源合并")
+        self.assertEqual(pool["成交额排名"].tolist(), list(range(1, 31)))

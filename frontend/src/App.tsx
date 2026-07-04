@@ -3027,8 +3027,8 @@ export default function App() {
 
           {/* 实时运行操作日志 */}
           <div className="hidden md:flex flex-col flex-1 min-h-0 mt-6 overflow-hidden">
-            <div className="flex min-h-0 flex-1 flex-col rounded-[18px] border border-slate-700/80 bg-[#070a12] px-3 py-3 shadow-[inset_0_1px_0_rgba(148,163,184,0.04)]">
-              <div className="flex items-center justify-between gap-2.5 border-b border-slate-800/90 pb-2.5">
+            <div className="flex min-h-0 flex-1 flex-col rounded-lg border border-slate-800/55 bg-slate-950/20 px-3 py-3">
+              <div className="flex items-center justify-between gap-2.5 border-b border-slate-800/55 pb-2.5">
                 <span className="text-[12px] font-black tracking-wide text-slate-300">事件流日志</span>
                 <button
                   type="button"
