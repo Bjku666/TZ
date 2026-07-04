@@ -347,26 +347,34 @@ def update_trade(trade_id: str, payload: dict[str, Any], mode: str | None = None
             frame.loc[index, column] = payload[api_key]
     if "type" in payload:
         frame.loc[index, "类型"] = "卖出" if str(payload["type"]).upper() in {"SELL", "卖出"} else "买入"
-    if "commission" in payload:
-        frame.loc[index, "手续费"] = number(payload["commission"])
-    if "stampDuty" in payload:
-        frame.loc[index, "印花税"] = number(payload["stampDuty"])
-    if "transferFee" in payload:
-        frame.loc[index, "过户费"] = number(payload["transferFee"])
     if "violationTags" in payload:
         frame.loc[index, "违规标签"] = json.dumps(parse_tags(payload["violationTags"]), ensure_ascii=False)
 
     price = number(frame.loc[index, "价格"])
     quantity = number(frame.loc[index, "数量"])
-    frame.loc[index, "金额"] = round(price * quantity, 2)
-    if "totalFee" in payload:
-        frame.loc[index, "总费用"] = number(payload["totalFee"])
-    else:
+    manual_fee_override = bool(payload.get("manualFeeOverride"))
+    if manual_fee_override:
+        if "commission" in payload:
+            frame.loc[index, "手续费"] = number(payload["commission"])
+        if "stampDuty" in payload:
+            frame.loc[index, "印花税"] = number(payload["stampDuty"])
+        if "transferFee" in payload:
+            frame.loc[index, "过户费"] = number(payload["transferFee"])
+        frame.loc[index, "金额"] = round(price * quantity, 2)
         frame.loc[index, "总费用"] = (
-            number(frame.loc[index, "手续费"])
+            number(payload.get("totalFee"))
+            if "totalFee" in payload
+            else number(frame.loc[index, "手续费"])
             + number(frame.loc[index, "印花税"])
             + number(frame.loc[index, "过户费"])
         )
+    else:
+        fees = calculate_trade_fees(frame.loc[index, "类型"], price, quantity, trade_fee_settings(active_mode))
+        frame.loc[index, "金额"] = fees["amount"]
+        frame.loc[index, "手续费"] = fees["commission"]
+        frame.loc[index, "印花税"] = fees["stamp_tax"]
+        frame.loc[index, "过户费"] = fees["transfer_fee"]
+        frame.loc[index, "总费用"] = fees["total_fee"]
     api_trades = trades_to_api(frame)
     for item_index, item in enumerate(api_trades):
         item["id"] = api_trade_id(item_index)
@@ -374,3 +382,21 @@ def update_trade(trade_id: str, payload: dict[str, Any], mode: str | None = None
     _sync_after_trade(mode)
     trade = api_trades[index]
     return {"success": True, "trade": trade}
+
+
+def recalculate_trade_fees(mode: str | None = None) -> dict[str, Any]:
+    active_mode = mode or current_mode()
+    active_mode_name = account_mode_name(active_mode)
+    api_trades = trade_repository.recalculate_api_trade_fees(
+        active_mode,
+        active_mode_name,
+        trade_fee_settings(active_mode),
+    )
+    portfolio = portfolio_snapshot(active_mode, sync_legacy=True)
+    sqlite_store.replace_trades(active_mode, api_trades_for_sqlite(api_trades))
+    return {
+        "success": True,
+        "updatedCount": len(api_trades),
+        "trades": api_trades,
+        "accountState": portfolio["accountState"],
+    }

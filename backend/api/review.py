@@ -10,8 +10,11 @@ router = APIRouter(prefix="/api", tags=["review"])
 
 
 @router.get("/review/today")
-def get_today_review(mode: str | None = Query(default=None)) -> dict[str, Any]:
-    return review_service.today_review(mode)
+def get_today_review(
+    mode: str | None = Query(default=None),
+    asOfDate: str | None = Query(default=None),
+) -> dict[str, Any]:
+    return review_service.today_review(mode, asOfDate)
 
 
 @router.post("/review/save")
@@ -33,8 +36,11 @@ def get_reports(type: str = Query(default="daily")) -> dict[str, Any]:
 
 
 @router.get("/reports/context")
-def get_report_context(mode: str | None = Query(default=None)) -> dict[str, Any]:
-    return review_service.context(mode)
+def get_report_context(
+    mode: str | None = Query(default=None),
+    asOfDate: str | None = Query(default=None),
+) -> dict[str, Any]:
+    return review_service.context(mode, asOfDate)
 
 
 @router.post("/reports/save")
@@ -43,4 +49,3 @@ def save_report_compat(payload: dict[str, Any]) -> dict[str, Any]:
         return review_service.save_report(payload)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-

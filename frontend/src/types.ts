@@ -195,6 +195,8 @@ export interface AccountState {
   totalPnL: number;
   totalReturnPct: number;
   todayPnL?: number;
+  todayRealizedPnL?: number;
+  asOfDate?: string;
 }
 
 export type SelfDiagnosisType = "holding" | "todayBuy" | "todaySell" | "manual";

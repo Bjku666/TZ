@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.data import TRADE_COLUMNS, load_trades as load_csv_trades, save_trades as save_csv_trades
 from src.data import trade_account_mode_name
+from src.portfolio import calculate_trade_fees
 from backend.storage import sqlite_store
 from backend.storage.csv_adapter import (
     api_trade_id,
@@ -107,6 +108,25 @@ def delete_all_api_trades(mode: str, mode_name: str) -> None:
     ensure_mode_loaded(mode, mode_name)
     sqlite_store.delete_trades(mode)
     sync_csv_mode(mode, mode_name)
+
+
+def recalculate_api_trade_fees(mode: str, mode_name: str, fee_settings: dict[str, Any]) -> list[dict[str, Any]]:
+    frame = load_trade_frame(mode, mode_name).reset_index(drop=True)
+    if frame.empty:
+        save_api_trades(mode, mode_name, [])
+        return []
+    for index, row in frame.iterrows():
+        fees = calculate_trade_fees(row.get("类型"), row.get("价格"), row.get("数量"), fee_settings)
+        frame.loc[index, "金额"] = fees["amount"]
+        frame.loc[index, "手续费"] = fees["commission"]
+        frame.loc[index, "印花税"] = fees["stamp_tax"]
+        frame.loc[index, "过户费"] = fees["transfer_fee"]
+        frame.loc[index, "总费用"] = fees["total_fee"]
+    api_trades = trades_to_api(frame)
+    for item_index, item in enumerate(api_trades):
+        item["id"] = api_trade_id(item_index)
+    save_api_trades(mode, mode_name, api_trades)
+    return api_trades
 
 
 def sync_csv_mode(mode: str, mode_name: str) -> None:

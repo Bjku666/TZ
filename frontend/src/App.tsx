@@ -73,18 +73,25 @@ const CARD_TEXT_ENDING_PERIOD = /([。．]|(?<!\.)\.)([”’"'）)\]】》]*)\s
 type AccountMode = "simulation" | "real";
 type QuoteRefreshTrigger = "manual" | "auto";
 type TurnoverScanTrigger = "manual" | "auto";
+type FeeProfile = "ths_simulation" | "real_a_share";
 type FeeSettings = {
+  feeProfile: FeeProfile;
   commissionRate: number;
   minCommission: number;
   stampDutyRate: number;
   transferFeeRate: number;
 };
 
+const ZERO_FEE_SETTINGS = {
+  commissionRate: 0,
+  minCommission: 0,
+  stampDutyRate: 0,
+  transferFeeRate: 0
+};
+
 const DEFAULT_FEE_SETTINGS: FeeSettings = {
-  commissionRate: 0.0003,
-  minCommission: 5.0,
-  stampDutyRate: 0.0005,
-  transferFeeRate: 0.00001
+  feeProfile: "ths_simulation",
+  ...ZERO_FEE_SETTINGS
 };
 
 type ActivityLogEntry = {
@@ -240,13 +247,48 @@ function numberSetting(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function feeProfileFromApi(value: unknown): FeeProfile {
+  return value === "real_a_share" ? "real_a_share" : "ths_simulation";
+}
+
 function feeSettingsFromApi(settings: any): FeeSettings {
+  const feeProfile = feeProfileFromApi(settings?.feeProfile);
   return {
+    feeProfile,
     commissionRate: numberSetting(settings?.commissionRate, DEFAULT_FEE_SETTINGS.commissionRate),
     minCommission: numberSetting(settings?.minCommission, DEFAULT_FEE_SETTINGS.minCommission),
     stampDutyRate: numberSetting(settings?.stampDutyRate, DEFAULT_FEE_SETTINGS.stampDutyRate),
     transferFeeRate: numberSetting(settings?.transferFeeRate, DEFAULT_FEE_SETTINGS.transferFeeRate)
   };
+}
+
+function isZeroFeeSettings(settings: FeeSettings): boolean {
+  return (
+    settings.commissionRate === 0 &&
+    settings.minCommission === 0 &&
+    settings.stampDutyRate === 0 &&
+    settings.transferFeeRate === 0
+  );
+}
+
+function feeProfileForValues(settings: FeeSettings): FeeProfile {
+  return isZeroFeeSettings(settings) ? "ths_simulation" : "real_a_share";
+}
+
+function feeSettingsWithValue(settings: FeeSettings, key: keyof Omit<FeeSettings, "feeProfile">, value: number): FeeSettings {
+  const next = { ...settings, [key]: value };
+  return { ...next, feeProfile: feeProfileForValues(next) };
+}
+
+function feeSettingsLabel(settings: FeeSettings, mode: AccountMode): string {
+  if (isZeroFeeSettings(settings)) return "同花顺模拟口径（全部费用为0）";
+  return mode === "real" ? "实盘/A股费用口径（按当前配置计算）" : "模拟训练费率（按当前配置计算）";
+}
+
+function percentFeeLabel(value: number): string {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  if (safeValue === 0) return "0%";
+  return `${(safeValue * 100).toFixed(4).replace(/0+$/, "").replace(/\.$/, "")}%`;
 }
 
 function rulesFromApi(config: Partial<TradingRulesConfig> | undefined): TradingRulesConfig {
@@ -298,48 +340,10 @@ function tradeAmount(trade: TradeLog): number {
   return Number.isFinite(trade.amount) && trade.amount > 0 ? trade.amount : trade.price * trade.quantity;
 }
 
-function calculateRealizedPnLByDate(trades: TradeLog[], targetDate: string): number {
-  const states = new Map<string, { qty: number; cost: number }>();
-  const orderedTrades = [...trades].sort((a, b) => {
-    const dateCompare = a.date.localeCompare(b.date);
-    if (dateCompare !== 0) return dateCompare;
-    return (a.time || "").localeCompare(b.time || "");
-  });
-
-  return orderedTrades.reduce((dailyPnL, trade) => {
-    const state = states.get(trade.code) ?? { qty: 0, cost: 0 };
-    const quantity = Number(trade.quantity) || 0;
-    const amount = tradeAmount(trade);
-    const totalFee = Number(trade.totalFee) || 0;
-
-    if (trade.type === "BUY") {
-      if (state.qty <= 0) {
-        state.qty = 0;
-        state.cost = 0;
-      }
-      state.qty += quantity;
-      state.cost += amount + totalFee;
-      states.set(trade.code, state);
-      return dailyPnL;
-    }
-
-    const sellQuantity = Math.min(quantity, state.qty);
-    if (sellQuantity <= 0) {
-      states.set(trade.code, state);
-      return dailyPnL;
-    }
-
-    const avgCost = state.cost / state.qty;
-    const realizedPnL = (trade.price - avgCost) * sellQuantity - totalFee;
-    state.qty -= sellQuantity;
-    state.cost -= avgCost * sellQuantity;
-    if (state.qty <= 0) {
-      state.qty = 0;
-      state.cost = 0;
-    }
-    states.set(trade.code, state);
-    return trade.date === targetDate ? dailyPnL + realizedPnL : dailyPnL;
-  }, 0);
+function tradeSettlementAmount(trade: TradeLog): number {
+  const amount = tradeAmount(trade);
+  const totalFee = Number(trade.totalFee) || 0;
+  return trade.type === "BUY" ? amount + totalFee : amount - totalFee;
 }
 
 type PositionSellPlan = {
@@ -683,7 +687,10 @@ export default function App() {
     realizedPnL: 0,
     floatingPnL: 0,
     totalPnL: 0,
-    totalReturnPct: 0
+    totalReturnPct: 0,
+    todayPnL: 0,
+    todayRealizedPnL: 0,
+    asOfDate: localDateString()
   });
   const [positions, setPositions] = useState<Position[]>([]);
   const [watchlist, setWatchlist] = useState<Stock[]>([]);
@@ -1146,7 +1153,8 @@ export default function App() {
       }
 
       // 6. 获取复盘报告聚合数据上下文
-      const resContext = await fetch(`/api/reports/context?mode=${currentMode}`);
+      const contextParams = new URLSearchParams({ mode: currentMode, asOfDate: reportDate });
+      const resContext = await fetch(`/api/reports/context?${contextParams.toString()}`);
       if (resContext.ok) {
         const data = await resContext.json();
         setReportContext(data);
@@ -1162,7 +1170,7 @@ export default function App() {
 
   useEffect(() => {
     loadAllData();
-  }, [watchlistGroup, reviewType, currentMode, activeTab]);
+  }, [watchlistGroup, reviewType, currentMode, activeTab, reportDate]);
 
   const logAction = (msg: string) => {
     const timestamp = new Date().toTimeString().split(" ")[0];
@@ -1545,9 +1553,10 @@ export default function App() {
     setEditTime(trade.time);
     setEditReason(trade.reason);
     setEditRemark(trade.remark || "");
-    setEditCommission(trade.commission || 0);
-    setEditStampDuty(trade.stampDuty || 0);
-    setEditTransferFee(trade.transferFee || 0);
+    const fees = calculateFeeBreakdown(trade.type, trade.price, trade.quantity);
+    setEditCommission(fees.comm);
+    setEditStampDuty(fees.stamp);
+    setEditTransferFee(fees.trans);
     setEditRulesConclusion(trade.rulesConclusion);
     setEditViolationTags(trade.violationTags || []);
   };
@@ -1569,11 +1578,7 @@ export default function App() {
           reason: editReason,
           remark: editRemark,
           rulesConclusion: editRulesConclusion,
-          violationTags: editViolationTags,
-          commission: Number(editCommission),
-          stampDuty: Number(editStampDuty),
-          transferFee: Number(editTransferFee),
-          totalFee: Number((Number(editCommission) + Number(editStampDuty) + Number(editTransferFee)).toFixed(2))
+          violationTags: editViolationTags
         })
       });
 
@@ -1598,7 +1603,13 @@ export default function App() {
 
     // 按复盘参考日期生成完整快照，不只取当前自然日。
     const reportTrades = trades.filter(t => t.date === reportDate);
-    const todayRealizedPnL = calculateRealizedPnLByDate(trades, reportDate);
+    const todayRealizedPnL = Number(
+      reportContext?.asOfDate === reportDate
+        ? reportContext?.realizedPnL
+        : accountState.asOfDate === reportDate
+          ? accountState.todayRealizedPnL
+          : 0
+    ) || 0;
     const buyCount = reportTrades.filter(t => t.type === "BUY").length;
     const sellCount = reportTrades.filter(t => t.type === "SELL").length;
     const reportBuys = reportTrades.filter(t => t.type === "BUY");
@@ -1745,6 +1756,31 @@ export default function App() {
     }
   };
 
+  const handleRecalculateFees = async (silent = false) => {
+    try {
+      const params = new URLSearchParams({ mode: currentMode });
+      const res = await fetch(`/api/trades/recalculate-fees?${params.toString()}`, {
+        method: "POST"
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || "历史交易费用重算失败");
+      }
+      const data = await res.json();
+      if (Array.isArray(data.trades)) setTrades(data.trades);
+      if (data.accountState) setAccountState(data.accountState);
+      if (!silent) {
+        logAction(`⚙️ 已按当前${currentMode === "real" ? "实盘" : "模拟"}费用口径重算 ${data.updatedCount ?? 0} 笔历史交易。`);
+      }
+      await loadAllData(true);
+      return true;
+    } catch (err) {
+      logAction("❌ 历史交易费用重算失败");
+      alert(err instanceof Error ? err.message : "历史交易费用重算失败");
+      return false;
+    }
+  };
+
   // 保存系统交易费用费率配置
   const handleSaveFees = async (newFees: typeof feeSettings) => {
     try {
@@ -1753,14 +1789,20 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...newFees,
+          feeProfile: feeProfileForValues(newFees),
           currentMode
         })
       });
       if (res.ok) {
         const settings = await res.json();
         applyRuntimeSettings(settings);
-        logAction(`⚙️ ${currentMode === "real" ? "实盘" : "模拟"}交易手续费率已更新！后续交易录入及重算将自动同步此费率。`);
-        loadAllData(true);
+        logAction(`⚙️ ${currentMode === "real" ? "实盘" : "模拟"}交易费用已更新为：${feeSettingsLabel(feeSettingsFromApi(settings), currentMode)}。`);
+        if (window.confirm("费用配置已保存。是否立即按当前费用配置重算当前账户全部历史交易费用？")) {
+          await handleRecalculateFees(true);
+          logAction(`⚙️ 已按当前费用配置重算${currentMode === "real" ? "实盘" : "模拟"}历史交易。`);
+        } else {
+          loadAllData(true);
+        }
       } else {
         alert("费用配置保存失败");
       }
@@ -1992,9 +2034,13 @@ export default function App() {
   };
 
   // 今日复盘相关计算
-  const todayStrForReview = localDateString();
-  const todayTrades = trades.filter(t => t.date === todayStrForReview);
-  const todayRealizedPnL = calculateRealizedPnLByDate(trades, todayStrForReview);
+  const reviewAsOfDate = String(reportContext?.asOfDate || reportDate || accountState.asOfDate || localDateString());
+  const todayTrades = trades.filter(t => t.date === reviewAsOfDate);
+  const todayRealizedPnL = Number(
+    reportContext?.realizedPnL ??
+    (accountState.asOfDate === reviewAsOfDate ? accountState.todayRealizedPnL : 0) ??
+    0
+  );
   const reviewBuyCount = todayTrades.filter(t => t.type === "BUY").length;
   const reviewCompliantCount = todayTrades.filter(t => t.rulesConclusion === "符合规则").length;
   const complianceRate = todayTrades.length > 0 ? Number(((reviewCompliantCount / todayTrades.length) * 100).toFixed(2)) : 100;
@@ -2175,7 +2221,13 @@ export default function App() {
     const sellCount = reportTrades.filter(t => t.type === "SELL").length;
     const compliantCount = reportTrades.filter(t => t.type === "BUY" && t.rulesConclusion === "符合规则").length;
     const draftComplianceRate = buyCount > 0 ? Number(((compliantCount / buyCount) * 100).toFixed(2)) : 100;
-    const draftPnl = calculateRealizedPnLByDate(trades, reportDate);
+    const draftPnl = Number(
+      reportContext?.asOfDate === reportDate
+        ? reportContext?.realizedPnL
+        : accountState.asOfDate === reportDate
+          ? accountState.todayRealizedPnL
+          : 0
+    ) || 0;
 
     let text = `【${reportDate} 闭环复盘日报】\n\n`;
     text += `一、流水与合规审计\n`;
@@ -2920,7 +2972,7 @@ export default function App() {
             </span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[12px]">当日盈亏:</span>
+            <span className="text-slate-400 text-[12px]" title={accountState.asOfDate ? `结算日 ${accountState.asOfDate}` : undefined}>当日盈亏:</span>
             <span className={`font-bold text-[14px] ${todayTotalPnLForAccount >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
               {signedCurrency(todayTotalPnLForAccount)}
             </span>
@@ -4008,7 +4060,12 @@ export default function App() {
                         <th className="p-3">方向</th>
                         <th className="p-3 text-right">价格</th>
                         <th className="p-3 text-right">数量</th>
-                        <th className="p-3 text-right">总手续费</th>
+                        <th className="p-3 text-right">成交额</th>
+                        <th className="p-3 text-right">佣金</th>
+                        <th className="p-3 text-right">印花税</th>
+                        <th className="p-3 text-right">过户费</th>
+                        <th className="p-3 text-right">总费用</th>
+                        <th className="p-3 text-right">结算额</th>
                         <th className="p-3">纪律合规审计</th>
                         <th className="p-3">买入依据 / 计划备注</th>
                         <th className="p-3">操作</th>
@@ -4017,7 +4074,7 @@ export default function App() {
                     <tbody>
                       {trades.length === 0 ? (
                         <tr>
-                          <td colSpan={9} className="p-8 text-center text-slate-500 italic">
+                          <td colSpan={14} className="p-8 text-center text-slate-500 italic">
                             <CardText as="span">暂无任何买卖存档记录。可在分组表格点击「买入」进行录入。</CardText>
                           </td>
                         </tr>
@@ -4039,8 +4096,15 @@ export default function App() {
                             </td>
                             <td className="p-3 text-right font-mono font-semibold text-slate-300">{t.price.toFixed(2)}</td>
                             <td className="p-3 text-right font-mono text-slate-400">{t.quantity}</td>
-                            <td className="p-3 text-right font-mono text-slate-500" title={`印花税:${t.stampDuty} 佣金:${t.commission} 过户费:${t.transferFee}`}>
+                            <td className="p-3 text-right font-mono text-slate-400">{tradeAmount(t).toFixed(2)}</td>
+                            <td className="p-3 text-right font-mono text-slate-500">{t.commission.toFixed(2)}</td>
+                            <td className="p-3 text-right font-mono text-slate-500">{t.stampDuty.toFixed(2)}</td>
+                            <td className="p-3 text-right font-mono text-slate-500">{t.transferFee.toFixed(2)}</td>
+                            <td className="p-3 text-right font-mono text-slate-500">
                               {t.totalFee.toFixed(2)}
+                            </td>
+                            <td className={`p-3 text-right font-mono font-bold ${t.type === "BUY" ? "text-rose-400" : "text-emerald-400"}`}>
+                              {tradeSettlementAmount(t).toFixed(2)}
                             </td>
                             <td className="p-3">
                               <div className="space-y-1">
@@ -4932,8 +4996,15 @@ export default function App() {
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">
                   <Coins className="h-4 w-4 text-cyan-400" />
                   <h3 className="text-sm font-bold text-slate-200">
-                    {currentMode === "real" ? "实盘交易手续费率配置" : "模拟交易手续费率配置"}
+                    {currentMode === "real" ? "实盘交易费用口径配置" : "模拟交易费用口径配置"}
                   </h3>
+                </div>
+
+                <div className="p-3 bg-slate-950 border border-slate-800 rounded text-xs text-slate-300 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                  <span className="font-bold">{feeSettingsLabel(feeSettings, currentMode)}</span>
+                  <span className="font-mono text-slate-500">
+                    佣金 {percentFeeLabel(feeSettings.commissionRate)} / 最低 {feeSettings.minCommission.toFixed(2)} / 印花税 {percentFeeLabel(feeSettings.stampDutyRate)} / 过户费 {percentFeeLabel(feeSettings.transferFeeRate)}
+                  </span>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -4943,8 +5014,8 @@ export default function App() {
                       type="number"
                       step="0.0001"
                       value={feeSettings.commissionRate}
-                      onChange={(e) => setFeeSettings(p => ({ ...p, commissionRate: Number(e.target.value) }))}
-                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-500"
+                      onChange={(e) => setFeeSettings(p => feeSettingsWithValue(p, "commissionRate", Number(e.target.value)))}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 disabled:text-slate-600 disabled:cursor-not-allowed focus:outline-none focus:border-cyan-500"
                     />
                     <span className="text-[10px] text-slate-500 block mt-1">例如: 0.0003 代表万分之三</span>
                   </div>
@@ -4955,8 +5026,8 @@ export default function App() {
                       type="number"
                       step="1"
                       value={feeSettings.minCommission}
-                      onChange={(e) => setFeeSettings(p => ({ ...p, minCommission: Number(e.target.value) }))}
-                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-500"
+                      onChange={(e) => setFeeSettings(p => feeSettingsWithValue(p, "minCommission", Number(e.target.value)))}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 disabled:text-slate-600 disabled:cursor-not-allowed focus:outline-none focus:border-cyan-500"
                     />
                     <span className="text-[10px] text-slate-500 block mt-1">不足此金额按此值收取 (标准 A股 为 5.0)</span>
                   </div>
@@ -4967,8 +5038,8 @@ export default function App() {
                       type="number"
                       step="0.0001"
                       value={feeSettings.stampDutyRate}
-                      onChange={(e) => setFeeSettings(p => ({ ...p, stampDutyRate: Number(e.target.value) }))}
-                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-500"
+                      onChange={(e) => setFeeSettings(p => feeSettingsWithValue(p, "stampDutyRate", Number(e.target.value)))}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 disabled:text-slate-600 disabled:cursor-not-allowed focus:outline-none focus:border-cyan-500"
                     />
                     <span className="text-[10px] text-slate-500 block mt-1">例如: 0.0005 代表千分之零点五</span>
                   </div>
@@ -4979,19 +5050,26 @@ export default function App() {
                       type="number"
                       step="0.00001"
                       value={feeSettings.transferFeeRate}
-                      onChange={(e) => setFeeSettings(p => ({ ...p, transferFeeRate: Number(e.target.value) }))}
-                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-500"
+                      onChange={(e) => setFeeSettings(p => feeSettingsWithValue(p, "transferFeeRate", Number(e.target.value)))}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-mono text-slate-300 disabled:text-slate-600 disabled:cursor-not-allowed focus:outline-none focus:border-cyan-500"
                     />
                     <span className="text-[10px] text-slate-500 block mt-1">例如: 0.00001 代表十万分之一</span>
                   </div>
                 </div>
 
-                <div className="text-right pt-2 border-t border-slate-800/60">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-end gap-2 pt-2 border-t border-slate-800/60">
+                  <button
+                    onClick={() => handleRecalculateFees(false)}
+                    className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-slate-950 hover:bg-slate-900 border border-slate-700 text-slate-300 rounded text-xs font-semibold transition"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    <span>按当前配置重算历史交易费用</span>
+                  </button>
                   <button
                     onClick={() => handleSaveFees(feeSettings)}
                     className="px-4 py-2 bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-500 hover:to-teal-500 text-white rounded text-xs font-semibold shadow transition"
                   >
-                    保存当前模式手续费率
+                    保存当前模式费用口径
                   </button>
                 </div>
               </div>
@@ -5213,16 +5291,20 @@ export default function App() {
 
             {/* 预计税费卡片 */}
             <div className="bg-slate-950 p-3 rounded border border-slate-850 text-[10px] font-mono text-slate-500 space-y-1">
+              <div className="flex justify-between text-slate-400 font-bold">
+                <span>费用口径:</span>
+                <span>{feeSettingsLabel(feeSettings, currentMode)}</span>
+              </div>
               <div className="flex justify-between">
-                <span>印花税 (0.05%, 仅卖出):</span>
+                <span>印花税 ({percentFeeLabel(feeSettings.stampDutyRate)}, 仅卖出):</span>
                 <span>{est.stamp.toFixed(2)} 元</span>
               </div>
               <div className="flex justify-between">
-                <span>券商佣金 (0.03%, 最低5元):</span>
+                <span>券商佣金 ({percentFeeLabel(feeSettings.commissionRate)}, 最低{feeSettings.minCommission.toFixed(2)}元):</span>
                 <span>{est.comm.toFixed(2)} 元</span>
               </div>
               <div className="flex justify-between">
-                <span>过户费 (0.002%):</span>
+                <span>过户费 ({percentFeeLabel(feeSettings.transferFeeRate)}):</span>
                 <span>{est.trans.toFixed(2)} 元</span>
               </div>
               <div className="flex justify-between border-t border-slate-900 pt-1 text-slate-400 font-bold">
@@ -5363,7 +5445,7 @@ export default function App() {
             {/* 编辑税费细分费用 */}
             <div className="bg-slate-950 p-4 rounded-lg border border-slate-850 space-y-3">
               <span className="text-[10px] font-bold text-slate-400 uppercase block tracking-wider">
-                手续费细目编辑 (已根据系统当前费率自动同步算好)
+                手续费细目预览 (保存时后端按当前费用口径重新计算)
               </span>
               
               <div className="grid grid-cols-3 gap-2 text-xs font-mono">
@@ -5373,8 +5455,9 @@ export default function App() {
                     type="number"
                     step="0.01"
                     value={editCommission}
+                    disabled
                     onChange={(e) => setEditCommission(Number(e.target.value))}
-                    className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] text-slate-200 mt-1 focus:outline-none"
+                    className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] text-slate-500 mt-1 disabled:cursor-not-allowed focus:outline-none"
                   />
                 </div>
 
@@ -5384,9 +5467,9 @@ export default function App() {
                     type="number"
                     step="0.01"
                     value={editStampDuty}
-                    disabled={editingTrade.type === "BUY"}
+                    disabled
                     onChange={(e) => setEditStampDuty(Number(e.target.value))}
-                    className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] text-slate-200 mt-1 disabled:opacity-50 focus:outline-none"
+                    className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] text-slate-500 mt-1 disabled:cursor-not-allowed focus:outline-none"
                   />
                 </div>
 
@@ -5396,14 +5479,15 @@ export default function App() {
                     type="number"
                     step="0.01"
                     value={editTransferFee}
+                    disabled
                     onChange={(e) => setEditTransferFee(Number(e.target.value))}
-                    className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] text-slate-200 mt-1 focus:outline-none"
+                    className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] text-slate-500 mt-1 disabled:cursor-not-allowed focus:outline-none"
                   />
                 </div>
               </div>
 
               <div className="flex justify-between border-t border-slate-900 pt-2 text-[11px] font-mono font-bold text-slate-300">
-                <span>总交易费用计费同步 (自动加总):</span>
+                <span>总交易费用预览:</span>
                 <span className="text-cyan-400 font-mono">
                   {(Number(editCommission) + Number(editStampDuty) + Number(editTransferFee)).toFixed(2)} 元
                 </span>

@@ -11,10 +11,14 @@ from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_grou
 from src.settings import (
     FEE_API_ALIASES,
     FEE_DEFAULTS,
+    FEE_PROFILE_REAL_A_SHARE,
+    FEE_PROFILE_THS_SIMULATION,
     account_mode_from_api,
     api_mode_from_account_mode,
     fee_prefix_for_mode,
     mode_fee_settings,
+    normalize_fee_profile,
+    profile_from_fee_values,
 )
 from src.storage import load_last_refresh
 
@@ -120,17 +124,20 @@ def frontend_settings(settings: dict[str, Any]) -> dict[str, Any]:
             5000 if current_mode == "real" else 10000,
         ),
         "currentMode": current_mode,
+        "feeProfile": active_fees["fee_profile"],
         "commissionRate": active_fees["commission_rate"],
         "minCommission": active_fees["min_commission"],
         "stampDutyRate": active_fees["stamp_tax_rate"],
         "transferFeeRate": active_fees["transfer_fee_rate"],
         "simulationFees": {
+            "feeProfile": simulation_fees["fee_profile"],
             "commissionRate": simulation_fees["commission_rate"],
             "minCommission": simulation_fees["min_commission"],
             "stampDutyRate": simulation_fees["stamp_tax_rate"],
             "transferFeeRate": simulation_fees["transfer_fee_rate"],
         },
         "realFees": {
+            "feeProfile": real_fees["fee_profile"],
             "commissionRate": real_fees["commission_rate"],
             "minCommission": real_fees["min_commission"],
             "stampDutyRate": real_fees["stamp_tax_rate"],
@@ -150,19 +157,48 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
 
     mode_for_fee = updates.get("currentMode") or api_mode_from_account_mode(out.get("account_mode"))
     fee_prefix = fee_prefix_for_mode(mode_for_fee)
+    explicit_profile_update = "feeProfile" in updates or "fee_profile" in updates
+    fee_value_update = any(api_key in updates for api_key in FEE_API_ALIASES)
+    if explicit_profile_update and not fee_value_update:
+        profile = normalize_fee_profile(updates.get("feeProfile", updates.get("fee_profile")), fee_prefix)
+        out[f"{fee_prefix}_fee_profile"] = profile
+        if profile == FEE_PROFILE_THS_SIMULATION:
+            for internal_key in FEE_DEFAULTS:
+                out[f"{fee_prefix}_{internal_key}"] = 0.0
+        elif profile == FEE_PROFILE_REAL_A_SHARE:
+            for internal_key, default in FEE_DEFAULTS.items():
+                out[f"{fee_prefix}_{internal_key}"] = number(updates.get(_api_key_for_fee(internal_key)), default)
+
     for api_key, internal_key in FEE_API_ALIASES.items():
         if api_key in updates:
             default = FEE_DEFAULTS[internal_key]
             mode_key = f"{fee_prefix}_{internal_key}"
             out[mode_key] = number(updates[api_key], number(current.get(mode_key), default))
+    if fee_value_update:
+        out[f"{fee_prefix}_fee_profile"] = profile_from_fee_values(
+            {key: out.get(f"{fee_prefix}_{key}") for key in FEE_DEFAULTS},
+            fee_prefix,
+        )
 
     active_prefix = fee_prefix_for_mode(out.get("account_mode"))
+    out["fee_profile"] = normalize_fee_profile(out.get(f"{active_prefix}_fee_profile"), active_prefix)
     for internal_key in FEE_DEFAULTS:
         out[internal_key] = number(
             out.get(f"{active_prefix}_{internal_key}"),
             FEE_DEFAULTS[internal_key],
         )
+    out["fee_profile"] = profile_from_fee_values(
+        {key: out.get(key) for key in FEE_DEFAULTS},
+        active_prefix,
+    )
     return out
+
+
+def _api_key_for_fee(internal_key: str) -> str:
+    for api_key, mapped_key in FEE_API_ALIASES.items():
+        if mapped_key == internal_key:
+            return api_key
+    return internal_key
 
 
 def api_trade_id(index: int) -> str:

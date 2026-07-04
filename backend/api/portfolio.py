@@ -10,10 +10,16 @@ router = APIRouter(prefix="/api", tags=["portfolio"])
 
 
 @router.get("/portfolio")
-def get_portfolio(mode: str | None = Query(default=None)) -> dict[str, Any]:
-    return portfolio_snapshot(mode, persist_risk_state=True)
+def get_portfolio(
+    mode: str | None = Query(default=None),
+    asOfDate: str | None = Query(default=None),
+) -> dict[str, Any]:
+    return portfolio_snapshot(mode, persist_risk_state=True, as_of_date=asOfDate)
 
 
 @router.get("/account")
-def get_account(mode: str | None = Query(default=None)) -> dict[str, Any]:
-    return portfolio_snapshot(mode, persist_risk_state=True)["accountState"]
+def get_account(
+    mode: str | None = Query(default=None),
+    asOfDate: str | None = Query(default=None),
+) -> dict[str, Any]:
+    return portfolio_snapshot(mode, persist_risk_state=True, as_of_date=asOfDate)["accountState"]

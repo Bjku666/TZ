@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, time, timedelta
 import json
 from typing import Any
 
@@ -13,6 +13,7 @@ from src.portfolio import (
     build_positions_from_trades,
     ensure_trade_columns,
     portfolio_to_legacy_holdings,
+    realized_pnl_by_date,
 )
 from src.rules import clean_code
 from src.trading_rules_config import (
@@ -53,6 +54,63 @@ def _latest_rows_by_code(frame: pd.DataFrame | None) -> dict[str, dict[str, Any]
     return rows
 
 
+def _parse_date(value: Any) -> date | None:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def _previous_weekday(day: date) -> date:
+    current = day
+    while current.weekday() >= 5:
+        current = current - timedelta(days=1)
+    return current
+
+
+def _latest_quote_trade_date() -> date | None:
+    candidates: list[date] = []
+    snapshot = load_quote_snapshot()
+    if not snapshot.empty and "更新时间" in snapshot:
+        parsed = pd.to_datetime(snapshot["更新时间"], errors="coerce").dropna()
+        candidates.extend(item.date() for item in parsed if item.date().weekday() < 5)
+    refresh_date = _parse_date(load_last_refresh().get("更新时间"))
+    if refresh_date and refresh_date.weekday() < 5:
+        candidates.append(refresh_date)
+    return max(candidates) if candidates else None
+
+
+def _last_trade_date(trades: pd.DataFrame) -> date | None:
+    flow = ensure_trade_columns(trades)
+    if flow.empty:
+        return None
+    parsed = pd.to_datetime(flow["日期"], errors="coerce").dropna()
+    return parsed.max().date() if not parsed.empty else None
+
+
+def resolve_portfolio_as_of_date(trades: pd.DataFrame, as_of_date: Any | None = None) -> date:
+    explicit = _parse_date(as_of_date)
+    if explicit is not None:
+        return explicit
+    quote_date = _latest_quote_trade_date()
+    trade_date = _last_trade_date(trades)
+    if quote_date is not None and trade_date is not None:
+        return max(quote_date, trade_date)
+    if quote_date is not None:
+        return quote_date
+    if trade_date is not None:
+        return trade_date
+    return _previous_weekday(date.today())
+
+
+def _trades_on_or_before(trades: pd.DataFrame, settlement_date: date) -> pd.DataFrame:
+    flow = ensure_trade_columns(trades)
+    if flow.empty:
+        return flow
+    parsed = pd.to_datetime(flow["日期"], errors="coerce")
+    return flow[parsed.dt.date <= settlement_date].reset_index(drop=True)
+
+
 def _is_intraday_timestamp(value: Any, today: date) -> bool:
     parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
@@ -83,7 +141,7 @@ def _reference_from_watchlist(row: dict[str, Any] | None, use_intraday_pct: bool
         divisor = 1 + float(pct) / 100
         if divisor:
             return price / divisor
-    return price
+    return None
 
 
 def _reference_from_trade_snapshots(flow: pd.DataFrame, code: str, today: date) -> float | None:
@@ -162,10 +220,10 @@ def _opening_reference_price(
     candidates = [
         _reference_from_quote(quote_rows.get(code), today),
         _reference_from_watchlist(watchlist_rows.get(code), use_watchlist_pct),
-        _positive_number((legacy_rows.get(code) or {}).get("当前价")),
         _reference_from_trade_snapshots(flow, code, today),
         _reference_from_quote_archives(code, today),
         _reference_from_history(code, today),
+        _positive_number((legacy_rows.get(code) or {}).get("当前价")),
         _positive_number(opening_row.get("平均成本")),
         _positive_number(opening_row.get("当前价")),
     ]
@@ -180,14 +238,15 @@ def _broker_style_today_pnl(
     positions: pd.DataFrame,
     watchlist: pd.DataFrame,
     legacy_holdings: pd.DataFrame,
+    settlement_date: date,
 ) -> float:
     flow = ensure_trade_columns(trades)
-    today = date.today()
+    today = settlement_date
     today_mask = pd.to_datetime(flow["日期"], errors="coerce").dt.date == today
     today_trades = flow[today_mask].copy()
     prior_trades = flow[~today_mask].copy()
 
-    opening_positions = build_positions_from_trades(prior_trades, watchlist, legacy_holdings)
+    opening_positions = build_positions_from_trades(prior_trades, watchlist, legacy_holdings, as_of_date=today)
     quote_rows = _latest_rows_by_code(load_quote_snapshot())
     watchlist_rows = _latest_rows_by_code(watchlist)
     legacy_rows = _latest_rows_by_code(legacy_holdings)
@@ -279,10 +338,13 @@ def portfolio_snapshot(
     mode: str | None = None,
     sync_legacy: bool = False,
     persist_risk_state: bool = False,
+    as_of_date: Any | None = None,
 ) -> dict[str, Any]:
     account_mode = account_mode_name(mode)
     active_mode = mode or current_mode()
-    trades = trade_repository.load_trade_frame(active_mode, account_mode)
+    all_trades = trade_repository.load_trade_frame(active_mode, account_mode)
+    settlement_date = resolve_portfolio_as_of_date(all_trades, as_of_date)
+    trades = _trades_on_or_before(all_trades, settlement_date)
     watchlist = load_watchlist()
     legacy_holdings = load_holdings()
     positions = build_positions_from_trades(
@@ -290,14 +352,16 @@ def portfolio_snapshot(
         watchlist,
         legacy_holdings,
         persist_below_ma5_state=sync_legacy or persist_risk_state,
+        as_of_date=settlement_date,
     )
     if sync_legacy:
         save_holdings(portfolio_to_legacy_holdings(positions))
 
     state = account_state_from_trades(trades, positions, initial_cash(mode), account_mode)
-    today_pnl = _broker_style_today_pnl(trades, positions, watchlist, legacy_holdings)
+    today_pnl = _broker_style_today_pnl(trades, positions, watchlist, legacy_holdings, settlement_date)
+    today_realized_pnl = realized_pnl_by_date(trades, settlement_date)
     grouped_trades = _trades_by_code(trades)
-    today = date.today()
+    today = settlement_date
 
     api_positions: list[dict[str, Any]] = []
     for _, row in positions.iterrows():
@@ -347,5 +411,7 @@ def portfolio_snapshot(
         "totalPnL": number(state.get("总盈亏")),
         "totalReturnPct": number(state.get("总收益率%")),
         "todayPnL": round(today_pnl, 2),
+        "todayRealizedPnL": round(today_realized_pnl, 2),
+        "asOfDate": settlement_date.isoformat(),
     }
-    return {"accountState": account_state, "positions": api_positions}
+    return {"accountState": account_state, "positions": api_positions, "asOfDate": settlement_date.isoformat()}

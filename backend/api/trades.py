@@ -39,6 +39,14 @@ def update_trade_compat(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/recalculate-fees")
+def recalculate_trade_fees(mode: str | None = Query(default=None)) -> dict[str, Any]:
+    try:
+        return trade_service.recalculate_trade_fees(mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("")
 def create_trade(payload: dict[str, Any]) -> dict[str, Any]:
     try:
@@ -61,4 +69,3 @@ def delete_trade(trade_id: str, mode: str | None = Query(default=None)) -> dict[
         return trade_service.delete_trade(trade_id, mode)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-

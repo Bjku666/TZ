@@ -73,3 +73,46 @@ class TradeRepositoryTests(TestCase):
                 self.assertEqual(rows[0]["code"], "600002")
                 mirrored = pd.read_csv(csv_path, dtype={"代码": str}, encoding="utf-8-sig")
                 self.assertEqual(mirrored.iloc[0]["代码"], "600002")
+
+    def test_recalculate_api_trade_fees_uses_current_fee_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "app.db"
+            csv_path = root / "trades" / "trade_log.csv"
+
+            def load_csv() -> pd.DataFrame:
+                if not csv_path.exists():
+                    return pd.DataFrame(columns=TRADE_COLUMNS)
+                return pd.read_csv(csv_path, dtype={"代码": str}, encoding="utf-8-sig")
+
+            def save_csv(frame: pd.DataFrame) -> None:
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+            with (
+                patch.object(sqlite_store, "DB_PATH", db_path),
+                patch.object(trade_repository, "load_csv_trades", load_csv),
+                patch.object(trade_repository, "save_csv_trades", save_csv),
+            ):
+                sqlite_store.init_db()
+                trade_repository.append_api_trade("simulation", "模拟训练", _trade("T000001", "600001"))
+
+                updated = trade_repository.recalculate_api_trade_fees(
+                    "simulation",
+                    "模拟训练",
+                    {
+                        "commission_rate": 0,
+                        "min_commission": 0,
+                        "stamp_tax_rate": 0,
+                        "transfer_fee_rate": 0,
+                    },
+                )
+
+                self.assertEqual(len(updated), 1)
+                self.assertEqual(updated[0]["amount"], 1000)
+                self.assertEqual(updated[0]["commission"], 0)
+                self.assertEqual(updated[0]["stampDuty"], 0)
+                self.assertEqual(updated[0]["transferFee"], 0)
+                self.assertEqual(updated[0]["totalFee"], 0)
+                mirrored = pd.read_csv(csv_path, dtype={"代码": str}, encoding="utf-8-sig")
+                self.assertEqual(float(mirrored.iloc[0]["总费用"]), 0)

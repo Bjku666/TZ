@@ -156,11 +156,11 @@ def _stock_links(trades: list[dict[str, Any]], positions: list[dict[str, Any]], 
     return links
 
 
-def today_review(mode: str | None = None) -> dict[str, Any]:
-    today = _today()
+def today_review(mode: str | None = None, as_of_date: str | None = None) -> dict[str, Any]:
+    portfolio = portfolio_snapshot(mode, persist_risk_state=True, as_of_date=as_of_date)
+    today = str(portfolio.get("asOfDate") or as_of_date or _today())
     trades = list_trades(mode)["list"]
     today_trades = [trade for trade in trades if str(trade.get("date")) == today]
-    portfolio = portfolio_snapshot(mode, persist_risk_state=True)
     return {
         "date": today,
         "todayTrades": today_trades,
@@ -379,11 +379,12 @@ def list_reports(report_type: str = "daily") -> dict[str, Any]:
     return {"reports": reports}
 
 
-def context(mode: str | None = None) -> dict[str, Any]:
+def context(mode: str | None = None, as_of_date: str | None = None) -> dict[str, Any]:
     trades = list_trades(mode)["list"]
     watchlist = list_watchlist()["list"]
-    portfolio = portfolio_snapshot(mode, persist_risk_state=True)
-    today = _today()
+    portfolio = portfolio_snapshot(mode, persist_risk_state=True, as_of_date=as_of_date)
+    account_state = portfolio["accountState"]
+    today = str(portfolio.get("asOfDate") or account_state.get("asOfDate") or as_of_date or _today())
     today_trades = [trade for trade in trades if str(trade.get("date")) == today]
 
     market_snapshot = market_risk_snapshot(watchlist)
@@ -412,6 +413,10 @@ def context(mode: str | None = None) -> dict[str, Any]:
     return {
         "todayTrades": today_trades,
         "currentPositions": portfolio["positions"],
+        "accountState": account_state,
+        "asOfDate": today,
+        "todayPnL": account_state.get("todayPnL", 0),
+        "realizedPnL": account_state.get("todayRealizedPnL", 0),
         "marketSnapshot": market_snapshot,
         "sectors": sectors,
         "holdingDeviation": holding_deviation,

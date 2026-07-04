@@ -210,7 +210,7 @@ def calculate_trade_fees(
     quantity: object,
     settings: dict[str, Any] | None = None,
 ) -> dict[str, float]:
-    """Calculate A-share fees for one trade."""
+    """Calculate fees for one trade under the selected account fee profile."""
     settings = settings or {}
     amount = round(number_or(price) * number_or(quantity), 2)
     commission_rate = number_or(settings.get("commission_rate", 0.00025), 0.00025)
@@ -223,7 +223,8 @@ def calculate_trade_fees(
     if use_min_commission and amount > 0:
         commission = max(commission, min_commission)
     commission = round(commission, 2)
-    stamp_tax = round(amount * stamp_tax_rate if side == "卖出" else 0.0, 2)
+    is_sell = str(side).upper() in {"SELL", "卖出"}
+    stamp_tax = round(amount * stamp_tax_rate if is_sell else 0.0, 2)
     transfer_fee = round(amount * transfer_fee_rate, 2)
     total_fee = round(commission + stamp_tax + transfer_fee, 2)
 
@@ -322,13 +323,14 @@ def build_positions_from_trades(
     watchlist: pd.DataFrame | None = None,
     legacy_holdings: pd.DataFrame | None = None,
     persist_below_ma5_state: bool = False,
+    as_of_date: object | None = None,
 ) -> pd.DataFrame:
     flow = ensure_trade_columns(trades)
     if flow.empty:
         return pd.DataFrame(columns=POSITION_COLUMNS)
 
     states: dict[str, dict[str, Any]] = {}
-    today = pd.Timestamp(date.today()).normalize()
+    today = date_or_today(as_of_date).normalize() if as_of_date is not None else pd.Timestamp(date.today()).normalize()
     for _, trade in flow.iterrows():
         code = clean_code(trade["代码"])
         if not code:
@@ -432,6 +434,20 @@ def realized_pnl_from_trades(trades: pd.DataFrame) -> float:
     if closed.empty:
         return 0.0
     return float(pd.to_numeric(closed["收益金额"], errors="coerce").fillna(0).sum())
+
+
+def realized_pnl_by_date(trades: pd.DataFrame, target_date: object) -> float:
+    closed = closed_trades_from_flow(trades)
+    if closed.empty:
+        return 0.0
+    parsed = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(parsed):
+        return 0.0
+    dates = pd.to_datetime(closed["卖出日期"], errors="coerce")
+    rows = closed[dates.dt.date == parsed.date()]
+    if rows.empty:
+        return 0.0
+    return float(pd.to_numeric(rows["收益金额"], errors="coerce").fillna(0).sum())
 
 
 def account_state_from_trades(
