@@ -11,6 +11,7 @@ from src.data import HOLDING_COLUMNS
 from src.history import load_cached_history
 from src.rules import clean_code, holding_advice, ma5_deviation
 from src.storage import safe_write_text
+from src.trading_calendar import next_trading_day, shanghai_now
 
 ROOT = Path(__file__).resolve().parents[1]
 BELOW_MA5_STATE_FILE = ROOT / "data" / "runtime" / "below_ma5_state.json"
@@ -20,6 +21,8 @@ POSITION_COLUMNS = [
     "名称",
     "数量",
     "可卖数量",
+    "今日买入数量",
+    "T1锁定数量",
     "平均成本",
     "当前价",
     "市值",
@@ -330,7 +333,11 @@ def build_positions_from_trades(
         return pd.DataFrame(columns=POSITION_COLUMNS)
 
     states: dict[str, dict[str, Any]] = {}
-    today = date_or_today(as_of_date).normalize() if as_of_date is not None else pd.Timestamp(date.today()).normalize()
+    today = (
+        date_or_today(as_of_date).normalize()
+        if as_of_date is not None
+        else pd.Timestamp(shanghai_now().date()).normalize()
+    )
     for _, trade in flow.iterrows():
         code = clean_code(trade["代码"])
         if not code:
@@ -344,6 +351,7 @@ def build_positions_from_trades(
                 "成本总额": 0.0,
                 "买入日期": trade["日期"],
                 "今日买入数量": 0.0,
+                "买入批次": [],
             },
         )
         qty = number_or(trade.get("数量"))
@@ -362,6 +370,9 @@ def build_positions_from_trades(
             state["成本总额"] += amount + total_fee
             if pd.to_datetime(trade["日期"], errors="coerce").normalize() == today:
                 state["今日买入数量"] += qty
+            trade_day = pd.to_datetime(trade["日期"], errors="coerce")
+            if pd.notna(trade_day):
+                state["买入批次"].append({"date": trade_day.date(), "quantity": qty})
             if str(trade.get("名称", "")).strip():
                 state["名称"] = trade.get("名称", "")
         else:
@@ -371,6 +382,13 @@ def build_positions_from_trades(
             avg_cost = state["成本总额"] / state["数量"] if state["数量"] else 0
             state["数量"] -= sell_qty
             state["成本总额"] -= avg_cost * sell_qty
+            remaining_sell = sell_qty
+            for lot in state["买入批次"]:
+                if remaining_sell <= 0:
+                    break
+                consumed = min(number_or(lot.get("quantity")), remaining_sell)
+                lot["quantity"] = number_or(lot.get("quantity")) - consumed
+                remaining_sell -= consumed
             if state["数量"] <= 0:
                 state["数量"] = 0.0
                 state["成本总额"] = 0.0
@@ -384,7 +402,14 @@ def build_positions_from_trades(
             continue
         active_codes.add(code)
         today_buy_qty = number_or(state.get("今日买入数量"))
-        available_qty = max(0, min(qty, qty - today_buy_qty))
+        locked_qty = sum(
+            number_or(lot.get("quantity"))
+            for lot in state.get("买入批次", [])
+            if number_or(lot.get("quantity")) > 0
+            and next_trading_day(lot.get("date")) > today.date()
+        )
+        locked_qty = max(0, min(qty, locked_qty))
+        available_qty = max(0, min(qty, qty - locked_qty))
         avg_cost = state["成本总额"] / qty if qty else 0
         context = current_context(code, watchlist, legacy_holdings)
         current_price = number_or(context.get("当前价"), avg_cost)
@@ -412,6 +437,8 @@ def build_positions_from_trades(
             "名称": state.get("名称") or context.get("名称", ""),
             "数量": int(qty),
             "可卖数量": int(available_qty),
+            "今日买入数量": int(today_buy_qty),
+            "T1锁定数量": int(locked_qty),
             "平均成本": avg_cost,
             "当前价": current_price,
             "市值": market_value,

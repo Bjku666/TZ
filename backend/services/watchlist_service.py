@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Thread
+from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 
@@ -22,11 +28,13 @@ from src.realtime import (
     fetch_realtime_quotes,
     is_a_share_trading_time,
     merge_quotes_into_watchlist,
+    realtime_source_health,
 )
 from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
 from src.storage import load_quote_snapshot, save_quote_snapshot
 
-from backend.services.risk_service import annotate_watchlist_risk, refresh_external_market_context
+from backend.services.risk_service import annotate_watchlist_risk, refresh_market_context_if_stale
+from backend.services.portfolio_service import portfolio_snapshot
 from backend.services.settings_service import account_mode_name, current_mode, get_settings, initial_cash
 from backend.storage.csv_adapter import (
     FRONTEND_GROUP_TO_STAGE,
@@ -37,6 +45,45 @@ from backend.storage import trade_repository
 
 PINNED_GROUPS = {"观察", "待买", "持仓"}
 TRUE_VALUES = {"true", "1", "是", "yes", "y"}
+LOGGER = logging.getLogger("tz.performance")
+QUOTE_REFRESH_LOCK = Lock()
+POOL_REBUILD_LOCK = Lock()
+TURNOVER_SCAN_LOCK = Lock()
+HISTORY_JOB_LOCK = Lock()
+HISTORY_JOBS_STATE_LOCK = Lock()
+HISTORY_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _performance_log(
+    endpoint: str,
+    request_id: str,
+    started_at: float,
+    *,
+    source: str = "",
+    source_latency_ms: int = 0,
+    cache_hit: bool = False,
+    stale: bool = False,
+    success: bool = True,
+    error_type: str = "",
+) -> int:
+    duration_ms = round((perf_counter() - started_at) * 1000)
+    LOGGER.info(
+        json.dumps(
+            {
+                "endpoint": endpoint,
+                "request_id": request_id,
+                "source": source,
+                "source_latency_ms": source_latency_ms,
+                "total_duration_ms": duration_ms,
+                "cache_hit": cache_hit,
+                "stale": stale,
+                "success": success,
+                "error_type": error_type,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return duration_ms
 
 
 def _watchlist_api(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -138,6 +185,20 @@ def list_watchlist() -> dict[str, Any]:
 
 
 def generate_watchlist() -> dict[str, Any]:
+    if not POOL_REBUILD_LOCK.acquire(blocking=False):
+        return {
+            "success": False,
+            "inProgress": True,
+            "message": "已有股票池重建任务进行中",
+            "list": _watchlist_api(load_watchlist()),
+        }
+    try:
+        return _generate_watchlist_locked()
+    finally:
+        POOL_REBUILD_LOCK.release()
+
+
+def _generate_watchlist_locked() -> dict[str, Any]:
     settings = get_settings()
     source = str(settings.get("quote_source") or settings.get("quoteSource") or "自动切换")
     limit = int(settings.get("auto_pool_size") or 30)
@@ -180,7 +241,7 @@ def generate_watchlist() -> dict[str, Any]:
 
     frame = recompute_watchlist(frame)
     save_watchlist(frame)
-    market_context = refresh_external_market_context()
+    market_context = refresh_market_context_if_stale()
     batch_id = str(frame["pool_batch_id"].dropna().iloc[0]) if "pool_batch_id" in frame and not frame.empty else ""
     return {
         "success": True,
@@ -228,21 +289,69 @@ def import_watchlist_file(content: bytes, filename: str, fetch_history: bool = F
 
 
 def refresh_quotes() -> dict[str, Any]:
+    request_id = uuid4().hex
+    started_at = perf_counter()
+    if not QUOTE_REFRESH_LOCK.acquire(blocking=False):
+        portfolio = portfolio_snapshot(persist_risk_state=False)
+        return {
+            "success": True,
+            "inProgress": True,
+            "requestId": request_id,
+            "message": "已有行情刷新任务进行中，返回当前快照",
+            "isStale": True,
+            "dataAgeSeconds": 0,
+            "list": _watchlist_api(load_watchlist()),
+            "positions": portfolio["positions"],
+            "accountState": portfolio["accountState"],
+            "durationMs": _performance_log(
+                "/api/watchlist/refresh-quotes",
+                request_id,
+                started_at,
+                cache_hit=True,
+                stale=True,
+            ),
+        }
+    try:
+        return _refresh_quotes_locked(request_id, started_at)
+    finally:
+        QUOTE_REFRESH_LOCK.release()
+
+
+def _refresh_quotes_locked(request_id: str, started_at: float) -> dict[str, Any]:
     frame = load_watchlist()
     if frame.empty:
-        return {"success": True, "list": []}
+        return {"success": True, "requestId": request_id, "list": [], "positions": [], "durationMs": 0}
     codes = [clean_code(code) for code in frame["代码"].dropna().astype(str)]
     settings = get_settings()
     source = str(settings.get("quote_source") or "自动切换")
+    source_started_at = perf_counter()
     quotes = fetch_realtime_quotes(codes, source=source)
+    source_latency_ms = round((perf_counter() - source_started_at) * 1000)
     message = str(quotes.attrs.get("message", ""))
+    used_cache = False
     if quotes.empty:
         cached = load_quote_snapshot()
         if not cached.empty:
             quotes = cached
+            used_cache = True
             message = message or "行情源失败，已使用最近缓存"
         else:
-            return {"success": False, "message": message or "行情刷新失败，且没有可用缓存", "list": _watchlist_api(frame)}
+            duration_ms = _performance_log(
+                "/api/watchlist/refresh-quotes",
+                request_id,
+                started_at,
+                source=source,
+                source_latency_ms=source_latency_ms,
+                success=False,
+                error_type="quote_source_unavailable",
+            )
+            return {
+                "success": False,
+                "requestId": request_id,
+                "message": message or "行情刷新失败，且没有可用缓存",
+                "list": _watchlist_api(frame),
+                "durationMs": duration_ms,
+            }
     else:
         save_quote_snapshot(
             quotes,
@@ -254,19 +363,49 @@ def refresh_quotes() -> dict[str, Any]:
     merged = merge_quotes_into_watchlist(frame, quotes)
     merged = recompute_watchlist(merged)
     save_watchlist(merged)
-    market_context = refresh_external_market_context()
+    portfolio = portfolio_snapshot(persist_risk_state=True)
+    duration_ms = _performance_log(
+        "/api/watchlist/refresh-quotes",
+        request_id,
+        started_at,
+        source=str(quotes.attrs.get("source", source)),
+        source_latency_ms=source_latency_ms,
+        cache_hit=used_cache,
+        stale=used_cache,
+    )
     return {
         "success": True,
+        "requestId": request_id,
+        "serverTime": china_now().isoformat(),
+        "source": str(quotes.attrs.get("source", source)),
+        "isStale": used_cache,
+        "dataAgeSeconds": 0,
+        "durationMs": duration_ms,
         "message": message,
-        "marketContext": {
-            "success": bool(market_context.get("success")),
-            "message": market_context.get("message", ""),
-        },
         "list": _watchlist_api(merged),
+        "watchlist": _watchlist_api(merged),
+        "positions": portfolio["positions"],
+        "accountState": portfolio["accountState"],
+        "sourceHealth": realtime_source_health(),
     }
 
 
 def scan_turnover_changes() -> dict[str, Any]:
+    if not TURNOVER_SCAN_LOCK.acquire(blocking=False):
+        return {
+            "success": False,
+            "inProgress": True,
+            "message": "已有成交额异动扫描进行中",
+            "changes": {"newEntries": [], "dropped": [], "rankUp": [], "rankDown": []},
+            "list": _watchlist_api(load_watchlist()),
+        }
+    try:
+        return _scan_turnover_changes_locked()
+    finally:
+        TURNOVER_SCAN_LOCK.release()
+
+
+def _scan_turnover_changes_locked() -> dict[str, Any]:
     frame = load_watchlist()
     settings = get_settings()
     source = str(settings.get("quote_source") or settings.get("quoteSource") or "自动切换")
@@ -478,6 +617,96 @@ def fetch_history_for_watchlist(code: str | None = None, fetch_all: bool = False
     save_watchlist(updated)
     summary["list"] = _watchlist_api(updated)
     return summary
+
+
+def _history_job_worker(job_id: str, codes: list[str], skipped: int) -> None:
+    results: dict[str, dict[str, Any]] = {}
+    fetched = 0
+    failed = 0
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(fetch_and_cache, code): code for code in codes}
+            for future in as_completed(futures):
+                item_code = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {"success": False, "status": "自动获取失败", "error": str(exc)}
+                fetched += int(bool(result.get("success")))
+                failed += int(not result.get("success"))
+                results[item_code] = {
+                    "success": bool(result.get("success")),
+                    "status": result.get("status", ""),
+                    "error": result.get("error", ""),
+                }
+                with HISTORY_JOBS_STATE_LOCK:
+                    HISTORY_JOBS[job_id].update(
+                        {
+                            "completed": fetched + failed,
+                            "fetched": fetched,
+                            "failed": failed,
+                            "results": dict(results),
+                        }
+                    )
+
+        updated = recompute_watchlist(load_watchlist())
+        save_watchlist(updated)
+        with HISTORY_JOBS_STATE_LOCK:
+            HISTORY_JOBS[job_id].update(
+                {
+                    "status": "completed",
+                    "success": failed == 0,
+                    "completed": len(codes),
+                    "fetched": fetched,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "list": _watchlist_api(updated),
+                }
+            )
+    except Exception as exc:
+        with HISTORY_JOBS_STATE_LOCK:
+            HISTORY_JOBS[job_id].update({"status": "failed", "success": False, "error": str(exc)})
+    finally:
+        HISTORY_JOB_LOCK.release()
+
+
+def start_history_job() -> dict[str, Any]:
+    if not HISTORY_JOB_LOCK.acquire(blocking=False):
+        with HISTORY_JOBS_STATE_LOCK:
+            running = next((job for job in HISTORY_JOBS.values() if job.get("status") == "running"), None)
+        return {"success": True, "inProgress": True, **(running or {"status": "running", "total": 0, "completed": 0})}
+
+    frame = load_watchlist()
+    all_codes = [clean_code(value) for value in frame.get("代码", pd.Series(dtype=str)).dropna().astype(str)]
+    codes = [code for code in all_codes if code and not diagnose_history(code)["is_valid"]]
+    job_id = uuid4().hex
+    job: dict[str, Any] = {
+        "success": True,
+        "jobId": job_id,
+        "status": "running",
+        "total": len(codes),
+        "completed": 0,
+        "fetched": 0,
+        "failed": 0,
+        "skipped": max(0, len(all_codes) - len(codes)),
+        "results": {},
+    }
+    with HISTORY_JOBS_STATE_LOCK:
+        HISTORY_JOBS[job_id] = job
+    if not codes:
+        job["status"] = "completed"
+        HISTORY_JOB_LOCK.release()
+        return dict(job)
+    Thread(target=_history_job_worker, args=(job_id, codes, int(job["skipped"])), daemon=True).start()
+    return dict(job)
+
+
+def get_history_job(job_id: str) -> dict[str, Any]:
+    with HISTORY_JOBS_STATE_LOCK:
+        job = HISTORY_JOBS.get(job_id)
+        if job is None:
+            raise ValueError("未找到K线补齐任务")
+        return dict(job)
 
 
 def update_stock(payload: dict[str, Any]) -> dict[str, Any]:

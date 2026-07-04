@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 import json
 from typing import Any
 
@@ -21,6 +21,16 @@ from src.trading_rules_config import (
     TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
 )
 from src.storage import load_last_refresh, load_quote_snapshot
+from src.trading_calendar import (
+    SHANGHAI_TZ,
+    calendar_degraded,
+    current_market_phase,
+    is_trading_day,
+    next_market_open,
+    next_trading_day,
+    previous_trading_day,
+    shanghai_now,
+)
 
 from backend.services.settings_service import account_mode_name, current_mode, get_settings, initial_cash
 from backend.storage.csv_adapter import number, trades_to_api
@@ -101,6 +111,73 @@ def resolve_portfolio_as_of_date(trades: pd.DataFrame, as_of_date: Any | None = 
     if trade_date is not None:
         return trade_date
     return _previous_weekday(date.today())
+
+
+def resolve_operation_date(value: Any | None = None) -> date:
+    return _parse_date(value) or shanghai_now().date()
+
+
+def resolve_valuation_date(trades: pd.DataFrame, operation_date: date) -> date:
+    quote_date = _latest_quote_trade_date()
+    trade_date = _last_trade_date(trades)
+    candidates = [day for day in (quote_date, trade_date) if day is not None and day <= operation_date]
+    if candidates:
+        candidate = max(candidates)
+        return candidate if is_trading_day(candidate) else previous_trading_day(candidate)
+    return operation_date if is_trading_day(operation_date) else previous_trading_day(operation_date)
+
+
+def _market_clock_for_operation(operation_date: date) -> datetime:
+    now = shanghai_now()
+    if operation_date == now.date():
+        return now
+    return datetime.combine(operation_date, time(12, 0), tzinfo=SHANGHAI_TZ)
+
+
+def _position_execution_status(row: pd.Series, operation_date: date) -> dict[str, Any]:
+    quantity = int(number(row.get("数量")))
+    available = int(number(row.get("可卖数量")))
+    today_buy = int(number(row.get("今日买入数量")))
+    t1_locked = int(number(row.get("T1锁定数量")))
+    buy_date = _parse_date(row.get("买入日期"))
+    clock = _market_clock_for_operation(operation_date)
+    phase = current_market_phase(clock)
+    is_today_buy = buy_date == operation_date
+    next_sellable = next_trading_day(operation_date) if t1_locked > 0 else operation_date
+    if t1_locked > 0 and buy_date is not None:
+        next_sellable = next_trading_day(buy_date)
+
+    can_execute = available > 0 and phase == "trading"
+    if phase in {"weekend", "holiday"}:
+        blocked = f"休市，下一交易日 {next_trading_day(operation_date).isoformat()} 可处理"
+    elif phase == "pre_market":
+        blocked = "盘前不可交易，今日开盘后可卖" if available > 0 else "盘前暂无可卖数量"
+    elif phase == "lunch_break":
+        blocked = "午间休市，13:00 后可处理" if available > 0 else "当前无可卖数量"
+    elif phase == "after_close":
+        blocked = f"已收盘，下一交易日 {next_trading_day(operation_date).isoformat()} 可处理"
+    elif available <= 0 and t1_locked > 0:
+        blocked = f"T+1 锁定 {t1_locked} 股，{next_sellable.isoformat()} 可处理"
+    elif available <= 0:
+        blocked = "当前无可卖数量，请检查交易流水或账户同步状态"
+    else:
+        blocked = ""
+
+    next_open = next_market_open(clock)
+    return {
+        "operationDate": operation_date.isoformat(),
+        "isTodayBuy": is_today_buy,
+        "todayBuyQuantity": today_buy,
+        "t1LockedQuantity": t1_locked,
+        "isT1Locked": t1_locked > 0,
+        "nextSellableTradeDate": next_sellable.isoformat(),
+        "marketPhase": phase,
+        "canExecuteSellNow": can_execute,
+        "sellBlockedReason": blocked,
+        "nextActionTime": next_open.isoformat(),
+        "calendarDegraded": calendar_degraded(),
+        "settledQuantity": max(0, quantity - t1_locked),
+    }
 
 
 def _trades_on_or_before(trades: pd.DataFrame, settlement_date: date) -> pd.DataFrame:
@@ -360,8 +437,9 @@ def portfolio_snapshot(
     account_mode = account_mode_name(mode)
     active_mode = mode or current_mode()
     all_trades = trade_repository.load_trade_frame(active_mode, account_mode)
-    settlement_date = resolve_portfolio_as_of_date(all_trades, as_of_date)
-    trades = _trades_on_or_before(all_trades, settlement_date)
+    operation_date = resolve_operation_date(as_of_date)
+    valuation_date = resolve_valuation_date(all_trades, operation_date)
+    trades = _trades_on_or_before(all_trades, operation_date)
     watchlist = load_watchlist()
     legacy_holdings = load_holdings()
     positions = build_positions_from_trades(
@@ -369,16 +447,16 @@ def portfolio_snapshot(
         watchlist,
         legacy_holdings,
         persist_below_ma5_state=sync_legacy or persist_risk_state,
-        as_of_date=settlement_date,
+        as_of_date=operation_date,
     )
     if sync_legacy:
         save_holdings(portfolio_to_legacy_holdings(positions))
 
     state = account_state_from_trades(trades, positions, initial_cash(mode), account_mode)
-    today_pnl = _broker_style_today_pnl(trades, positions, watchlist, legacy_holdings, settlement_date)
-    today_realized_pnl = realized_pnl_by_date(trades, settlement_date)
+    today_pnl = _broker_style_today_pnl(trades, positions, watchlist, legacy_holdings, valuation_date)
+    today_realized_pnl = realized_pnl_by_date(trades, operation_date)
     grouped_trades = _trades_by_code(trades)
-    today = settlement_date
+    today = operation_date
 
     api_positions: list[dict[str, Any]] = []
     for _, row in positions.iterrows():
@@ -391,6 +469,7 @@ def portfolio_snapshot(
         quantity = int(number(row.get("数量")))
         current_loss_amount = max(0.0, (avg_cost - current_price) * quantity)
         max_loss_amount = number(state.get("初始本金")) * MAX_SINGLE_TRADE_RISK_PCT
+        execution_status = _position_execution_status(row, operation_date)
         api_positions.append(
             {
                 "code": code,
@@ -407,6 +486,7 @@ def portfolio_snapshot(
                 "holdDays": int(number(row.get("持仓天数"))),
                 "belowMa5Days": int(number(row.get("跌破MA5天数"))),
                 "buyDate": str(row.get("买入日期") or ""),
+                "valuationDate": valuation_date.isoformat(),
                 "advice": advice,
                 "riskLevel": _risk_level(advice, deviation),
                 "currentLossAmount": round(current_loss_amount, 2),
@@ -415,6 +495,7 @@ def portfolio_snapshot(
                 if number(state.get("初始本金")) > 0
                 else 0,
                 "tradeLink": _position_trade_link(code, grouped_trades, today),
+                **execution_status,
             }
         )
 
@@ -431,7 +512,9 @@ def portfolio_snapshot(
         "totalReturnPct": round(number(state.get("总收益率%")), 2),
         "todayPnL": round(today_pnl, 2),
         "todayRealizedPnL": round(today_realized_pnl, 2),
-        "asOfDate": settlement_date.isoformat(),
+        "asOfDate": operation_date.isoformat(),
+        "operationDate": operation_date.isoformat(),
+        "valuationDate": valuation_date.isoformat(),
     }
     settings = get_settings()
     reconciliation_key = "realThsReconciliation" if active_mode == "real" else "simulationThsReconciliation"
@@ -480,4 +563,10 @@ def portfolio_snapshot(
                 )
     else:
         account_state["reconciliationMode"] = False
-    return {"accountState": account_state, "positions": api_positions, "asOfDate": settlement_date.isoformat()}
+    return {
+        "accountState": account_state,
+        "positions": api_positions,
+        "asOfDate": operation_date.isoformat(),
+        "operationDate": operation_date.isoformat(),
+        "valuationDate": valuation_date.isoformat(),
+    }

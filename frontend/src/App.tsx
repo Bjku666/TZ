@@ -427,24 +427,30 @@ function buildPositionSellPlan(position: Position, rules: TradingRulesConfig = D
   const farFromMa5 = hasMa5 && deviation > rules.takeProfit.priorityDeviationPct;
   const belowDays = Math.max(0, Math.floor(Number(position.belowMa5Days) || 0));
   const availableQuantity = Math.max(0, Math.floor(Number(position.availableQuantity) || 0));
-  const t1Locked = availableQuantity <= 0;
-  const actionableQuantity = t1Locked ? position.quantity : availableQuantity;
+  const t1Locked = Boolean(position.isT1Locked);
+  const fullyT1Locked = t1Locked && availableQuantity <= 0;
+  const actionableQuantity = availableQuantity;
+  const marketClosed = position.marketPhase !== "trading";
+  const buyDateLabel = position.buyDate ? `${position.buyDate.slice(5).replace("-", "月")}日建仓` : "历史建仓";
+  const nextSellableLabel = position.nextSellableTradeDate || "下一交易日";
   const smallPosition = actionableQuantity < 200;
   const sizingRule = smallPosition
-    ? t1Locked
-      ? "今日仓暂无可卖数量，不能执行卖出，只能记录风险并规划明日动作。"
+    ? fullyT1Locked
+      ? `${position.sellBlockedReason || "当前暂无可卖数量"}。`
       : "100股或小仓位不能卖半手：要么继续持有，要么一次卖完。"
-    : "200股以上才考虑卖一半，剩余仓位继续用5日线管理。";
+    : t1Locked
+      ? `可卖 ${availableQuantity} 股，T+1锁定 ${position.t1LockedQuantity} 股；卖出只使用已结算数量。`
+      : "200股以上才考虑卖一半，剩余仓位继续用5日线管理。";
   const holdText = holdingTimeLabel(position);
-  const nextMorningRule = t1Locked
-    ? "今日建仓受T+1限制，盘中跌破只能记录风险；明日10:00前核对强弱，不强再按可卖数量处理。"
+  const nextMorningRule = fullyT1Locked
+    ? `${position.sellBlockedReason || `T+1锁定，${nextSellableLabel} 可处理`}。`
     : position.holdDays <= 1
       ? "次日10:00前核对强度：高开低走、冲高回落、弱于板块、没有继续上攻、跌破MA5，都按“不强”处理，冲高卖出或退出。"
     : `${holdText}，首个隔日强弱窗口已过；后续仍看是否弱于板块、冲高回落或跌破MA5。`;
   const takeProfitRule = !hasMa5
     ? "缺少MA5，先补齐K线后再判断是否远离5日线。"
-    : t1Locked && farFromMa5
-        ? `当前偏离MA5 ${signedPercent(deviation)}，但今日仓T+1不可卖；先写好明日止盈计划。`
+    : fullyT1Locked && farFromMa5
+        ? `当前偏离MA5 ${signedPercent(deviation)}，但当前不可卖；先写好下一交易日止盈计划。`
     : farFromMa5
       ? `当前偏离MA5 ${signedPercent(deviation)}，已进入远离5日线止盈层。${sizingRule}`
       : takeProfitWatch
@@ -452,10 +458,10 @@ function buildPositionSellPlan(position: Position, rules: TradingRulesConfig = D
       : `当前偏离MA5 ${signedPercent(deviation)}，尚未明显远离5日线；不因普通上涨随意卖飞。`;
   const ma5RiskRule = !hasMa5
     ? "缺少MA5，暂不能执行5日线风控判断。"
-    : t1Locked && (belowMa5 || belowDays >= 3)
-      ? "当前跌破MA5，但今日建仓没有可卖数量；先记录风险，明日开盘后按强弱和可卖数量优先处理。"
-    : t1Locked
-      ? "今日建仓暂无可卖数量，14:50只复核MA5位置并记录，不触发卖出动作。"
+    : fullyT1Locked && (belowMa5 || belowDays >= 3)
+      ? `当前跌破MA5，但没有可卖数量；先记录风险，${nextSellableLabel} 开盘后优先处理。`
+    : fullyT1Locked
+      ? `${position.sellBlockedReason || "当前暂无可卖数量"}，只复核MA5位置并记录。`
     : belowDays >= 3
       ? `已跌破MA5 ${belowDays} 天且未站回，触发清仓层。`
       : belowMa5
@@ -482,22 +488,27 @@ function buildPositionSellPlan(position: Position, rules: TradingRulesConfig = D
     };
   }
 
-  if (t1Locked) {
+  if (fullyT1Locked) {
+    const closedTitle = marketClosed && !position.isTodayBuy
+      ? `${buyDateLabel} · 休市中`
+      : position.isTodayBuy
+        ? "今日建仓，T+1锁定"
+        : "T+1待结算";
     return {
       tone: belowMa5 ? "warning" : "neutral",
       triggerKey: "t1-lock",
       priority: belowMa5 ? 2 : 4,
-      statusLabel: "T+1锁仓",
-      title: belowMa5 ? "今日建仓跌破MA5，先记录风险" : "今日建仓，T+1不可卖",
+      statusLabel: marketClosed ? "T+1待结算 · 休市" : "T+1锁定",
+      title: belowMa5 ? "跌破MA5，下一交易日优先复核" : closedTitle,
       primaryAction: belowMa5
-        ? "这只票今天没有可卖数量，不能提示14:50卖出；收盘前只确认是否继续跌破，明日10:00前优先处理。"
-        : "今日仓按T+1锁定，今天不生成卖出动作；明日再按强弱、远离MA5和跌破MA5三层规则执行。",
+        ? `${position.sellBlockedReason || "当前不能执行卖出"}。${nextSellableLabel} 开盘后先观察强弱，再按可卖数量处理。`
+        : `${position.sellBlockedReason || "当前不能执行卖出"}。`,
       nextMorningRule,
       takeProfitRule,
       ma5RiskRule,
       sizingRule,
-      sellReason: "今日建仓T+1不可卖，仅记录风险观察",
-      buttonLabel: "T+1锁仓",
+      sellReason: position.sellBlockedReason || "当前不可卖，仅记录风险观察",
+      buttonLabel: marketClosed ? "休市中" : "T+1锁定",
       cardClass: belowMa5 ? "bg-slate-900/70 border-amber-900/70 text-slate-200" : "bg-slate-900/60 border-slate-800 text-slate-200",
       dotClass: belowMa5 ? "bg-amber-500" : "bg-slate-500",
       badgeClass: belowMa5 ? "bg-amber-950 text-amber-300 border border-amber-700/60" : "bg-slate-950/50 text-slate-300 border border-slate-700"
@@ -673,6 +684,11 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [actionLog, setActionLog] = useState<string[]>([]);
   const [currentMode, setCurrentMode] = useState<AccountMode>("simulation");
+  const [backendHealth, setBackendHealth] = useState({
+    gitCommit: "",
+    serverTime: "",
+    timezone: "Asia/Shanghai"
+  });
 
   // 筛选与交互状态
   const [watchlistGroup, setWatchlistGroup] = useState<StockViewGroup>("初筛");
@@ -768,11 +784,20 @@ export default function App() {
   const [autoQuoteRefreshEnabled, setAutoQuoteRefreshEnabled] = useState(false);
   const [quoteRefreshCountdown, setQuoteRefreshCountdown] = useState(QUOTE_AUTO_REFRESH_SECONDS);
   const [lastQuoteRefreshAt, setLastQuoteRefreshAt] = useState<Date | null>(null);
+  const [quoteFreshness, setQuoteFreshness] = useState({
+    source: "",
+    durationMs: 0,
+    isStale: false,
+    dataAgeSeconds: 0,
+    serverTime: ""
+  });
   const [turnoverScanning, setTurnoverScanning] = useState(false);
+  const [historyJobProgress, setHistoryJobProgress] = useState<{ completed: number; total: number } | null>(null);
   const [autoTurnoverScanEnabled, setAutoTurnoverScanEnabled] = useState(false);
   const [turnoverScanCountdown, setTurnoverScanCountdown] = useState(TURNOVER_AUTO_SCAN_SECONDS);
   const [lastTurnoverScanAt, setLastTurnoverScanAt] = useState<Date | null>(null);
   const quoteRefreshInFlightRef = useRef(false);
+  const latestQuoteRefreshSequenceRef = useRef(0);
   const turnoverScanInFlightRef = useRef(false);
   const lastQuoteRefreshAtMsRef = useRef(Date.now());
   const lastTurnoverScanAtMsRef = useRef(Date.now());
@@ -1073,6 +1098,12 @@ export default function App() {
   useEffect(() => {
     loadSettings();
     loadRulesConfig();
+    fetch("/api/health")
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (data) setBackendHealth(data);
+      })
+      .catch(() => undefined);
   }, []);
 
   // 切换运行模式
@@ -1093,59 +1124,48 @@ export default function App() {
     }
   };
 
-  // 加载系统所有数据
+  const loadPortfolio = async () => {
+    const res = await fetch(`/api/portfolio?mode=${currentMode}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    setAccountState(data.accountState);
+    setPositions(data.positions);
+  };
+
+  const loadWatchlist = async () => {
+    const res = await fetch("/api/watchlist");
+    if (!res.ok) return;
+    const data = await res.json();
+    setWatchlist(data.list);
+    if (data.list.length > 0 && !selectedStock) {
+      const firstVisible = firstStockForGroup(data.list, watchlistGroup);
+      if (firstVisible) setSelectedStock(firstVisible);
+    }
+  };
+
+  const loadTrades = async () => {
+    const res = await fetch(`/api/trades?mode=${currentMode}`);
+    if (res.ok) setTrades((await res.json()).list);
+  };
+
+  const loadReviewData = async () => {
+    const contextParams = new URLSearchParams({ mode: currentMode, asOfDate: reportDate });
+    const [resAudit, resReports, resContext] = await Promise.all([
+      fetch(`/api/reports/audit?mode=${currentMode}`),
+      fetch(`/api/reports/list?type=${reviewType}`),
+      fetch(`/api/reports/context?${contextParams.toString()}`)
+    ]);
+    if (resAudit.ok) setAuditStats(await resAudit.json());
+    if (resReports.ok) setReportsList((await resReports.json()).reports);
+    if (resContext.ok) setReportContext(await resContext.json());
+  };
+
+  // 加载当前工作区需要的核心数据
   const loadAllData = async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      // 1. 获取持仓与资产
-      const resPortfolio = await fetch(`/api/portfolio?mode=${currentMode}`);
-      if (resPortfolio.ok) {
-        const data = await resPortfolio.json();
-        setAccountState(data.accountState);
-        setPositions(data.positions);
-      }
-      
-      // 2. 获取自选池
-      const resWatchlist = await fetch("/api/watchlist");
-      if (resWatchlist.ok) {
-        const data = await resWatchlist.json();
-        setWatchlist(data.list);
-        // 如果没有选中的股票，默认选当前视图的第一只
-        if (data.list.length > 0 && !selectedStock) {
-          const firstVisible = firstStockForGroup(data.list, watchlistGroup);
-          if (firstVisible) setSelectedStock(firstVisible);
-        }
-      }
-
-      // 3. 获取交易历史
-      const resTrades = await fetch(`/api/trades?mode=${currentMode}`);
-      if (resTrades.ok) {
-        const data = await resTrades.json();
-        setTrades(data.list);
-      }
-
-      // 4. 获取复盘审计
-      const resAudit = await fetch(`/api/reports/audit?mode=${currentMode}`);
-      if (resAudit.ok) {
-        const data = await resAudit.json();
-        setAuditStats(data);
-      }
-
-      // 5. 获取复盘报告列表
-      const resReports = await fetch(`/api/reports/list?type=${reviewType}`);
-      if (resReports.ok) {
-        const data = await resReports.json();
-        setReportsList(data.reports);
-      }
-
-      // 6. 获取复盘报告聚合数据上下文
-      const contextParams = new URLSearchParams({ mode: currentMode, asOfDate: reportDate });
-      const resContext = await fetch(`/api/reports/context?${contextParams.toString()}`);
-      if (resContext.ok) {
-        const data = await resContext.json();
-        setReportContext(data);
-      }
-
+      await Promise.all([loadPortfolio(), loadWatchlist(), loadTrades()]);
+      if (activeTab === "review") await loadReviewData();
     } catch (err) {
       console.error("加载数据错误:", err);
       logAction("❌ 数据加载发生异常，请检查后台连接");
@@ -1156,7 +1176,11 @@ export default function App() {
 
   useEffect(() => {
     loadAllData();
-  }, [watchlistGroup, reviewType, currentMode, activeTab, reportDate]);
+  }, [currentMode]);
+
+  useEffect(() => {
+    if (activeTab === "review") void loadReviewData();
+  }, [activeTab, reviewType, reportDate, currentMode]);
 
   const logAction = (msg: string) => {
     const timestamp = new Date().toTimeString().split(" ")[0];
@@ -1213,18 +1237,34 @@ export default function App() {
     }
 
     quoteRefreshInFlightRef.current = true;
+    const refreshSequence = ++latestQuoteRefreshSequenceRef.current;
     setQuoteRefreshing(true);
     if (isManualRefresh) setLoading(true);
     logAction(isManualRefresh ? "⏳ 立刻刷新当前池行情启动..." : "⏳ 30秒自动刷新当前池行情启动...");
     try {
-      const res = await fetch("/api/watchlist/refresh-quotes", { method: "POST" });
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 5000);
+      const res = await fetch("/api/watchlist/refresh-quotes", {
+        method: "POST",
+        signal: controller.signal
+      }).finally(() => window.clearTimeout(timeoutId));
       const data = await res.json().catch(() => null);
       if (!res.ok || data?.success === false) {
         if (Array.isArray(data?.list)) setWatchlist(data.list);
         throw new Error(data?.message || "行情刷新失败，保留本地缓存");
       }
 
-      setWatchlist(data?.list || []);
+      if (refreshSequence !== latestQuoteRefreshSequenceRef.current) return;
+      setWatchlist(data?.watchlist || data?.list || []);
+      if (Array.isArray(data?.positions)) setPositions(data.positions);
+      if (data?.accountState) setAccountState(data.accountState);
+      setQuoteFreshness({
+        source: data?.source || "",
+        durationMs: Number(data?.durationMs) || 0,
+        isStale: Boolean(data?.isStale),
+        dataAgeSeconds: Number(data?.dataAgeSeconds) || 0,
+        serverTime: data?.serverTime || ""
+      });
       const refreshMessage = data?.message ? `（${data.message}）` : "";
       logAction(
         isManualRefresh
@@ -1236,10 +1276,11 @@ export default function App() {
       logAction(isManualRefresh ? `❌ ${errorMessage}` : `❌ 自动刷新失败：${errorMessage}`);
     } finally {
       const finishedAt = new Date();
-      lastQuoteRefreshAtMsRef.current = finishedAt.getTime();
-      setLastQuoteRefreshAt(finishedAt);
-      setQuoteRefreshCountdown(QUOTE_AUTO_REFRESH_SECONDS);
-      await loadAllData(true);
+      if (refreshSequence === latestQuoteRefreshSequenceRef.current) {
+        lastQuoteRefreshAtMsRef.current = finishedAt.getTime();
+        setLastQuoteRefreshAt(finishedAt);
+        setQuoteRefreshCountdown(QUOTE_AUTO_REFRESH_SECONDS);
+      }
       quoteRefreshInFlightRef.current = false;
       setQuoteRefreshing(false);
       if (isManualRefresh) setLoading(false);
@@ -1349,13 +1390,14 @@ export default function App() {
       const secondsLeft = Math.max(QUOTE_AUTO_REFRESH_SECONDS - elapsedSeconds, 0);
       setQuoteRefreshCountdown(secondsLeft);
 
-      if (secondsLeft <= 0 && !quoteRefreshInFlightRef.current) {
+      const marketIsOpen = positions.length === 0 || positions.some(position => position.marketPhase === "trading");
+      if (secondsLeft <= 0 && !quoteRefreshInFlightRef.current && !document.hidden && marketIsOpen) {
         void refreshQuotesRef.current("auto");
       }
     }, 1000);
 
     return () => window.clearInterval(timer);
-  }, [autoQuoteRefreshEnabled]);
+  }, [autoQuoteRefreshEnabled, positions]);
 
   useEffect(() => {
     if (!autoTurnoverScanEnabled) {
@@ -1372,7 +1414,7 @@ export default function App() {
       const secondsLeft = Math.max(TURNOVER_AUTO_SCAN_SECONDS - elapsedSeconds, 0);
       setTurnoverScanCountdown(secondsLeft);
 
-      if (secondsLeft <= 0 && !turnoverScanInFlightRef.current) {
+      if (secondsLeft <= 0 && !turnoverScanInFlightRef.current && !document.hidden) {
         void scanTurnoverChangesRef.current("auto");
       }
     }, 1000);
@@ -1380,19 +1422,39 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [autoTurnoverScanEnabled]);
 
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden && autoQuoteRefreshEnabled && positions.some(position => position.marketPhase === "trading")) {
+        void refreshQuotesRef.current("auto");
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [autoQuoteRefreshEnabled, positions]);
+
   // 补充K线历史
   const handleFetchHistory = async (code?: string, fetchAll = false) => {
-    setLoading(true);
+    if (!fetchAll) setLoading(true);
     logAction(fetchAll ? "⏳ 正在抓取自选池全量历史K线以补齐MA均线指标..." : `⏳ 正在抓取股票 ${code} 的历史K线...`);
     try {
-      const res = await fetch("/api/watchlist/fetch-history", {
+      const res = await fetch(fetchAll ? "/api/watchlist/history-jobs" : "/api/watchlist/fetch-history", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code, fetchAll })
       });
       if (res.ok) {
-        const data = await res.json();
-        setWatchlist(data.list);
+        let data = await res.json();
+        if (fetchAll && data.jobId) {
+          setHistoryJobProgress({ completed: data.completed || 0, total: data.total || 0 });
+          while (data.status === "running") {
+            await new Promise(resolve => window.setTimeout(resolve, 600));
+            const statusRes = await fetch(`/api/watchlist/history-jobs/${data.jobId}`);
+            if (!statusRes.ok) throw new Error("K线任务状态读取失败");
+            data = await statusRes.json();
+            setHistoryJobProgress({ completed: data.completed || 0, total: data.total || 0 });
+          }
+        }
+        if (Array.isArray(data.list)) setWatchlist(data.list);
         if (fetchAll) {
           const failedItems = Object.entries(data.results || {})
             .filter(([, item]) => !(item as { success?: boolean }).success)
@@ -1416,7 +1478,8 @@ export default function App() {
       logAction("❌ 历史K线拉取失败，请检查互联网连接");
     } finally {
       setLoading(false);
-      loadAllData(true);
+      setHistoryJobProgress(null);
+      await Promise.all([loadPortfolio(), loadWatchlist()]);
     }
   };
 
@@ -1451,8 +1514,8 @@ export default function App() {
   // 打开卖出交易模态框
   const openSellModal = (pos: Position) => {
     const availableQuantity = Math.max(0, Math.floor(Number(pos.availableQuantity) || 0));
-    if (availableQuantity <= 0) {
-      logAction(`${pos.name} 今日无可卖数量，T+1锁仓；已阻止卖出记录入口`);
+    if (!pos.canExecuteSellNow || availableQuantity <= 0) {
+      logAction(`${pos.name} ${pos.sellBlockedReason || "当前无可卖数量"}；已阻止卖出记录入口`);
       return;
     }
     const matched = watchlist.find(s => s.code === pos.code);
@@ -3489,6 +3552,11 @@ export default function App() {
                         <CardText className="mt-1 text-[11px] font-semibold text-slate-300">
                           更新现价、成交额、MA5偏离并重算分组；名单不变
                         </CardText>
+                        <CardText className={`mt-1 text-[11px] font-semibold ${quoteFreshness.isStale ? "text-amber-300" : "text-slate-400"}`}>
+                          {lastQuoteRefreshAt
+                            ? `最后成功刷新 ${lastQuoteRefreshAt.toLocaleTimeString("zh-CN", { hour12: false })} · ${quoteFreshness.source || "行情源待确认"} · ${(quoteFreshness.durationMs / 1000).toFixed(1)}秒${quoteFreshness.isStale ? " · 当前使用缓存" : " · 实时"}`
+                            : "尚未执行本次会话行情刷新"}
+                        </CardText>
                       </div>
                       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] lg:w-[520px]">
                       <button
@@ -3608,9 +3676,10 @@ export default function App() {
                     </button>
                     <button
                       onClick={() => handleFetchHistory(undefined, true)}
+                      disabled={Boolean(historyJobProgress)}
                       className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded text-xs font-black shadow-sm transition"
                     >
-                      补充所有K线
+                      {historyJobProgress ? `补齐中 ${historyJobProgress.completed}/${historyJobProgress.total}` : "补充所有K线"}
                     </button>
                     <button
                       onClick={() => setShowImportPanel(!showImportPanel)}
@@ -5179,6 +5248,8 @@ export default function App() {
                   <div className="border-t border-slate-800 pt-4">
                     <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">文件与数据同步校验</h4>
                     <div className="bg-slate-950 p-4 rounded border border-slate-850 font-mono text-xs space-y-2 text-slate-400">
+                      <div><span className="text-slate-500">后端版本：</span>{backendHealth.gitCommit || "未连接"}</div>
+                      <div><span className="text-slate-500">服务时间：</span>{backendHealth.serverTime || "未连接"} ({backendHealth.timezone})</div>
                       <div><span className="text-slate-500">Watchlist文件：</span>data/watchlist.csv</div>
                       <div><span className="text-slate-500">交易流水文件：</span>data/trades/trade_log.csv</div>
                       <div><span className="text-slate-500">历史均线缓存：</span>data/history/*.csv (个股历史K线)</div>

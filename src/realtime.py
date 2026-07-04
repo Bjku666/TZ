@@ -7,6 +7,9 @@ import time as time_module
 import urllib.parse
 import urllib.request
 from datetime import datetime, time
+from threading import Lock
+from time import monotonic, perf_counter
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -172,7 +175,13 @@ def fetch_realtime_quotes_auto(wanted: set[str], timeout: int = 8) -> pd.DataFra
     ]:
         if not remaining:
             break
+        if _source_in_cooldown(source_name):
+            messages.append(f"{source_name}: 熔断冷却中")
+            continue
+        source_started_at = perf_counter()
         frame = fetcher(remaining)
+        latency_ms = round((perf_counter() - source_started_at) * 1000)
+        _record_source_result(source_name, not frame.empty, latency_ms)
         message = frame.attrs.get("message", "")
         if frame.empty:
             if message:
@@ -782,3 +791,41 @@ def merge_quotes_into_holdings(holdings: pd.DataFrame, quotes: pd.DataFrame) -> 
         if pd.notna(quote.get("最新价")):
             out.loc[index, "当前价"] = quote["最新价"]
     return out
+SOURCE_HEALTH_LOCK = Lock()
+SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
+
+
+def realtime_source_health() -> dict[str, dict[str, Any]]:
+    now = monotonic()
+    with SOURCE_HEALTH_LOCK:
+        return {
+            source: {
+                "status": "cooldown" if float(state.get("cooldown_until", 0)) > now else state.get("status", "unknown"),
+                "failureCount": int(state.get("failure_count", 0)),
+                "lastLatencyMs": int(state.get("last_latency_ms", 0)),
+                "averageLatencyMs": int(state.get("average_latency_ms", 0)),
+                "retryAfterSeconds": max(0, round(float(state.get("cooldown_until", 0)) - now)),
+            }
+            for source, state in SOURCE_HEALTH.items()
+        }
+
+
+def _source_in_cooldown(source: str) -> bool:
+    with SOURCE_HEALTH_LOCK:
+        return float(SOURCE_HEALTH.get(source, {}).get("cooldown_until", 0)) > monotonic()
+
+
+def _record_source_result(source: str, success: bool, latency_ms: int) -> None:
+    with SOURCE_HEALTH_LOCK:
+        state = SOURCE_HEALTH.setdefault(source, {})
+        failures = 0 if success else int(state.get("failure_count", 0)) + 1
+        previous_average = int(state.get("average_latency_ms", 0))
+        state.update(
+            {
+                "status": "healthy" if success else "degraded",
+                "failure_count": failures,
+                "last_latency_ms": latency_ms,
+                "average_latency_ms": latency_ms if previous_average <= 0 else round((previous_average + latency_ms) / 2),
+                "cooldown_until": monotonic() + 60 if failures >= 3 else 0,
+            }
+        )

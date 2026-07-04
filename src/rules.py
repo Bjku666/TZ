@@ -332,12 +332,12 @@ def holding_advice(
     t1_locked = available_qty <= 0 or (hold_days is not None and hold_days <= 0)
     if t1_locked:
         if deviation is None:
-            return "今日建仓T+1不可卖，先补当前价和MA5"
+            return "当前无可卖数量，先补当前价和MA5并核对结算状态"
         if deviation < 0 or days >= 3:
-            return "今日建仓T+1不可卖，记录跌破MA5，明日优先处理"
+            return "当前无可卖数量，记录跌破MA5，下一交易日优先处理"
         if deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT:
-            return "今日建仓T+1不可卖，远离MA5先记录止盈计划"
-        return "今日建仓T+1不可卖，明日10:00看强弱"
+            return "当前无可卖数量，远离MA5先记录下一交易日止盈计划"
+        return "当前无可卖数量，下一交易日开盘后看强弱"
     if days >= 3:
         return "连续3天未站回MA5，清仓"
     if deviation is None:

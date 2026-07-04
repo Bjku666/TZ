@@ -18,6 +18,7 @@ export type StockStage =
   | "淘汰";
 
 export type RiskLevel = "normal" | "warning" | "danger";
+export type MarketPhase = "pre_market" | "trading" | "lunch_break" | "after_close" | "weekend" | "holiday";
 
 export type HistoryStatus = "已有缓存" | "缺少历史K线" | "自动获取失败" | "数据不足" | "缓存过旧";
 
@@ -86,6 +87,19 @@ export interface Position {
   name: string;
   quantity: number;
   availableQuantity: number; // 可卖数量 (支持T+1等规则)
+  settledQuantity: number;
+  todayBuyQuantity: number;
+  t1LockedQuantity: number;
+  isTodayBuy: boolean;
+  isT1Locked: boolean;
+  operationDate: string;
+  valuationDate: string;
+  nextSellableTradeDate: string;
+  nextActionTime: string;
+  marketPhase: MarketPhase;
+  canExecuteSellNow: boolean;
+  sellBlockedReason: string;
+  calendarDegraded: boolean;
   avgCost: number;           // 平均成本 (元)
   currentPrice: number;      // 现价
   marketValue: number;       // 市值

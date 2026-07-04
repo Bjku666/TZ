@@ -185,9 +185,11 @@ class FeePortfolioTests(TestCase):
             ),
             patch.object(portfolio_service, "initial_cash", return_value=10000),
         ):
-            snapshot = portfolio_service.portfolio_snapshot("simulation")
+            snapshot = portfolio_service.portfolio_snapshot("simulation", as_of_date="2026-07-03")
 
         self.assertEqual(snapshot["asOfDate"], "2026-07-03")
+        self.assertEqual(snapshot["operationDate"], "2026-07-03")
+        self.assertEqual(snapshot["valuationDate"], "2026-07-03")
         self.assertEqual(snapshot["accountState"]["asOfDate"], "2026-07-03")
         self.assertEqual(snapshot["accountState"]["availableCash"], 2724.00)
         self.assertEqual(snapshot["accountState"]["holdingValue"], 7218.72)
@@ -247,7 +249,7 @@ class FeePortfolioTests(TestCase):
             patch.object(portfolio_service, "initial_cash", return_value=10000),
             patch.object(portfolio_service, "get_settings", return_value=reconciliation_settings),
         ):
-            snapshot = portfolio_service.portfolio_snapshot("simulation")
+            snapshot = portfolio_service.portfolio_snapshot("simulation", as_of_date="2026-07-03")
 
         account = snapshot["accountState"]
         self.assertEqual(snapshot["asOfDate"], "2026-07-03")

@@ -67,6 +67,19 @@ def fetch_history(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     )
 
 
+@router.post("/history-jobs")
+def start_history_job() -> dict[str, Any]:
+    return watchlist_service.start_history_job()
+
+
+@router.get("/history-jobs/{job_id}")
+def get_history_job(job_id: str) -> dict[str, Any]:
+    try:
+        return watchlist_service.get_history_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/update-stock")
 def update_stock(payload: dict[str, Any]) -> dict[str, Any]:
     try:

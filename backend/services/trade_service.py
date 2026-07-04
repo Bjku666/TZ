@@ -152,7 +152,7 @@ def _audit_sell(position: dict[str, Any] | None, quantity: float, reason: str, a
     if quantity > owned:
         tags.append("卖出数量超过持仓")
     if quantity > available:
-        tags.append("T+1可卖数量不足")
+        tags.append(str(position.get("sellBlockedReason") or "可卖数量不足"))
 
     hit_ma5_risk = ma5 > 0 and deviation < 0
     hit_clear = below_days >= 3
@@ -230,7 +230,10 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
         if owned < quantity:
             raise ValueError(f"持仓不足，当前仅持有 {owned:.0f} 股")
         if available < quantity:
-            raise ValueError(f"T+1可卖数量不足，当前可卖 {available:.0f} 股")
+            reason = str((position or {}).get("sellBlockedReason") or f"可卖数量不足，当前可卖 {available:.0f} 股")
+            raise ValueError(reason)
+        if not bool((position or {}).get("canExecuteSellNow")):
+            raise ValueError(str((position or {}).get("sellBlockedReason") or "当前不可执行卖出"))
 
     now = china_now()
     trade_date = str(payload.get("date") or now.date().isoformat())

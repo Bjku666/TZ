@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import subprocess
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -10,6 +15,19 @@ from src.data import ensure_data_dir
 APP_NAME = "强势回踩短线交易纪律系统 API"
 APP_VERSION = "0.1.4"
 API_CONTRACT_VERSION = "trade-link-v8"
+BUILD_TIME = os.environ.get("TZ_BUILD_TIME") or datetime.now(timezone.utc).isoformat()
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+            timeout=1,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def create_app() -> FastAPI:
@@ -37,6 +55,10 @@ def create_app() -> FastAPI:
             "status": "ok",
             "version": APP_VERSION,
             "contract": API_CONTRACT_VERSION,
+            "gitCommit": _git_commit(),
+            "buildTime": BUILD_TIME,
+            "serverTime": datetime.now().astimezone().isoformat(),
+            "timezone": "Asia/Shanghai",
         }
 
     return app

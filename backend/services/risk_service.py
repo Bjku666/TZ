@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from threading import Lock, Thread
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ MARKET_INDEX_CODES = {
     "399001": "深证成指",
     "399006": "创业板指",
 }
+MARKET_CONTEXT_REFRESH_LOCK = Lock()
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -239,6 +241,32 @@ def refresh_external_market_context() -> dict[str, Any]:
         "success": True,
         "message": "真实市场/行业上下文已更新" + (f"；部分失败: {'；'.join(errors)}" if errors else ""),
         "context": context,
+    }
+
+
+def refresh_market_context_if_stale(ttl_seconds: int = 300) -> dict[str, Any]:
+    cached = load_external_market_context()
+    updated_at = str(cached.get("updatedAt") or "")
+    parsed = datetime.fromisoformat(updated_at) if updated_at else None
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    stale = parsed is None or now - parsed > timedelta(seconds=ttl_seconds)
+    if not stale:
+        return {"success": True, "stale": False, "context": cached, "message": "使用市场上下文缓存"}
+    if MARKET_CONTEXT_REFRESH_LOCK.acquire(blocking=False):
+        def worker() -> None:
+            try:
+                refresh_external_market_context()
+            finally:
+                MARKET_CONTEXT_REFRESH_LOCK.release()
+
+        Thread(target=worker, daemon=True).start()
+    return {
+        "success": bool(cached),
+        "stale": True,
+        "context": cached,
+        "message": "先返回最近市场上下文，后台刷新中",
     }
 
 
