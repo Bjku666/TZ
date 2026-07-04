@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.data import clean_code
-from src.rules import screening_result
+from src.trading_rules_config import TURNOVER_TOP_N
+from src.video_original_rules import filter_raw_top20
 
 QUOTE_COLUMNS = [
     "代码",
@@ -329,17 +330,25 @@ def _pool_candidates_from_quotes(quotes: pd.DataFrame, limit: int) -> pd.DataFra
     pool["名称"] = pool["名称"].fillna("").astype(str).str.strip()
     for column in ["最新价", "涨跌幅%", "成交额"]:
         pool[column] = pd.to_numeric(pool[column], errors="coerce")
-
-    passed = pool.apply(
-        lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
-        axis=1,
-    )
-    return (
-        pool[passed]
-        .dropna(subset=["成交额"])
-        .sort_values("成交额", ascending=False)
-        .head(limit)
-    )
+    pool = pool.dropna(subset=["成交额"]).sort_values("成交额", ascending=False, kind="stable").reset_index(drop=True)
+    rows = []
+    for index, row in pool.iterrows():
+        item = row.to_dict()
+        item["raw_rank"] = index + 1
+        item["rank"] = index + 1
+        item["code"] = item.get("代码")
+        item["name"] = item.get("名称")
+        item["price"] = item.get("最新价")
+        rows.append(item)
+    filtered = [item for item in filter_raw_top20(rows, raw_top_n=limit) if item["market_allowed"]]
+    if not filtered:
+        return pd.DataFrame(columns=pool.columns.tolist() + ["raw_rank"])
+    result = pd.DataFrame(filtered)
+    for column in pool.columns:
+        if column not in result:
+            result[column] = pd.NA
+    result["raw_rank"] = pd.to_numeric(result["raw_rank"], errors="coerce")
+    return result
 
 
 def _build_pool_result(pool: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFrame:
@@ -350,7 +359,7 @@ def _build_pool_result(pool: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFrame
         "现价": pool["最新价"],
         "涨跌幅%": pool["涨跌幅%"],
         "成交额": pool["成交额"],
-        "成交额排名": range(1, len(pool) + 1),
+        "成交额排名": pd.to_numeric(pool.get("raw_rank"), errors="coerce").fillna(pd.Series(range(1, len(pool) + 1), index=pool.index)).astype(int),
         "上市板块": "主板",
     })
     return _with_status(
@@ -358,6 +367,51 @@ def _build_pool_result(pool: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFrame
         quotes.attrs.get("source", "自动切换"),
         quotes.attrs.get("message", "自动股票池已生成"),
     )
+
+
+def raw_turnover_top_from_quotes(quotes: pd.DataFrame, limit: int = TURNOVER_TOP_N) -> pd.DataFrame:
+    if quotes.empty:
+        return pd.DataFrame()
+    frame = quotes.copy()
+    frame["代码"] = frame["代码"].map(clean_code)
+    frame["名称"] = frame["名称"].fillna("").astype(str).str.strip()
+    for column in ["最新价", "涨跌幅%", "成交额"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = (
+        frame.dropna(subset=["代码", "成交额"])
+        .sort_values("成交额", ascending=False, kind="stable")
+        .drop_duplicates("代码", keep="first")
+        .head(max(int(limit or TURNOVER_TOP_N), 1))
+        .reset_index(drop=True)
+    )
+    if frame.empty:
+        return frame
+    frame["raw_rank"] = range(1, len(frame) + 1)
+    frame.attrs.update(quotes.attrs)
+    return frame
+
+
+def fetch_raw_turnover_top(limit: int = TURNOVER_TOP_N, source: str = "自动切换") -> pd.DataFrame:
+    safe_limit = max(int(limit or TURNOVER_TOP_N), 1)
+    if source in {"手动上传/不刷新", "新浪行情"}:
+        return _with_status(pd.DataFrame(), source, "当前行情源不能生成全市场原始成交额榜")
+    errors: list[str] = []
+    if source in {"自动切换", "东方财富"}:
+        rank_quotes = fetch_turnover_rank_quotes_eastmoney(limit=safe_limit)
+        if not rank_quotes.empty:
+            return _with_status(raw_turnover_top_from_quotes(rank_quotes, safe_limit), rank_quotes.attrs.get("source", "东方财富"), rank_quotes.attrs.get("message", ""))
+        errors.append("东方财富成交额榜: " + rank_quotes.attrs.get("message", "失败"))
+    if source in {"自动切换", "efinance"}:
+        quotes = fetch_full_market_quotes_efinance()
+        if not quotes.empty:
+            return _with_status(raw_turnover_top_from_quotes(quotes, safe_limit), quotes.attrs.get("source", "efinance"), quotes.attrs.get("message", ""))
+        errors.append("efinance: " + quotes.attrs.get("message", "失败"))
+    if source in {"自动切换", "AKShare"}:
+        quotes = fetch_full_market_quotes_akshare()
+        if not quotes.empty:
+            return _with_status(raw_turnover_top_from_quotes(quotes, safe_limit), quotes.attrs.get("source", "AKShare"), quotes.attrs.get("message", ""))
+        errors.append("AKShare: " + quotes.attrs.get("message", "失败"))
+    return _with_status(pd.DataFrame(), source, "；".join(errors) or "行情源未返回原始成交额榜")
 
 
 def _build_pool_from_source_frames(
@@ -387,14 +441,14 @@ def _build_pool_from_source_frames(
 
 
 def fetch_turnover_rank_quotes_eastmoney(
-    limit: int = 30,
+    limit: int = TURNOVER_TOP_N,
     timeout: int = 8,
     page_size: int = 100,
     max_pages: int = 12,
 ) -> pd.DataFrame:
     errors: list[str] = []
-    safe_limit = max(int(limit or 30), 30)
-    safe_page_size = min(max(int(page_size or 100), 30), 100)
+    safe_limit = max(int(limit or TURNOVER_TOP_N), 1)
+    safe_page_size = min(max(int(page_size or 100), safe_limit), 100)
     safe_max_pages = max(int(max_pages or 1), 1)
     best_frame = pd.DataFrame()
     best_candidate_count = 0
@@ -428,13 +482,14 @@ def fetch_turnover_rank_quotes_eastmoney(
                 total = int(parsed_total) if pd.notna(parsed_total) else 0
 
             frame = _standardize_eastmoney_rows(host_rows)
+            raw_count = len(frame.dropna(subset=["成交额"])) if "成交额" in frame else len(frame)
             candidate_count = len(_pool_candidates_from_quotes(frame, safe_limit))
-            if candidate_count > best_candidate_count:
+            if raw_count > best_candidate_count:
                 best_frame = frame
-                best_candidate_count = candidate_count
-                best_message = f"{host} 成交额榜分页扫描 {len(host_rows)} 条，主板候选 {candidate_count} 只"
-            if candidate_count >= safe_limit:
-                return _with_status(frame, "东方财富", f"{host} 成交额榜分页扫描 {len(host_rows)} 条，已获取主板前{safe_limit}")
+                best_candidate_count = raw_count
+                best_message = f"{host} 成交额榜分页扫描 {len(host_rows)} 条，原始成交额样本 {raw_count} 条，过滤后 {candidate_count} 只"
+            if raw_count >= safe_limit:
+                return _with_status(frame.head(safe_limit), "东方财富", f"{host} 成交额榜分页扫描 {len(host_rows)} 条，已获取全市场原始前{safe_limit}")
             if len(rows) < safe_page_size or (total and page * safe_page_size >= total):
                 break
 
@@ -661,9 +716,9 @@ def fetch_full_market_quotes_efinance() -> pd.DataFrame:
     )
 
 
-def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.DataFrame:
-    """Generate a main-board stock pool ranked by turnover amount."""
-    safe_limit = max(int(limit or 30), 1)
+def fetch_auto_stock_pool(limit: int = TURNOVER_TOP_N, source: str = "自动切换") -> pd.DataFrame:
+    """Generate the video-original pool: raw turnover top N, then filter."""
+    safe_limit = max(int(limit or TURNOVER_TOP_N), 1)
 
     if source == "手动上传/不刷新":
         return _with_status(pd.DataFrame(), source, "当前设置为手动上传/不刷新")
@@ -677,8 +732,7 @@ def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.D
         rank_quotes = fetch_turnover_rank_quotes_eastmoney(limit=safe_limit)
         if not rank_quotes.empty:
             pool = _pool_candidates_from_quotes(rank_quotes, safe_limit)
-            if len(pool) >= safe_limit:
-                return _build_pool_result(pool, rank_quotes)
+            return _build_pool_result(pool, rank_quotes)
             source_frames.append(rank_quotes)
         else:
             errors.append("东方财富成交额榜: " + rank_quotes.attrs.get("message", "失败"))
@@ -687,8 +741,7 @@ def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.D
         efinance_quotes = fetch_full_market_quotes_efinance()
         if not efinance_quotes.empty:
             pool = _pool_candidates_from_quotes(efinance_quotes, safe_limit)
-            if len(pool) >= safe_limit:
-                return _build_pool_result(pool, efinance_quotes)
+            return _build_pool_result(pool, efinance_quotes)
             source_frames.append(efinance_quotes)
         else:
             errors.append("efinance: " + efinance_quotes.attrs.get("message", "失败"))
@@ -697,8 +750,7 @@ def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.D
         akshare_quotes = fetch_full_market_quotes_akshare()
         if not akshare_quotes.empty:
             pool = _pool_candidates_from_quotes(akshare_quotes, safe_limit)
-            if len(pool) >= safe_limit:
-                return _build_pool_result(pool, akshare_quotes)
+            return _build_pool_result(pool, akshare_quotes)
             source_frames.append(akshare_quotes)
         else:
             errors.append("AKShare: " + akshare_quotes.attrs.get("message", "失败"))
@@ -711,8 +763,7 @@ def fetch_auto_stock_pool(limit: int = 30, source: str = "自动切换") -> pd.D
         eastmoney_full_quotes = fetch_full_market_quotes_eastmoney()
         if not eastmoney_full_quotes.empty:
             pool = _pool_candidates_from_quotes(eastmoney_full_quotes, safe_limit)
-            if len(pool) >= safe_limit:
-                return _build_pool_result(pool, eastmoney_full_quotes)
+            return _build_pool_result(pool, eastmoney_full_quotes)
             source_frames.append(eastmoney_full_quotes)
         else:
             errors.append("东方财富全市场: " + eastmoney_full_quotes.attrs.get("message", "失败"))

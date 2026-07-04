@@ -1,88 +1,47 @@
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime
 from typing import Any
 
-LOT_SIZE = 100
+from src.video_original_rules import (
+    LOT_SIZE,
+    QUOTE_FRESHNESS_SECONDS,
+    STRATEGY_NAME,
+    STRATEGY_VERSION,
+    TURNOVER_TOP_N,
+    buy_window_label,
+    is_buy_window,
+    rules_config as video_rules_config,
+)
 
 SIMULATION_CAPITAL = 10000
 REAL_CAPITAL = 5000
 
-TURNOVER_TOP_N = 30
-
-BIG_CANDLE_LOOKBACK_DAYS = 20
-BIG_CANDLE_THRESHOLD_PCT = 5.0
-
-BUY_ZONE_MIN_DEVIATION_PCT = 0.0
-BUY_ZONE_MAX_DEVIATION_PCT = 2.5
-OBSERVE_ZONE_MAX_DEVIATION_PCT = 5.0
-HIGH_ZONE_MAX_DEVIATION_PCT = 7.0
-
-MAX_SINGLE_TRADE_RISK_PCT = 0.02
-STEADY_SINGLE_TRADE_RISK_PCT = 0.01
-
-MA5_EFFECTIVE_BREAK_PCT = 0.0
-STOP_PRICE_MA5_BUFFER_PCT = 0.01
-
-TAKE_PROFIT_WATCH_DEVIATION_PCT = 5.0
-TAKE_PROFIT_PRIORITY_DEVIATION_PCT = 7.0
-
-BUY_WINDOWS = [
-    (time(9, 35), time(10, 0)),
-    (time(14, 30), time(14, 55)),
-]
-
-RISK_CHECK_TIME = time(14, 50)
-
-
-def _time_label(value: time) -> str:
-    return value.strftime("%H:%M")
-
 
 def trading_rules_config() -> dict[str, Any]:
-    """Return the canonical trading-rule configuration for API/UI consumers."""
+    """Return the read-only strategy contract plus execution defaults."""
+    config = video_rules_config()
     return {
-        "lotSize": LOT_SIZE,
+        **config,
         "simulationCapital": SIMULATION_CAPITAL,
         "realCapital": REAL_CAPITAL,
-        "turnoverTopN": TURNOVER_TOP_N,
-        "bigCandleLookbackDays": BIG_CANDLE_LOOKBACK_DAYS,
-        "bigCandleThresholdPct": BIG_CANDLE_THRESHOLD_PCT,
-        "buyZone": {
-            "minDeviationPct": BUY_ZONE_MIN_DEVIATION_PCT,
-            "maxDeviationPct": BUY_ZONE_MAX_DEVIATION_PCT,
+        "manualConfirmationRequired": True,
+        "executionConstraints": {
+            "lotSize": LOT_SIZE,
+            "tPlusOne": True,
+            "cashRequired": True,
+            "brokerConnection": False,
+            "autoOrder": False,
         },
-        "observeZone": {
-            "maxDeviationPct": OBSERVE_ZONE_MAX_DEVIATION_PCT,
-        },
-        "highZone": {
-            "maxDeviationPct": HIGH_ZONE_MAX_DEVIATION_PCT,
-        },
-        "singleTradeRisk": {
-            "maxPct": MAX_SINGLE_TRADE_RISK_PCT,
-            "steadyPct": STEADY_SINGLE_TRADE_RISK_PCT,
-        },
-        "ma5Risk": {
-            "effectiveBreakPct": MA5_EFFECTIVE_BREAK_PCT,
-            "stopPriceBufferPct": STOP_PRICE_MA5_BUFFER_PCT,
-        },
-        "takeProfit": {
-            "watchDeviationPct": TAKE_PROFIT_WATCH_DEVIATION_PCT,
-            "priorityDeviationPct": TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
-        },
-        "buyWindows": [
-            {"start": _time_label(start), "end": _time_label(end)}
-            for start, end in BUY_WINDOWS
-        ],
-        "riskCheckTime": _time_label(RISK_CHECK_TIME),
     }
 
 
 def is_allowed_buy_window(value: datetime | None) -> bool:
-    if value is None or value.weekday() >= 5:
-        return False
-    current = value.time()
-    return any(start <= current <= end for start, end in BUY_WINDOWS)
+    return is_buy_window(value)
+
+
+def active_buy_window_label(value: datetime | None) -> str:
+    return buy_window_label(value)
 
 
 def lot_cost(price: Any, lot_size: int = LOT_SIZE) -> float | None:
@@ -95,43 +54,45 @@ def lot_cost(price: Any, lot_size: int = LOT_SIZE) -> float | None:
     return numeric * lot_size
 
 
-def stop_price_from_ma5(ma5: Any) -> float | None:
-    try:
-        numeric = float(ma5)
-    except (TypeError, ValueError):
-        return None
-    if numeric <= 0:
-        return None
-    return numeric * (1 - STOP_PRICE_MA5_BUFFER_PCT)
-
-
-def estimate_single_trade_risk(
+def estimate_execution_loss_reference(
     buy_price: Any,
     quantity: Any,
-    ma5: Any,
+    reference_price: Any,
     sell_fee: Any = 0,
 ) -> dict[str, float | None]:
-    stop_price = stop_price_from_ma5(ma5)
+    """Display-only loss estimate.
+
+    Video original rules do not define a fixed stop-loss. This helper exists
+    only for account risk visibility and must not be used to qualify signals.
+    """
     try:
         price_f = float(buy_price)
         qty_f = float(quantity)
+        ref_f = float(reference_price)
         fee_f = float(sell_fee or 0)
     except (TypeError, ValueError):
-        return {
-            "stop_price": stop_price,
-            "risk_per_share": None,
-            "risk_amount": None,
-        }
-    if stop_price is None or price_f <= 0 or qty_f <= 0:
-        return {
-            "stop_price": stop_price,
-            "risk_per_share": None,
-            "risk_amount": None,
-        }
-    risk_per_share = max(0.0, price_f - stop_price)
-    risk_amount = risk_per_share * qty_f + max(0.0, fee_f)
+        return {"reference_price": None, "risk_per_share": None, "risk_amount": None}
+    if price_f <= 0 or qty_f <= 0 or ref_f <= 0:
+        return {"reference_price": None, "risk_per_share": None, "risk_amount": None}
+    risk_per_share = max(0.0, price_f - ref_f)
     return {
-        "stop_price": round(stop_price, 4),
+        "reference_price": round(ref_f, 4),
         "risk_per_share": round(risk_per_share, 4),
-        "risk_amount": round(risk_amount, 2),
+        "risk_amount": round(risk_per_share * qty_f + max(0.0, fee_f), 2),
     }
+
+
+__all__ = [
+    "LOT_SIZE",
+    "QUOTE_FRESHNESS_SECONDS",
+    "REAL_CAPITAL",
+    "SIMULATION_CAPITAL",
+    "STRATEGY_NAME",
+    "STRATEGY_VERSION",
+    "TURNOVER_TOP_N",
+    "active_buy_window_label",
+    "estimate_execution_loss_reference",
+    "is_allowed_buy_window",
+    "lot_cost",
+    "trading_rules_config",
+]

@@ -4,6 +4,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Thread
+from datetime import date, datetime, time
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
@@ -20,18 +21,30 @@ from src.data import (
     save_watchlist,
     standardize_import_file,
 )
-from src.history import compute_all_reminders, diagnose_history, fetch_and_cache
+from src.history import compute_all_reminders, diagnose_history, fetch_and_cache, load_cached_history
 from src.portfolio import account_state_from_trades, build_positions_from_trades
 from src.realtime import (
     china_now,
     fetch_auto_stock_pool,
+    fetch_raw_turnover_top,
     fetch_realtime_quotes,
     is_a_share_trading_time,
     merge_quotes_into_watchlist,
     realtime_source_health,
 )
+from src.rule_models import CandidateState
 from src.rules import clean_code, evaluate_stock, normalize_stage, stage_to_group
 from src.storage import load_quote_snapshot, save_quote_snapshot
+from src.trading_calendar import is_trading_day, next_trading_day, previous_trading_day
+from src.trading_rules_config import QUOTE_FRESHNESS_SECONDS, TURNOVER_TOP_N
+from src.video_original_rules import (
+    calculate_ma5_close,
+    calculate_ma5_live,
+    evaluate_candidate_state,
+    filter_raw_top20,
+    is_official_selection_qualified,
+    official_generation_allowed,
+)
 
 from backend.services.risk_service import annotate_watchlist_risk, refresh_market_context_if_stale
 from backend.services.portfolio_service import portfolio_snapshot
@@ -42,6 +55,7 @@ from backend.storage.csv_adapter import (
     watchlist_to_api,
 )
 from backend.storage import trade_repository
+from backend.storage import sqlite_store
 
 PINNED_GROUPS = {"观察", "待买", "持仓"}
 TRUE_VALUES = {"true", "1", "是", "yes", "y"}
@@ -52,6 +66,195 @@ TURNOVER_SCAN_LOCK = Lock()
 HISTORY_JOB_LOCK = Lock()
 HISTORY_JOBS_STATE_LOCK = Lock()
 HISTORY_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _iso_now() -> str:
+    return china_now().replace(microsecond=0).isoformat()
+
+
+def _official_selection_date(now: datetime | None = None) -> date:
+    current = now or china_now()
+    if is_trading_day(current.date()) and current.time() >= time(15, 5):
+        return current.date()
+    return previous_trading_day(current.date())
+
+
+def _history_values_for_selection(code: str, selection_date: date) -> dict[str, Any]:
+    history = load_cached_history(code)
+    empty = {
+        "close": None,
+        "ma5": None,
+        "ma10": None,
+        "ma20": None,
+        "history_last_trade_date": "",
+        "risk": "缺少历史K线，不能确认入选日MA5",
+        "previous_four_closes": [],
+    }
+    if history is None or history.empty or "收盘" not in history:
+        return empty
+    frame = history.copy()
+    frame["日期"] = pd.to_datetime(frame.get("日期"), errors="coerce")
+    frame = frame.dropna(subset=["日期"]).sort_values("日期")
+    frame = frame[frame["日期"].dt.date <= selection_date].copy()
+    if frame.empty:
+        return empty
+    close = pd.to_numeric(frame["收盘"], errors="coerce").dropna()
+    if len(close) < 5:
+        return {**empty, "risk": "历史K线不足5个完成交易日"}
+    latest = frame.loc[close.index[-1]]
+    ma5 = calculate_ma5_close(close.tolist())
+    ma10 = float(close.tail(10).mean()) if len(close) >= 10 else None
+    ma20 = float(close.tail(20).mean()) if len(close) >= 20 else None
+    previous_four = close.iloc[-4:].tolist()
+    return {
+        "close": float(latest.get("收盘")),
+        "ma5": ma5,
+        "ma10": round(ma10, 6) if ma10 is not None else None,
+        "ma20": round(ma20, 6) if ma20 is not None else None,
+        "history_last_trade_date": latest["日期"].date().isoformat(),
+        "risk": "" if latest["日期"].date() == selection_date else "历史K线日期与入选日不一致，信号需人工复核",
+        "previous_four_closes": previous_four,
+    }
+
+
+def _previous_four_closes_for_live(code: str, today: date) -> tuple[list[float], str]:
+    history = load_cached_history(code)
+    if history is None or history.empty or "收盘" not in history:
+        return [], ""
+    frame = history.copy()
+    frame["日期"] = pd.to_datetime(frame.get("日期"), errors="coerce")
+    frame = frame.dropna(subset=["日期"]).sort_values("日期")
+    frame = frame[frame["日期"].dt.date < today].copy()
+    close = pd.to_numeric(frame.get("收盘"), errors="coerce").dropna()
+    if len(close) < 4:
+        return [], ""
+    last_date = frame.loc[close.index[-1], "日期"].date().isoformat()
+    return [float(value) for value in close.tail(4).tolist()], last_date
+
+
+def _candidate_waiting_days(selection_date: Any, as_of: date | None = None) -> int:
+    start = pd.to_datetime(selection_date, errors="coerce")
+    if pd.isna(start):
+        return 0
+    current = as_of or china_now().date()
+    days = 0
+    day = next_trading_day(start.date())
+    while day <= current:
+        if is_trading_day(day):
+            days += 1
+        day = next_trading_day(day)
+    return days
+
+
+def _selection_item_api(item: dict[str, Any], batch: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "batchId": item.get("batch_id"),
+        "code": item.get("code"),
+        "name": item.get("name"),
+        "rawRank": item.get("raw_rank"),
+        "turnover": item.get("turnover"),
+        "closePrice": item.get("close_price"),
+        "ma5Close": item.get("ma5_close"),
+        "marketAllowed": bool(item.get("market_allowed")),
+        "exclusionReason": item.get("exclusion_reason") or "",
+        "aboveMa5": bool(item.get("above_ma5")),
+        "candidateCreated": bool(item.get("candidate_created")),
+        "selectionDate": (batch or {}).get("selection_date"),
+        "source": (batch or {}).get("source"),
+        "dataAsOf": (batch or {}).get("data_as_of"),
+    }
+
+
+def _candidate_api(candidate: dict[str, Any]) -> dict[str, Any]:
+    waiting_days = _candidate_waiting_days(candidate.get("selection_date"))
+    return {
+        "id": candidate.get("id"),
+        "code": candidate.get("code"),
+        "name": candidate.get("name"),
+        "sourceBatchId": candidate.get("source_batch_id"),
+        "selectionDate": candidate.get("selection_date"),
+        "eligibleFrom": candidate.get("eligible_from"),
+        "state": candidate.get("state"),
+        "waitingTradeDays": waiting_days,
+        "lastClose": candidate.get("last_close"),
+        "lastMa5Close": candidate.get("last_ma5_close"),
+        "lastLivePrice": candidate.get("last_live_price"),
+        "lastMa5Live": candidate.get("last_ma5_live"),
+        "lastDeviation": candidate.get("last_deviation"),
+        "touchStartedAt": candidate.get("touch_started_at"),
+        "touchDetectedAt": candidate.get("touch_detected_at"),
+        "boughtTradeId": candidate.get("bought_trade_id"),
+        "invalidatedReason": candidate.get("invalidated_reason"),
+        "createdAt": candidate.get("created_at"),
+        "updatedAt": candidate.get("updated_at"),
+    }
+
+
+def _watchlist_frame_from_selection(items: list[dict[str, Any]], batch: dict[str, Any]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        rows.append(
+            {
+                "代码": item.get("code"),
+                "名称": item.get("name"),
+                "现价": item.get("close_price"),
+                "涨跌幅%": pd.NA,
+                "成交额": item.get("turnover"),
+                "成交额排名": item.get("raw_rank"),
+                "pool_batch_id": item.get("batch_id"),
+                "pool_source": batch.get("source"),
+                "pool_generated_at": batch.get("generated_at"),
+                "pool_rank_at_generation": item.get("raw_rank"),
+                "is_pool_locked": True,
+                "is_pinned": bool(item.get("candidate_created")),
+                "上市板块": "主板" if item.get("market_allowed") else "不适用",
+                "状态": CandidateState.INITIAL_SCREENED.value if item.get("market_allowed") else CandidateState.INITIAL_REJECTED.value,
+                "分组": "初筛",
+                "MA5": item.get("ma5_close"),
+                "MA10": pd.NA,
+                "MA20": pd.NA,
+                "MA5向上": False,
+                "最近大阳线%": pd.NA,
+                "放量跌破MA5": False,
+                "MA5偏离率%": pd.NA,
+                "history_status": "已有缓存" if item.get("ma5_close") else "缺少历史K线",
+                "流程阶段": CandidateState.INITIAL_SCREENED.value if item.get("market_allowed") else CandidateState.INITIAL_REJECTED.value,
+                "筛选原因": "" if item.get("market_allowed") else item.get("exclusion_reason"),
+                "提醒": "入选日收盘站上MA5，转入跨日观察" if item.get("candidate_created") else item.get("exclusion_reason") or "等待历史K线确认",
+                "规则状态": "视频原版",
+                "备注": "由SQLite正式批次派生",
+            }
+        )
+    return ensure_watchlist_frame(pd.DataFrame(rows))
+
+
+def _latest_official_payload() -> dict[str, Any]:
+    batch = sqlite_store.latest_official_batch()
+    if not batch:
+        return {
+            "officialSelection": None,
+            "initialPool": [],
+            "observationPool": [_candidate_api(item) for item in sqlite_store.candidate_cycles(active_only=True)],
+            "buyReadyPool": [],
+        }
+    items = sqlite_store.selection_items_for_batch(str(batch["id"]))
+    candidates = [_candidate_api(item) for item in sqlite_store.candidate_cycles(active_only=True)]
+    buy_ready = [item for item in candidates if item.get("state") == CandidateState.BUY_READY.value]
+    return {
+        "officialSelection": {
+            "batchId": batch.get("id"),
+            "selectionDate": batch.get("selection_date"),
+            "generatedAt": batch.get("generated_at"),
+            "source": batch.get("source"),
+            "isOfficial": bool(batch.get("is_official")),
+            "dataAsOf": batch.get("data_as_of"),
+            "rawTopN": batch.get("raw_top_n"),
+        },
+        "initialPool": [_selection_item_api(item, batch) for item in items],
+        "observationPool": candidates,
+        "buyReadyPool": buy_ready,
+    }
 
 
 def _performance_log(
@@ -150,6 +353,109 @@ def _account_cash_for_watchlist(frame: pd.DataFrame) -> tuple[float, float]:
     return float(state.get("当前现金") or capital), capital
 
 
+def _quote_target_codes(frame: pd.DataFrame) -> list[str]:
+    codes: set[str] = set()
+    if not frame.empty and "代码" in frame:
+        codes.update(clean_code(code) for code in frame["代码"].dropna().astype(str))
+    latest = sqlite_store.latest_official_batch()
+    if latest:
+        for item in sqlite_store.selection_items_for_batch(str(latest["id"])):
+            code = clean_code(item.get("code"))
+            if code:
+                codes.add(code)
+    for candidate in sqlite_store.candidate_cycles(active_only=True):
+        code = clean_code(candidate.get("code"))
+        if code:
+            codes.add(code)
+    codes.update(_held_codes(frame))
+    return sorted(code for code in codes if code)
+
+
+def _update_candidates_from_quotes(quotes: pd.DataFrame, *, used_cache: bool, source: str, account_cash: float) -> None:
+    if quotes.empty or "代码" not in quotes:
+        return
+    now = china_now().replace(microsecond=0)
+    quote_rows = {clean_code(row.get("代码")): row.to_dict() for _, row in quotes.iterrows()}
+    candidates = sqlite_store.candidate_cycles(active_only=True)
+    for candidate in candidates:
+        code = clean_code(candidate.get("code"))
+        quote = quote_rows.get(code)
+        if not quote:
+            continue
+        price = _number(quote.get("最新价"))
+        previous_four, history_last_date = _previous_four_closes_for_live(code, now.date())
+        ma5_live = calculate_ma5_live(previous_four, price)
+        quote_time = str(quote.get("更新时间") or now.isoformat())
+        quote_age = 999999 if used_cache else 0
+        evaluation = evaluate_candidate_state(
+            candidate,
+            {
+                "price": price,
+                "ma5_live": ma5_live,
+                "quote_age_seconds": quote_age,
+                "tradeable": price is not None and price > 0,
+            },
+            now,
+            account_cash=account_cash,
+        )
+        previous_state = str(candidate.get("state") or "")
+        updates = {
+            "state": evaluation.state.value,
+            "waiting_trade_days": _candidate_waiting_days(candidate.get("selection_date"), now.date()),
+            "last_live_price": price,
+            "last_ma5_live": ma5_live,
+            "last_deviation": evaluation.deviation,
+        }
+        if evaluation.state == CandidateState.BUY_READY:
+            touch_time = str(candidate.get("touch_started_at") or now.isoformat())
+            updates["touch_started_at"] = touch_time
+            updates["touch_detected_at"] = now.isoformat()
+        sqlite_store.update_candidate_cycle(str(candidate["id"]), updates)
+        if previous_state != evaluation.state.value:
+            sqlite_store.add_candidate_event(
+                str(candidate["id"]),
+                "STATE_CHANGED",
+                event_time=now.isoformat(),
+                trade_date=now.date().isoformat(),
+                price=price,
+                ma5=ma5_live,
+                deviation=evaluation.deviation,
+                quote_time=quote_time,
+                quote_age_seconds=quote_age,
+                source=source,
+                reason=evaluation.signal_reason,
+                payload={
+                    **evaluation.to_api(),
+                    "historyLastTradeDate": history_last_date,
+                    "quoteTime": quote_time,
+                },
+            )
+        if evaluation.state == CandidateState.BUY_READY or evaluation.signal_qualified:
+            sqlite_store.add_signal_event(
+                {
+                    "candidate_id": candidate["id"],
+                    "code": code,
+                    "event_time": now.isoformat(),
+                    "trade_date": now.date().isoformat(),
+                    "signal_type": "MA5_TOUCH_BUY",
+                    "signal_qualified": int(evaluation.signal_qualified),
+                    "execution_allowed": int(evaluation.execution_allowed),
+                    "execution_block_reasons": evaluation.execution_block_reasons,
+                    "price": price,
+                    "ma5": ma5_live,
+                    "deviation": evaluation.deviation,
+                    "quote_time": quote_time,
+                    "quote_age_seconds": quote_age,
+                    "payload": {
+                        **evaluation.to_api(),
+                        "ma5Type": "live",
+                        "calculationTime": now.isoformat(),
+                        "historyLastTradeDate": history_last_date,
+                    },
+                }
+            )
+
+
 def recompute_watchlist(frame: pd.DataFrame, cash: float | None = None) -> pd.DataFrame:
     if frame.empty:
         return ensure_watchlist_frame(frame)
@@ -181,80 +487,213 @@ def recompute_watchlist(frame: pd.DataFrame, cash: float | None = None) -> pd.Da
 
 def list_watchlist() -> dict[str, Any]:
     frame = recompute_watchlist(load_watchlist())
-    return {"list": _watchlist_api(frame)}
+    payload = _latest_official_payload()
+    return {"list": _watchlist_api(frame), **payload}
 
 
 def generate_watchlist() -> dict[str, Any]:
+    return generate_official_selection_batch()
+
+
+def generate_official_selection_batch(source: str | None = None, force: bool = False) -> dict[str, Any]:
     if not POOL_REBUILD_LOCK.acquire(blocking=False):
         return {
             "success": False,
             "inProgress": True,
             "message": "已有股票池重建任务进行中",
             "list": _watchlist_api(load_watchlist()),
+            **_latest_official_payload(),
         }
     try:
-        return _generate_watchlist_locked()
+        return _generate_official_selection_batch_locked(source=source, force=force)
     finally:
         POOL_REBUILD_LOCK.release()
 
 
-def _generate_watchlist_locked() -> dict[str, Any]:
+def _generate_official_selection_batch_locked(source: str | None = None, force: bool = False) -> dict[str, Any]:
     settings = get_settings()
-    source = str(settings.get("quote_source") or settings.get("quoteSource") or "自动切换")
-    limit = int(settings.get("auto_pool_size") or 30)
-    pool = fetch_auto_stock_pool(limit=limit, source=source)
-    if pool.empty:
+    quote_source = source or str(settings.get("quote_source") or settings.get("quoteSource") or "自动切换")
+    now = china_now()
+    selection_date = _official_selection_date(now)
+    if not force and not official_generation_allowed(now, selection_date):
+        payload = _latest_official_payload()
+        return {
+            "success": False,
+            "message": "正式初筛只能在完整交易日收盘数据可用后生成；盘中请使用盘中前20预览",
+            "list": _watchlist_api(load_watchlist()),
+            **payload,
+        }
+
+    raw_top = fetch_raw_turnover_top(limit=TURNOVER_TOP_N, source=quote_source)
+    if raw_top.empty:
         cached = load_watchlist()
-        source_message = pool.attrs.get("message", "行情源未返回股票池")
+        source_message = raw_top.attrs.get("message", "行情源未返回原始成交额前20")
         trading_time = is_a_share_trading_time()
-        if not trading_time and _has_current_day_locked_pool(cached, limit):
+        if not trading_time and _has_current_day_locked_pool(cached, TURNOVER_TOP_N):
             cached = recompute_watchlist(cached)
             return {
                 "success": True,
                 "usedCache": True,
-                "message": f"行情源暂时不可用，已保留今日已锁定初筛池 {len(cached)} 只。原因：{source_message}",
+                "message": f"行情源暂时不可用，已保留最近正式初筛池 {len(cached)} 只。原因：{source_message}",
                 "list": _watchlist_api(cached),
+                **_latest_official_payload(),
             }
         return {
             "success": False,
             "message": _source_failure_message(source_message, trading_time=trading_time),
             "list": _watchlist_api(cached),
+            **_latest_official_payload(),
         }
 
-    existing = load_watchlist()
-    remarks: dict[str, Any] = {}
-    plans: dict[str, Any] = {}
-    if not existing.empty:
-        for _, row in existing.iterrows():
-            code = clean_code(row.get("代码"))
-            remarks[code] = row.get("备注", "")
-            plans[code] = row.get("明日计划", "")
+    rows: list[dict[str, Any]] = []
+    for _, row in raw_top.iterrows():
+        rows.append(
+            {
+                "code": clean_code(row.get("代码")),
+                "name": str(row.get("名称") or ""),
+                "raw_rank": int(_number(row.get("raw_rank"), _number(row.get("成交额排名"), len(rows) + 1))),
+                "turnover": _number(row.get("成交额")),
+                "price": _number(row.get("最新价", row.get("现价"))),
+            }
+        )
+    filtered = filter_raw_top20(rows, raw_top_n=TURNOVER_TOP_N)
+    source_label = str(raw_top.attrs.get("source") or quote_source or "自动生成")
+    generated_at = now.replace(microsecond=0).isoformat()
+    batch_id = f"{selection_date.isoformat()}_{source_label}_official_v1"
+    batch = {
+        "id": batch_id,
+        "selection_date": selection_date.isoformat(),
+        "generated_at": generated_at,
+        "data_as_of": selection_date.isoformat(),
+        "source": source_label,
+        "is_official": 1,
+        "raw_top_n": TURNOVER_TOP_N,
+        "status": "active",
+        "source_message": str(raw_top.attrs.get("message") or ""),
+    }
+    sqlite_store.upsert_selection_batch(batch)
 
-    source_label = str(pool.attrs.get("source") or source or "自动生成")
-    frame = ensure_watchlist_frame(assign_pool_batch(pool, f"自动生成:{source_label}"))
-    for index, row in frame.iterrows():
-        code = clean_code(row.get("代码"))
-        if code in remarks:
-            frame.loc[index, "备注"] = remarks[code]
-        if code in plans:
-            frame.loc[index, "明日计划"] = plans[code]
+    saved_items: list[dict[str, Any]] = []
+    created_count = 0
+    for item in filtered:
+        code = clean_code(item.get("code"))
+        history_values = _history_values_for_selection(code, selection_date)
+        close_price = history_values.get("close")
+        ma5_close = history_values.get("ma5")
+        above_ma5 = bool(item.get("market_allowed")) and is_official_selection_qualified(close_price, ma5_close)
+        candidate_created = False
+        if above_ma5:
+            eligible = next_trading_day(selection_date)
+            candidate_id, created = sqlite_store.create_candidate_cycle(
+                {
+                    "id": f"C_{code}_{selection_date.isoformat()}",
+                    "code": code,
+                    "name": item.get("name"),
+                    "source_batch_id": batch_id,
+                    "selection_date": selection_date.isoformat(),
+                    "eligible_from": eligible.isoformat(),
+                    "state": CandidateState.WAITING_ELIGIBLE_DATE.value if eligible > now.date() else CandidateState.OBSERVING.value,
+                    "waiting_trade_days": 0,
+                    "last_close": close_price,
+                    "last_ma5_close": ma5_close,
+                    "event_time": generated_at,
+                }
+            )
+            candidate_created = True
+            created_count += int(created)
+        selection_item = {
+            "id": f"{batch_id}:{code}",
+            "batch_id": batch_id,
+            "code": code,
+            "name": item.get("name"),
+            "raw_rank": int(item.get("raw_rank") or 0),
+            "turnover": item.get("turnover"),
+            "close_price": close_price,
+            "ma5_close": ma5_close,
+            "market_allowed": int(bool(item.get("market_allowed"))),
+            "exclusion_reason": item.get("exclusion_reason") or history_values.get("risk") or ("" if above_ma5 else "入选日收盘未站上MA5"),
+            "above_ma5": int(above_ma5),
+            "candidate_created": int(candidate_created),
+        }
+        sqlite_store.upsert_selection_item(selection_item)
+        saved_items.append(selection_item)
 
-    frame = recompute_watchlist(frame)
+    frame = _watchlist_frame_from_selection(saved_items, batch)
     save_watchlist(frame)
     market_context = refresh_market_context_if_stale()
-    batch_id = str(frame["pool_batch_id"].dropna().iloc[0]) if "pool_batch_id" in frame and not frame.empty else ""
+    payload = _latest_official_payload()
     return {
         "success": True,
-        "message": f"已生成并锁定今日初筛池 {len(frame)} 只，批次 {batch_id}",
+        "message": f"已生成视频原版正式初筛批次：原始前{TURNOVER_TOP_N}，过滤后 {sum(1 for item in saved_items if item['market_allowed'])} 只，新建候选 {created_count} 只",
         "marketContext": {
             "success": bool(market_context.get("success")),
             "message": market_context.get("message", ""),
         },
         "list": _watchlist_api(frame),
+        **payload,
     }
 
 
-def import_watchlist_file(content: bytes, filename: str, fetch_history: bool = False) -> dict[str, Any]:
+def generate_intraday_preview() -> dict[str, Any]:
+    settings = get_settings()
+    source = str(settings.get("quote_source") or settings.get("quoteSource") or "自动切换")
+    raw_top = fetch_raw_turnover_top(limit=TURNOVER_TOP_N, source=source)
+    if raw_top.empty:
+        return {
+            "success": False,
+            "message": raw_top.attrs.get("message", "行情源未返回盘中前20预览"),
+            "intradayPreview": {"items": [], "changes": {"newEntries": [], "dropped": [], "rankUp": [], "rankDown": []}},
+        }
+    rows = []
+    for _, row in raw_top.iterrows():
+        rows.append(
+            {
+                "code": clean_code(row.get("代码")),
+                "name": str(row.get("名称") or ""),
+                "raw_rank": int(_number(row.get("raw_rank"), len(rows) + 1)),
+                "turnover": _number(row.get("成交额")),
+                "price": _number(row.get("最新价")),
+            }
+        )
+    items = filter_raw_top20(rows, raw_top_n=TURNOVER_TOP_N)
+    latest = sqlite_store.latest_official_batch()
+    old_items = sqlite_store.selection_items_for_batch(str(latest["id"])) if latest else []
+    old_rank = {clean_code(item.get("code")): int(item.get("raw_rank") or 0) for item in old_items}
+    old_codes = set(old_rank)
+    new_rank = {clean_code(item.get("code")): int(item.get("raw_rank") or 0) for item in items}
+    new_codes = set(new_rank)
+
+    def payload_for(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "rank": item.get("raw_rank"),
+            "volume": item.get("turnover"),
+            "price": item.get("price"),
+            "marketAllowed": item.get("market_allowed"),
+            "exclusionReason": item.get("exclusion_reason"),
+        }
+
+    by_code = {clean_code(item.get("code")): item for item in items}
+    changes = {
+        "newEntries": [payload_for(by_code[code]) for code in sorted(new_codes - old_codes, key=lambda code: new_rank.get(code, 999))],
+        "dropped": [{"code": code, "oldRank": old_rank.get(code), "currentRank": None} for code in sorted(old_codes - new_codes, key=lambda code: old_rank.get(code, 999))],
+        "rankUp": [],
+        "rankDown": [],
+    }
+    for code in sorted(old_codes & new_codes, key=lambda value: new_rank.get(value, 999)):
+        if new_rank[code] < old_rank[code]:
+            changes["rankUp"].append({**payload_for(by_code[code]), "oldRank": old_rank[code], "newRank": new_rank[code]})
+        elif new_rank[code] > old_rank[code]:
+            changes["rankDown"].append({**payload_for(by_code[code]), "oldRank": old_rank[code], "newRank": new_rank[code]})
+    return {
+        "success": True,
+        "message": "盘中前20预览已更新；不会生成正式候选，也不会覆盖收盘批次",
+        "intradayPreview": {"items": [payload_for(item) for item in items], "changes": changes},
+    }
+
+
+def import_watchlist_file(content: bytes, filename: str, fetch_history: bool = False, as_official: bool = False) -> dict[str, Any]:
     if not content:
         raise ValueError("上传文件为空")
     frame, summary = standardize_import_file(content, filename)
@@ -266,6 +705,66 @@ def import_watchlist_file(content: bytes, filename: str, fetch_history: bool = F
     frame["备注"] = frame["备注"].fillna("").replace("", "同花顺表格导入初筛")
     frame = recompute_watchlist(frame)
     save_watchlist(frame)
+    official_payload: dict[str, Any] = {}
+    if as_official:
+        now = china_now()
+        selection_date = _official_selection_date(now)
+        generated_at = now.replace(microsecond=0).isoformat()
+        batch_id = f"{selection_date.isoformat()}_ths_import_official_v1"
+        batch = {
+            "id": batch_id,
+            "selection_date": selection_date.isoformat(),
+            "generated_at": generated_at,
+            "data_as_of": selection_date.isoformat(),
+            "source": f"同花顺上传:{filename}",
+            "is_official": 1,
+            "raw_top_n": TURNOVER_TOP_N,
+            "status": "active",
+            "source_message": "用户确认作为正式收盘批次",
+        }
+        sqlite_store.upsert_selection_batch(batch)
+        saved_items: list[dict[str, Any]] = []
+        for _, row in frame.iterrows():
+            code = clean_code(row.get("代码"))
+            history_values = _history_values_for_selection(code, selection_date)
+            close_price = history_values.get("close")
+            ma5_close = history_values.get("ma5")
+            above_ma5 = is_official_selection_qualified(close_price, ma5_close)
+            candidate_created = False
+            if above_ma5:
+                candidate_id, _created = sqlite_store.create_candidate_cycle(
+                    {
+                        "id": f"C_{code}_{selection_date.isoformat()}",
+                        "code": code,
+                        "name": str(row.get("名称") or ""),
+                        "source_batch_id": batch_id,
+                        "selection_date": selection_date.isoformat(),
+                        "eligible_from": next_trading_day(selection_date).isoformat(),
+                        "state": CandidateState.OBSERVING.value,
+                        "waiting_trade_days": 0,
+                        "last_close": close_price,
+                        "last_ma5_close": ma5_close,
+                        "event_time": generated_at,
+                    }
+                )
+                candidate_created = True
+            item = {
+                "id": f"{batch_id}:{code}",
+                "batch_id": batch_id,
+                "code": code,
+                "name": str(row.get("名称") or ""),
+                "raw_rank": int(_number(row.get("pool_rank_at_generation"), _number(row.get("成交额排名"), 0))),
+                "turnover": _number(row.get("成交额")),
+                "close_price": close_price,
+                "ma5_close": ma5_close,
+                "market_allowed": 1,
+                "exclusion_reason": history_values.get("risk") or ("" if above_ma5 else "入选日收盘未站上MA5"),
+                "above_ma5": int(above_ma5),
+                "candidate_created": int(candidate_created),
+            }
+            sqlite_store.upsert_selection_item(item)
+            saved_items.append(item)
+        official_payload = _latest_official_payload()
 
     refresh_result = refresh_quotes()
     frame = load_watchlist()
@@ -285,6 +784,7 @@ def import_watchlist_file(content: bytes, filename: str, fetch_history: bool = F
         },
         "history": history_result,
         "list": _watchlist_api(frame),
+        **official_payload,
     }
 
 
@@ -303,6 +803,7 @@ def refresh_quotes() -> dict[str, Any]:
             "list": _watchlist_api(load_watchlist()),
             "positions": portfolio["positions"],
             "accountState": portfolio["accountState"],
+            **_latest_official_payload(),
             "durationMs": _performance_log(
                 "/api/watchlist/refresh-quotes",
                 request_id,
@@ -319,9 +820,9 @@ def refresh_quotes() -> dict[str, Any]:
 
 def _refresh_quotes_locked(request_id: str, started_at: float) -> dict[str, Any]:
     frame = load_watchlist()
-    if frame.empty:
-        return {"success": True, "requestId": request_id, "list": [], "positions": [], "durationMs": 0}
-    codes = [clean_code(code) for code in frame["代码"].dropna().astype(str)]
+    codes = _quote_target_codes(frame)
+    if not codes:
+        return {"success": True, "requestId": request_id, "list": [], "positions": [], "durationMs": 0, **_latest_official_payload()}
     settings = get_settings()
     source = str(settings.get("quote_source") or "自动切换")
     source_started_at = perf_counter()
@@ -350,6 +851,7 @@ def _refresh_quotes_locked(request_id: str, started_at: float) -> dict[str, Any]
                 "requestId": request_id,
                 "message": message or "行情刷新失败，且没有可用缓存",
                 "list": _watchlist_api(frame),
+                **_latest_official_payload(),
                 "durationMs": duration_ms,
             }
     else:
@@ -360,10 +862,20 @@ def _refresh_quotes_locked(request_id: str, started_at: float) -> dict[str, Any]
             message=message,
         )
 
+    if frame.empty:
+        frame = ensure_watchlist_frame(pd.DataFrame({"代码": codes}))
     merged = merge_quotes_into_watchlist(frame, quotes)
     merged = recompute_watchlist(merged)
+    available_cash, _capital = _account_cash_for_watchlist(merged)
+    _update_candidates_from_quotes(
+        quotes,
+        used_cache=used_cache,
+        source=str(quotes.attrs.get("source", source)),
+        account_cash=available_cash,
+    )
     save_watchlist(merged)
     portfolio = portfolio_snapshot(persist_risk_state=True)
+    payload = _latest_official_payload()
     duration_ms = _performance_log(
         "/api/watchlist/refresh-quotes",
         request_id,
@@ -380,6 +892,7 @@ def _refresh_quotes_locked(request_id: str, started_at: float) -> dict[str, Any]
         "source": str(quotes.attrs.get("source", source)),
         "isStale": used_cache,
         "dataAgeSeconds": 0,
+        "quoteFreshnessSeconds": QUOTE_FRESHNESS_SECONDS,
         "durationMs": duration_ms,
         "message": message,
         "list": _watchlist_api(merged),
@@ -387,6 +900,7 @@ def _refresh_quotes_locked(request_id: str, started_at: float) -> dict[str, Any]
         "positions": portfolio["positions"],
         "accountState": portfolio["accountState"],
         "sourceHealth": realtime_source_health(),
+        **payload,
     }
 
 
@@ -395,12 +909,20 @@ def scan_turnover_changes() -> dict[str, Any]:
         return {
             "success": False,
             "inProgress": True,
-            "message": "已有成交额异动扫描进行中",
+            "message": "已有盘中前20预览扫描进行中",
             "changes": {"newEntries": [], "dropped": [], "rankUp": [], "rankDown": []},
             "list": _watchlist_api(load_watchlist()),
         }
     try:
-        return _scan_turnover_changes_locked()
+        result = generate_intraday_preview()
+        preview = result.get("intradayPreview") or {}
+        return {
+            "success": bool(result.get("success")),
+            "message": result.get("message", ""),
+            "changes": preview.get("changes", {"newEntries": [], "dropped": [], "rankUp": [], "rankDown": []}),
+            "intradayPreview": preview,
+            "list": _watchlist_api(load_watchlist()),
+        }
     finally:
         TURNOVER_SCAN_LOCK.release()
 
@@ -409,12 +931,12 @@ def _scan_turnover_changes_locked() -> dict[str, Any]:
     frame = load_watchlist()
     settings = get_settings()
     source = str(settings.get("quote_source") or settings.get("quoteSource") or "自动切换")
-    limit = int(settings.get("auto_pool_size") or 30)
+    limit = TURNOVER_TOP_N
     live_pool = fetch_auto_stock_pool(limit=limit, source=source)
     if live_pool.empty:
         return {
             "success": False,
-            "message": live_pool.attrs.get("message", "行情源未返回实时成交额前30"),
+            "message": live_pool.attrs.get("message", "行情源未返回盘中原始成交额前20"),
             "changes": {"newEntries": [], "dropped": [], "rankUp": [], "rankDown": []},
             "list": _watchlist_api(frame),
         }
@@ -496,75 +1018,10 @@ def _scan_turnover_changes_locked() -> dict[str, Any]:
 
 
 def include_turnover_stock(payload: dict[str, Any]) -> dict[str, Any]:
-    code = clean_code(payload.get("code"))
-    if not code:
-        raise ValueError("股票代码缺失")
-
-    frame = ensure_watchlist_frame(load_watchlist())
-    matches = frame.index[frame["代码"].astype(str).map(clean_code) == code].tolist() if not frame.empty else []
-    rank = int(_number(payload.get("rank"), len(frame) + 1))
-
-    if matches:
-        index = matches[0]
-    else:
-        if frame.empty:
-            batch = assign_pool_batch(pd.DataFrame([{}]), "手动纳入新进前30")
-            batch_id = str(batch.loc[0, "pool_batch_id"])
-            source = str(batch.loc[0, "pool_source"])
-            generated_at = str(batch.loc[0, "pool_generated_at"])
-        else:
-            batch_ids = frame["pool_batch_id"].replace("", pd.NA).dropna()
-            sources = frame["pool_source"].replace("", pd.NA).dropna()
-            generated_times = frame["pool_generated_at"].replace("", pd.NA).dropna()
-            if batch_ids.empty or generated_times.empty:
-                batch = assign_pool_batch(pd.DataFrame([{}]), "手动纳入新进前30")
-                batch_id = str(batch.loc[0, "pool_batch_id"])
-                generated_at = str(batch.loc[0, "pool_generated_at"])
-            else:
-                batch_id = str(batch_ids.iloc[0])
-                generated_at = str(generated_times.iloc[0])
-            source = str(sources.iloc[0]) if not sources.empty else "当前初筛池"
-        row = {
-            "代码": code,
-            "名称": str(payload.get("name") or ""),
-            "现价": _number(payload.get("price")),
-            "涨跌幅%": _number(payload.get("pct")),
-            "成交额": _number(payload.get("volume")),
-            "成交额排名": rank,
-            "pool_batch_id": batch_id,
-            "pool_source": f"{source};手动纳入",
-            "pool_generated_at": generated_at,
-            "pool_rank_at_generation": rank,
-            "is_pool_locked": True,
-            "is_pinned": False,
-            "上市板块": "主板",
-            "状态": "初筛通过",
-            "流程阶段": "初筛通过",
-            "分组": "初筛",
-            "备注": "新进成交额前30手动纳入",
-        }
-        index = len(frame)
-        frame.loc[index, WATCHLIST_COLUMNS] = pd.NA
-        for column, value in row.items():
-            frame.loc[index, column] = value
-
-    for field, column in {
-        "name": "名称",
-        "price": "现价",
-        "pct": "涨跌幅%",
-        "volume": "成交额",
-        "rank": "成交额排名",
-    }.items():
-        if field in payload and payload.get(field) not in {None, ""}:
-            frame.loc[index, column] = payload.get(field)
-    frame.loc[index, "pool_rank_at_generation"] = rank
-
-    frame = recompute_watchlist(frame)
-    save_watchlist(frame)
     return {
-        "success": True,
-        "message": f"已手动纳入今日初筛池：{code}",
-        "list": _watchlist_api(frame),
+        "success": False,
+        "message": "盘中前20预览不能手动纳入正式池；请等待收盘后生成正式批次或导入收盘表并明确作为正式批次",
+        "list": _watchlist_api(load_watchlist()),
     }
 
 

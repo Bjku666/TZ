@@ -10,7 +10,7 @@
   "quote_source": "自动切换",
   "quote_refresh_mode": "60秒",
   "quote_refresh_seconds": 60,
-  "auto_pool_size": 30,
+  "auto_pool_size": 20,
   "fee_profile": "custom",
   "commission_rate": 0.00031,
   "min_commission": 0.0,

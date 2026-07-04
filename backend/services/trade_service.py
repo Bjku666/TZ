@@ -11,18 +11,9 @@ from src.data import (
 )
 from src.portfolio import calculate_trade_fees
 from src.realtime import china_now, is_a_share_trading_time
-from src.rules import clean_code, screening_result
-from src.trading_rules_config import (
-    BIG_CANDLE_THRESHOLD_PCT,
-    BUY_ZONE_MAX_DEVIATION_PCT,
-    BUY_ZONE_MIN_DEVIATION_PCT,
-    LOT_SIZE,
-    MAX_SINGLE_TRADE_RISK_PCT,
-    TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
-    TAKE_PROFIT_WATCH_DEVIATION_PCT,
-    estimate_single_trade_risk,
-    is_allowed_buy_window,
-)
+from src.rules import clean_code
+from src.trading_rules_config import LOT_SIZE, is_allowed_buy_window
+from src.video_original_rules import evaluate_buy_compliance, evaluate_next_day_exit
 
 from backend.services.portfolio_service import portfolio_snapshot
 from backend.services.risk_service import market_trade_filter
@@ -78,60 +69,51 @@ def _audit_buy(
     now: datetime,
     market_risk: bool = False,
     market_risk_reasons: list[str] | None = None,
+    is_historical: bool = False,
+    manual_confirmed: bool = True,
 ) -> tuple[str, list[str], dict[str, Any]]:
-    tags: list[str] = []
-    passed, reason = screening_result(code, name)
-    if not passed:
-        tags.append(reason)
-    if not is_allowed_buy_window(now):
-        tags.append("不在允许买入时间窗口")
-    if market_risk:
-        reason_text = "、".join(market_risk_reasons or []) or "大盘或板块弱"
-        tags.append(f"{reason_text}，不允许开新仓")
-    risk_context: dict[str, Any] = {
-        "stopPrice": 0,
-        "riskAmount": 0,
-        "maxRiskAmount": round(account_initial_cash * MAX_SINGLE_TRADE_RISK_PCT, 2),
-        "riskPct": 0,
-    }
-    if stock is None:
-        tags.append("不在股票池")
-    else:
-        if stock.get("historyStatus") != "已有缓存" and number(stock.get("ma5")) <= 0:
-            tags.append("缺少有效历史K线")
-        if stock.get("stage") != "待买观察":
-            tags.append("不在待买观察")
-        elif not stock.get("canBuy"):
-            tags.append("待买硬约束未通过")
-        if not stock.get("ma5Upward"):
-            tags.append("MA5未向上")
-        if number(stock.get("bigCandlePct")) < BIG_CANDLE_THRESHOLD_PCT:
-            tags.append("无5%大阳线")
-        deviation = number(stock.get("deviation5"))
-        if deviation < BUY_ZONE_MIN_DEVIATION_PCT:
-            tags.append("跌破MA5买入")
-        elif deviation > BUY_ZONE_MAX_DEVIATION_PCT:
-            tags.append("偏离MA5超过2.5%")
-        risk_info = estimate_single_trade_risk(price, quantity, stock.get("ma5"), estimated_sell_fee)
-        risk_amount = number(risk_info.get("risk_amount"))
-        max_risk = account_initial_cash * MAX_SINGLE_TRADE_RISK_PCT
-        risk_context = {
-            "stopPrice": number(risk_info.get("stop_price")),
-            "riskAmount": round(risk_amount, 2),
-            "maxRiskAmount": round(max_risk, 2),
-            "riskPct": round(risk_amount / account_initial_cash * 100, 2) if account_initial_cash else 0,
+    candidate = sqlite_store.active_candidate_for_code(clean_code(code))
+    if candidate is None and stock is not None:
+        candidate = {
+            "id": stock.get("candidateCycleId") or stock.get("candidateId"),
+            "source_batch_id": stock.get("selectionBatchId") or stock.get("poolBatchId"),
+            "selection_date": stock.get("selectionDate"),
+            "eligible_from": stock.get("eligibleFrom"),
+            "above_ma5": True,
         }
-        if risk_amount <= 0:
-            tags.append("无法计算单笔风险")
-        elif risk_amount > max_risk:
-            tags.append("单笔风险超过本金2%")
-    if available_cash < price * LOT_SIZE:
-        tags.append("现金不足一手")
-    if not tags:
-        return "符合规则", [], risk_context
-    if len(tags) <= 2:
-        return "部分不符", tags, risk_context
-    return "违规交易", tags, risk_context
+    ma5_live = (stock or {}).get("ma5Live", (stock or {}).get("ma5"))
+    quote_age = (stock or {}).get("quoteAgeSeconds", 0)
+    result = evaluate_buy_compliance(
+        candidate=candidate,
+        trade_datetime=now,
+        trade_price=price,
+        quantity=quantity,
+        ma5_live=ma5_live,
+        quote_age_seconds=quote_age,
+        available_cash=available_cash,
+        manual_confirmed=manual_confirmed,
+        is_historical=is_historical,
+    )
+    context = {
+        "candidateCycleId": (candidate or {}).get("id"),
+        "selectionBatchId": (candidate or {}).get("source_batch_id"),
+        "selectionDate": (candidate or {}).get("selection_date"),
+        "eligibleFrom": (candidate or {}).get("eligible_from"),
+        "tradeDateTime": now.isoformat(),
+        "tradePrice": price,
+        "ma5Live": number(ma5_live),
+        "deviation": result.get("deviation"),
+        "buyWindow": result.get("buyWindow"),
+        "quoteAgeSeconds": quote_age,
+        "signalQualified": result.get("signalQualified"),
+        "executionAllowed": result.get("executionAllowed"),
+        "executionBlockReasons": result.get("executionBlockReasons"),
+        "manualConfirmationRequired": True,
+        "marketRisk": market_risk,
+        "marketRiskReasons": market_risk_reasons or [],
+        "marketInfoNote": "市场信息仅供查看，不属于视频原版交易条件",
+    }
+    return str(result["conclusion"]), list(result["tags"]), context
 
 
 def _audit_sell(position: dict[str, Any] | None, quantity: float, reason: str, account_initial_cash: float) -> tuple[str, list[str]]:
@@ -141,40 +123,17 @@ def _audit_sell(position: dict[str, Any] | None, quantity: float, reason: str, a
 
     owned = number(position.get("quantity"))
     available = number(position.get("availableQuantity"))
-    current_price = number(position.get("currentPrice"))
-    avg_cost = number(position.get("avgCost"))
-    ma5 = number(position.get("ma5"))
-    deviation = number(position.get("deviation5"))
-    below_days = int(number(position.get("belowMa5Days")))
-    hold_days = int(number(position.get("holdDays")))
-    reason_text = str(reason or "")
 
     if quantity > owned:
         tags.append("卖出数量超过持仓")
     if quantity > available:
         tags.append(str(position.get("sellBlockedReason") or "可卖数量不足"))
-
-    hit_ma5_risk = ma5 > 0 and deviation < 0
-    hit_clear = below_days >= 3
-    hit_take_profit_watch = ma5 > 0 and deviation >= TAKE_PROFIT_WATCH_DEVIATION_PCT
-    hit_take_profit_priority = ma5 > 0 and deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT
-    current_loss_amount = max(0.0, (avg_cost - current_price) * owned)
-    hit_max_loss = account_initial_cash > 0 and current_loss_amount >= account_initial_cash * MAX_SINGLE_TRADE_RISK_PCT
-    hit_next_day = hold_days <= 1 and any(key in reason_text for key in ["次日", "10点", "10:00", "不强", "冲高", "退出"])
-
-    allowed_trigger = (
-        hit_ma5_risk
-        or hit_clear
-        or hit_take_profit_watch
-        or hit_take_profit_priority
-        or hit_max_loss
-        or hit_next_day
-    )
-
-    if ma5 <= 0 and not hit_max_loss:
-        tags.append("缺少MA5卖出依据")
-    if not allowed_trigger:
-        tags.append("未触发卖出纪律")
+    exit_state = str(position.get("originalExitState") or position.get("exitState") or "")
+    reason_text = str(reason or "")
+    if exit_state not in {"MORNING_EXIT_DUE", "AFTERNOON_EXIT_DUE", "LIMIT_UP_OPENED_EXIT_DUE"} and not any(
+        key in reason_text for key in ["次日", "10点", "10:00", "尾盘", "涨停打开", "原版"]
+    ):
+        tags.append("未对应视频原版隔日卖出提醒")
 
     if not tags:
         return "符合规则", []
@@ -215,13 +174,21 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
     if not code or not name or price <= 0 or quantity <= 0:
         raise ValueError("交易参数不完整")
 
+    now = china_now()
+    trade_date = str(payload.get("date") or now.date().isoformat())
+    trade_time = str(payload.get("time") or now.strftime("%H:%M:%S"))
+    try:
+        trade_dt = datetime.fromisoformat(f"{trade_date}T{trade_time}")
+    except ValueError:
+        trade_dt = now
+    is_historical = bool(payload.get("historicalBackfill")) or trade_dt.date() != now.date()
     active_mode = mode or payload.get("mode")
     portfolio = portfolio_snapshot(active_mode, persist_risk_state=True)
     account_state = portfolio["accountState"]
     positions = {item["code"]: item for item in portfolio["positions"]}
     fees = calculate_trade_fees(side, price, quantity, trade_fee_settings(active_mode))
     total_cost = fees["amount"] + fees["total_fee"]
-    if side == "买入" and number(account_state.get("availableCash")) < total_cost:
+    if side == "买入" and not is_historical and number(account_state.get("availableCash")) < total_cost:
         raise ValueError(f"可用资金不足，需要 {total_cost:.2f} 元")
     position = positions.get(code)
     if side == "卖出":
@@ -235,9 +202,6 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
         if not bool((position or {}).get("canExecuteSellNow")):
             raise ValueError(str((position or {}).get("sellBlockedReason") or "当前不可执行卖出"))
 
-    now = china_now()
-    trade_date = str(payload.get("date") or now.date().isoformat())
-    trade_time = str(payload.get("time") or now.strftime("%H:%M:%S"))
     stock = _current_stock(code)
     market_filter = market_trade_filter(code)
     manual_market_risk = bool(payload.get("systemicRisk") or payload.get("marketRisk"))
@@ -263,8 +227,9 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
         "marketRiskReasons": market_reasons,
         "marketSnapshot": market_filter.get("marketSnapshot", {}),
         "sectorSnapshot": market_filter.get("sectorSnapshot", {}),
-        "buyWindow": "09:35-10:00 / 14:30-14:55",
-        "riskLimitPct": MAX_SINGLE_TRADE_RISK_PCT * 100,
+        "buyWindow": "09:30-10:00 / 14:30-15:00",
+        "ruleBoundaryNote": "市场、板块和账户资金属于辅助信息或执行约束，不属于视频原版买点条件",
+        "historicalBackfill": is_historical,
         "positionBeforeTrade": _position_snapshot(position),
     }
     if side == "买入":
@@ -277,9 +242,11 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
             number(account_state.get("availableCash")),
             account_initial_cash,
             estimated_sell_fee,
-            now,
+            trade_dt,
             market_risk=market_risk,
             market_risk_reasons=market_reasons,
+            is_historical=is_historical,
+            manual_confirmed=bool(payload.get("manualConfirmed", True)),
         )
         snapshot.update(buy_risk_context)
     else:
@@ -311,6 +278,26 @@ def create_trade(payload: dict[str, Any], mode: str | None = None) -> dict[str, 
     trade = trades_to_api(pd.DataFrame([new_row]))[0]
     trade["id"] = trade_id
     trade_repository.append_api_trade(active_mode_key, active_mode_name, trade)
+    if side == "买入":
+        candidate_id = str(snapshot.get("candidateCycleId") or "")
+        if candidate_id:
+            sqlite_store.update_candidate_cycle(
+                candidate_id,
+                {"state": "BOUGHT", "bought_trade_id": trade_id},
+            )
+            sqlite_store.add_candidate_event(
+                candidate_id,
+                "BUY_RECORDED",
+                event_time=trade_dt.isoformat(),
+                trade_date=trade_date,
+                price=price,
+                ma5=snapshot.get("ma5Live"),
+                deviation=snapshot.get("deviation"),
+                quote_age_seconds=snapshot.get("quoteAgeSeconds"),
+                source="manual_trade_record",
+                reason="用户人工确认买入记录",
+                payload=snapshot,
+            )
     _sync_after_trade(active_mode)
     return {"success": True, "trade": trade}
 

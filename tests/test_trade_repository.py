@@ -19,7 +19,7 @@ def _trade(trade_id: str, code: str = "600000") -> dict[str, object]:
         "name": "测试股票",
         "type": "BUY",
         "date": "2026-07-03",
-        "time": "09:35:00",
+        "time": "09:30:00",
         "price": 10,
         "quantity": 100,
         "amount": 1000,

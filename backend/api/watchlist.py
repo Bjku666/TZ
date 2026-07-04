@@ -25,6 +25,7 @@ async def import_watchlist_file(
     request: Request,
     filename: str = "",
     fetchHistory: bool = False,
+    asOfficial: bool = False,
 ) -> dict[str, Any]:
     try:
         content = await request.body()
@@ -35,6 +36,7 @@ async def import_watchlist_file(
             content,
             uploaded_name,
             fetch_history=fetchHistory,
+            as_official=asOfficial,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -45,9 +47,19 @@ def refresh_quotes() -> dict[str, Any]:
     return watchlist_service.refresh_quotes()
 
 
+@router.get("/refresh-quotes")
+def refresh_quotes_get() -> dict[str, Any]:
+    return watchlist_service.refresh_quotes()
+
+
 @router.post("/scan-turnover-changes")
 def scan_turnover_changes() -> dict[str, Any]:
     return watchlist_service.scan_turnover_changes()
+
+
+@router.get("/preview")
+def intraday_preview() -> dict[str, Any]:
+    return watchlist_service.generate_intraday_preview()
 
 
 @router.post("/include-turnover-stock")

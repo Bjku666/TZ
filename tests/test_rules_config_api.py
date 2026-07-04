@@ -11,8 +11,9 @@ class RulesConfigApiTests(TestCase):
         config = data["config"]
 
         self.assertEqual(config["lotSize"], 100)
-        self.assertEqual(config["turnoverTopN"], 30)
-        self.assertEqual(config["buyZone"]["maxDeviationPct"], 2.5)
-        self.assertEqual(config["singleTradeRisk"]["maxPct"], 0.02)
-        self.assertEqual(config["buyWindows"][0], {"start": "09:35", "end": "10:00"})
-        self.assertEqual(config["riskCheckTime"], "14:50")
+        self.assertEqual(config["turnoverTopN"], 20)
+        self.assertEqual(config["touchTolerancePct"], 0.5)
+        self.assertEqual(config["morningBuyWindow"], {"start": "09:30", "end": "10:00", "endExclusive": True})
+        self.assertEqual(config["afternoonBuyWindow"], {"start": "14:30", "end": "15:00", "endExclusive": True})
+        self.assertEqual(config["quoteFreshnessSeconds"], 20)
+        self.assertIn("executionConstraints", config)

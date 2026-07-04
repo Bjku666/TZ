@@ -62,7 +62,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "quote_source": "自动切换",
     "quote_refresh_mode": "手动",
     "quote_refresh_seconds": 60,
-    "auto_pool_size": 30,
+    "auto_pool_size": 20,
     "fee_profile": FEE_PROFILE_THS_SIMULATION,
     "commission_rate": THS_SIMULATION_FEE_DEFAULTS["commission_rate"],
     "min_commission": THS_SIMULATION_FEE_DEFAULTS["min_commission"],

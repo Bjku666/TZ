@@ -8,13 +8,13 @@ import subprocess
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api import market, portfolio, review, rules, settings, trades, watchlist
+from backend.api import candidates, market, portfolio, review, rules, selection, settings, trades, watchlist
 from backend.storage.sqlite_store import init_db
 from src.data import ensure_data_dir
 
-APP_NAME = "强势回踩短线交易纪律系统 API"
-APP_VERSION = "0.1.4"
-API_CONTRACT_VERSION = "trade-link-v8"
+APP_NAME = "视频原版五日线回踩隔日超短交易纪律系统 API"
+APP_VERSION = "0.2.0"
+API_CONTRACT_VERSION = "video-original-v1"
 BUILD_TIME = os.environ.get("TZ_BUILD_TIME") or datetime.now(timezone.utc).isoformat()
 
 
@@ -48,6 +48,8 @@ def create_app() -> FastAPI:
     app.include_router(portfolio.router)
     app.include_router(review.router)
     app.include_router(rules.router)
+    app.include_router(selection.router)
+    app.include_router(candidates.router)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

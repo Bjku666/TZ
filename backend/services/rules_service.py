@@ -7,6 +7,6 @@ from src.trading_rules_config import trading_rules_config
 
 def rules_config() -> dict[str, Any]:
     return {
-        "version": "strong-pullback-v1",
+        "version": "video-original-v1",
         "config": trading_rules_config(),
     }

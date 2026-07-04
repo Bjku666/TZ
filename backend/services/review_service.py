@@ -217,11 +217,11 @@ def _stock_screening(report: dict[str, Any]) -> dict[str, Any]:
     screening = report.get("stockScreening") or {}
     return {
         "step1": screening.get("step1")
-        or {"title": "当前成交额前30初筛池复查", "reviewed": stock.get("top200Reviewed"), "stocks": stock.get("step1Screened") or []},
+        or {"title": "正式成交额原始前20批次复查", "reviewed": stock.get("top200Reviewed"), "stocks": stock.get("step1Screened") or []},
         "step2": screening.get("step2")
-        or {"title": "量比前50且成交额10-20亿", "reviewed": stock.get("volRatioReviewed"), "stocks": stock.get("step2Screened") or []},
+        or {"title": "跨日观察候选复查", "reviewed": stock.get("volRatioReviewed"), "stocks": stock.get("step2Screened") or []},
         "step3": screening.get("step3")
-        or {"title": "涨跌停板与情绪高度核查", "reviewed": stock.get("limitUpReviewed"), "stocks": stock.get("step3Screened") or []},
+        or {"title": "当前待买和隔日退出复查", "reviewed": stock.get("limitUpReviewed"), "stocks": stock.get("step3Screened") or []},
     }
 
 
@@ -251,7 +251,7 @@ def report_markdown(report: dict[str, Any]) -> str:
     portfolio_risk = stats.get("portfolioRisk", report.get("portfolioRisk", ""))
 
     lines = [
-        f"# {report.get('date', _today())} 强势回踩系统日报",
+        f"# {report.get('date', _today())} 视频原版五日线回踩日报",
         "",
         "## 一、账户与交易结果",
         f"- 买入次数: {buy_count}",
@@ -274,18 +274,18 @@ def report_markdown(report: dict[str, Any]) -> str:
         f"- 系统性风险: {'是' if market.get('systemicRisk') else '否'}",
         f"- 我的市场结论: {_clean_text(market.get('marketConclusion'))}",
         "",
-        "## 三、板块复盘",
+        "## 三、市场辅助信息",
         f"- 已复盘 ETF 数量: {sector.get('reviewedEtfCount', 0)}",
         f"- 热点板块: {_clean_text(sector.get('hotSectors'))}",
         f"- 资金流与题材备注: {_clean_text(sector.get('etfFlowNotes'))}",
         "",
-        "## 四、当前初筛池三步复查",
+        "## 四、视频原版流程复查",
     ]
 
     for step_key, fallback_title in [
-        ("step1", "当前成交额前30初筛池复查"),
-        ("step2", "量比前50且成交额10-20亿"),
-        ("step3", "涨跌停板与情绪高度核查"),
+        ("step1", "正式成交额原始前20批次复查"),
+        ("step2", "跨日观察候选复查"),
+        ("step3", "当前待买和隔日退出复查"),
     ]:
         step = _stock_screening(report).get(step_key) or {}
         title = _clean_text(step.get("title"), fallback_title)

@@ -6,17 +6,23 @@ PROJECT_DIR="/Users/lulu/Desktop/touzi"
 BACKEND_URL="http://127.0.0.1:8000"
 BACKEND_PORT="8000"
 FRONTEND_URL="http://127.0.0.1:5173"
-BACKEND_REQUIRED_CONTRACT="trade-link-v8"
+BACKEND_REQUIRED_CONTRACT="video-original-v1"
 BACKEND_REQUIRED_ROUTES=(
+  "/api/rules"
+  "/api/selection/official/latest"
+  "/api/selection/official/generate"
+  "/api/selection/preview"
+  "/api/selection/import"
+  "/api/candidates"
+  "/api/watchlist/refresh-quotes"
   "/api/trades/recalculate-fees"
-  "/api/watchlist/scan-turnover-changes"
-  "/api/watchlist/include-turnover-stock"
+  "/api/positions/{code}/defer-exit"
 )
 
 cd "$PROJECT_DIR"
 mkdir -p "$PROJECT_DIR/.tmp"
 
-echo "强势回踩系统：本地 Python 后端 + React 前端"
+echo "视频原版五日线回踩隔日超短系统：本地 Python 后端 + React 前端"
 echo "项目目录：$PROJECT_DIR"
 
 if [[ ! -x ".venv/bin/python" ]]; then

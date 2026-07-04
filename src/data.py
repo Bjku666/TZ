@@ -18,10 +18,7 @@ from src.rules import (
     stage_to_group,
 )
 from src.storage import backup_file, safe_write_csv
-from src.trading_rules_config import (
-    MAX_SINGLE_TRADE_RISK_PCT,
-    estimate_single_trade_risk,
-)
+from src.trading_rules_config import estimate_execution_loss_reference
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -324,16 +321,11 @@ def parse_rank(value: object) -> float | None:
     return None
 
 
-def normalize_imported_candidates(df: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
+def normalize_imported_candidates(df: pd.DataFrame, limit: int = 20) -> pd.DataFrame:
     out = df.copy()
     out["代码"] = out["代码"].map(clean_code)
     out["名称"] = out["名称"].fillna("").astype(str).str.strip()
     out = out[out["代码"].str.len() == 6].copy()
-    passed = out.apply(
-        lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
-        axis=1,
-    )
-    out = out[passed].copy()
     for column in ["现价", "涨跌幅%", "成交额"]:
         out[column] = out[column].map(parse_number)
     out["成交额排名"] = out["成交额排名"].map(parse_rank)
@@ -346,9 +338,15 @@ def normalize_imported_candidates(df: pd.DataFrame, limit: int = 30) -> pd.DataF
         .drop(columns=["_rank_sort", "_turnover_sort"])
         .copy()
     )
-    out["成交额排名"] = range(1, len(out) + 1)
+    out["_raw_rank"] = out["成交额排名"]
+    passed = out.apply(
+        lambda row: screening_result(str(row.get("代码", "")), str(row.get("名称", "")))[0],
+        axis=1,
+    )
+    out = out[passed].copy()
+    out["成交额排名"] = out["_raw_rank"]
     out["上市板块"] = out["上市板块"].fillna("主板").replace("", "主板")
-    return out.reset_index(drop=True)
+    return out.drop(columns=["_raw_rank"], errors="ignore").reset_index(drop=True)
 
 
 def imported_codes_summary(raw: pd.DataFrame) -> dict[str, int]:
@@ -527,17 +525,13 @@ def enrich_watchlist(
     out["当前可用资金"] = available_cash
 
     risk_rows = [
-        estimate_single_trade_risk(price, lot_size, ma5)
+        estimate_execution_loss_reference(price, lot_size, ma5)
         for price, ma5 in zip(out["现价"], out["MA5"])
     ]
-    out["预估止损价"] = [row.get("stop_price") for row in risk_rows]
+    out["预估止损价"] = [row.get("reference_price") for row in risk_rows]
     out["预估亏损金额"] = [row.get("risk_amount") for row in risk_rows]
-    out["最大允许亏损"] = round(float(initial_cash) * MAX_SINGLE_TRADE_RISK_PCT, 2) if initial_cash else pd.NA
-    out["单笔风险%"] = (
-        pd.to_numeric(out["预估亏损金额"], errors="coerce") / float(initial_cash) * 100
-        if initial_cash
-        else pd.NA
-    )
+    out["最大允许亏损"] = pd.NA
+    out["单笔风险%"] = pd.NA
 
     # Budget calculations
     numeric_price = pd.to_numeric(out["现价"], errors="coerce")
@@ -559,11 +553,10 @@ def auto_assign_groups(df: pd.DataFrame) -> pd.DataFrame:
         code = str(row.get("代码", ""))
         name = str(row.get("名称", ""))
         deviation = ma5_deviation(row.get("现价"), row.get("MA5"))
-        has_big_line = pd.notna(row.get("最近大阳线%")) and float(row.get("最近大阳线%", 0) or 0) >= 5
         ma5_up = pd.notna(row.get("MA5向上", False)) and str(row.get("MA5向上", False)).lower() in {"true", "1", "是"}
         has_history = pd.notna(row.get("MA5"))  # has MA5 means has history
         new_group = determine_group(
-            code, name, has_history, has_big_line, ma5_up, deviation, True,
+            code, name, has_history, True, ma5_up, deviation, True,
             current_group=str(row.get("状态", "")) if pd.notna(row.get("状态")) else None,
         )
         out.loc[index, "状态"] = new_group

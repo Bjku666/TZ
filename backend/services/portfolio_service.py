@@ -16,10 +16,7 @@ from src.portfolio import (
     realized_pnl_by_date,
 )
 from src.rules import clean_code
-from src.trading_rules_config import (
-    MAX_SINGLE_TRADE_RISK_PCT,
-    TAKE_PROFIT_PRIORITY_DEVIATION_PCT,
-)
+from src.video_original_rules import evaluate_next_day_exit
 from src.storage import load_last_refresh, load_quote_snapshot
 from src.trading_calendar import (
     SHANGHAI_TZ,
@@ -35,13 +32,14 @@ from src.trading_calendar import (
 from backend.services.settings_service import account_mode_name, current_mode, get_settings, initial_cash
 from backend.storage.csv_adapter import number, trades_to_api
 from backend.storage import trade_repository
+from backend.storage.sqlite_store import load_kv, save_kv
 
 
 def _risk_level(advice: str, deviation: float) -> str:
     text = str(advice or "")
-    if "清仓" in text or "卖出" in text or "跌破" in text:
+    if "待卖" in text or "卖出" in text or "超时" in text:
         return "danger"
-    if deviation > TAKE_PROFIT_PRIORITY_DEVIATION_PCT:
+    if "延迟" in text or "观察" in text:
         return "warning"
     return "normal"
 
@@ -428,6 +426,31 @@ def _position_trade_link(code: str, grouped_trades: dict[str, list[dict[str, Any
     }
 
 
+def _defer_key(code: str, buy_date: Any) -> str:
+    return f"defer_exit:{clean_code(code)}:{str(buy_date)[:10]}"
+
+
+def defer_position_exit(code: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    buy_date = str(payload.get("buyDate") or "")
+    if not clean_code(code):
+        raise ValueError("股票代码缺失")
+    if not buy_date:
+        snapshot = portfolio_snapshot(payload.get("mode"), persist_risk_state=False)
+        match = next((item for item in snapshot["positions"] if item.get("code") == clean_code(code)), None)
+        if not match:
+            raise ValueError("未找到持仓")
+        buy_date = str(match.get("buyDate") or "")
+    decision = {
+        "code": clean_code(code),
+        "buyDate": buy_date,
+        "deferReason": str(payload.get("reason") or "用户选择延迟至14:30后处理"),
+        "decisionTime": shanghai_now().replace(microsecond=0).isoformat(),
+    }
+    save_kv(_defer_key(code, buy_date), decision)
+    return {"success": True, "decision": decision}
+
+
 def portfolio_snapshot(
     mode: str | None = None,
     sync_legacy: bool = False,
@@ -467,9 +490,17 @@ def portfolio_snapshot(
         avg_cost = number(row.get("平均成本"))
         current_price = number(row.get("当前价"))
         quantity = int(number(row.get("数量")))
-        current_loss_amount = max(0.0, (avg_cost - current_price) * quantity)
-        max_loss_amount = number(state.get("初始本金")) * MAX_SINGLE_TRADE_RISK_PCT
         execution_status = _position_execution_status(row, operation_date)
+        buy_date = str(row.get("买入日期") or "")
+        defer_decision = load_kv(_defer_key(code, buy_date), {})
+        exit_eval = evaluate_next_day_exit(
+            buy_date=buy_date,
+            now=_market_clock_for_operation(operation_date),
+            current_price=current_price,
+            deferred=bool(defer_decision),
+            sellable_quantity=int(number(row.get("可卖数量"))),
+        )
+        original_advice = str(exit_eval.get("message") or advice)
         api_positions.append(
             {
                 "code": code,
@@ -485,15 +516,22 @@ def portfolio_snapshot(
                 "deviation5": deviation,
                 "holdDays": int(number(row.get("持仓天数"))),
                 "belowMa5Days": int(number(row.get("跌破MA5天数"))),
-                "buyDate": str(row.get("买入日期") or ""),
+                "buyDate": buy_date,
                 "valuationDate": valuation_date.isoformat(),
-                "advice": advice,
-                "riskLevel": _risk_level(advice, deviation),
-                "currentLossAmount": round(current_loss_amount, 2),
-                "maxLossAmount": round(max_loss_amount, 2),
-                "lossRiskPct": round(current_loss_amount / number(state.get("初始本金")) * 100, 2)
-                if number(state.get("初始本金")) > 0
-                else 0,
+                "advice": original_advice,
+                "riskLevel": _risk_level(original_advice, deviation),
+                "currentLossAmount": round(max(0.0, (avg_cost - current_price) * quantity), 2),
+                "maxLossAmount": 0,
+                "lossRiskPct": 0,
+                "originalExitState": exit_eval.get("state"),
+                "originalExitMessage": exit_eval.get("message"),
+                "nextOriginalActionTime": exit_eval.get("nextActionTime"),
+                "isLimitUp": bool(exit_eval.get("isLimitUp")),
+                "deferExitDecision": defer_decision or None,
+                "executionBlocked": bool(exit_eval.get("executionBlocked")),
+                "executionBlockReason": exit_eval.get("executionBlockReason", ""),
+                "originalRuleViolation": bool(exit_eval.get("ruleViolation")),
+                "programCompletionNote": exit_eval.get("programCompletionNote", ""),
                 "tradeLink": _position_trade_link(code, grouped_trades, today),
                 **execution_status,
             }

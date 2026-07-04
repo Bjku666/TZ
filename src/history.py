@@ -10,16 +10,10 @@ import urllib.request
 
 import pandas as pd
 
-from src.trading_rules_config import (
-    BIG_CANDLE_THRESHOLD_PCT,
-    BUY_ZONE_MAX_DEVIATION_PCT,
-    OBSERVE_ZONE_MAX_DEVIATION_PCT,
-    HIGH_ZONE_MAX_DEVIATION_PCT,
-)
-
 from src.data import ROOT, DATA_DIR, clean_code
 from src.rules import recent_big_candle_pct
 from src.storage import safe_write_csv
+from src.video_original_rules import MA5_TOUCH_TOLERANCE_PCT
 
 HISTORY_DIR = DATA_DIR / "history"
 EASTMONEY_HISTORY_HOSTS = [
@@ -593,21 +587,12 @@ def compute_reminder_text(info: dict, price: float | None = None) -> str:
 
     ma5 = info.get("MA5")
     deviation = info.get("MA5偏离率%")
-    has_big_line = info.get("最近大阳线%") is not None and float(info.get("最近大阳线%", 0) or 0) >= BIG_CANDLE_THRESHOLD_PCT
-
-    if not has_big_line:
-        return "近20日无5%阳线启动信号，不进入观察池"
-
     if deviation is not None:
-        if deviation < 0:
-            return "当前价跌破MA5，不进入待买"
-        elif deviation <= BUY_ZONE_MAX_DEVIATION_PCT:
-            return "接近5日线，盘中重点观察是否回踩不破。"
-        elif deviation <= OBSERVE_ZONE_MAX_DEVIATION_PCT:
-            return "趋势仍强，等待回踩到MA5附近。"
-        elif deviation <= HIGH_ZONE_MAX_DEVIATION_PCT:
-            return "位置偏高，不追，继续观察。"
-        return "远离5日线，不追，等后续回踩。"
+        if deviation < -MA5_TOUCH_TOLERANCE_PCT:
+            return "当前价低于MA5回踩容差下沿，盘中不进入待买"
+        if deviation <= MA5_TOUCH_TOLERANCE_PCT:
+            return "当前位于MA5工程回踩区；若处于视频买入时段且行情新鲜，可人工确认"
+        return "仍在MA5回踩区上方，继续跨日观察"
 
     return "无法计算MA5偏离率，暂不进入观察池"
 
@@ -674,16 +659,12 @@ def classify_reminder(reminder_text: str) -> str:
         return "未达规则"
     if "缓存过旧" in reminder_text or "过旧" in reminder_text:
         return "未达规则"
-    if "跌破5日线" in reminder_text or "跌破" in reminder_text:
-        return "跌破MA5"
-    if "接近5日线" in reminder_text:
-        return "待买观察"
+    if "下沿" in reminder_text:
+        return "BELOW_MA5"
+    if "回踩区" in reminder_text and "上方" not in reminder_text:
+        return "BUY_READY"
     if "等待回踩" in reminder_text:
-        return "继续观察"
-    if "位置偏高" in reminder_text:
-        return "偏高不追"
-    if "远离" in reminder_text:
-        return "远离不追"
-    if "阳线启动信号" in reminder_text or "MA5未向上" in reminder_text or "无法计算" in reminder_text:
-        return "未达规则"
-    return "未达规则"
+        return "OBSERVING"
+    if "无法计算" in reminder_text:
+        return "INITIAL_REJECTED"
+    return "OBSERVING"

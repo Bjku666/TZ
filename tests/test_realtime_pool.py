@@ -39,7 +39,7 @@ def quote_frame(count: int) -> pd.DataFrame:
 
 
 class RealtimePoolTests(TestCase):
-    def test_turnover_rank_fetches_small_pages_until_enough_main_board_candidates(self) -> None:
+    def test_turnover_rank_fetches_only_raw_requested_count(self) -> None:
         page1 = {
             "data": {
                 "total": 90,
@@ -64,10 +64,9 @@ class RealtimePoolTests(TestCase):
             frame = realtime.fetch_turnover_rank_quotes_eastmoney(limit=30, page_size=30, max_pages=3)
 
         self.assertFalse(frame.empty)
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, 1)
         self.assertEqual(request.call_args_list[0].kwargs["page"], 1)
-        self.assertEqual(request.call_args_list[1].kwargs["page"], 2)
-        self.assertIn("分页扫描 60 条", frame.attrs["message"])
+        self.assertIn("全市场原始前30", frame.attrs["message"])
 
     def test_auto_stock_pool_uses_turnover_rank_without_full_market_fallback(self) -> None:
         rank_quotes = quote_frame(30)
@@ -86,7 +85,7 @@ class RealtimePoolTests(TestCase):
         full_market.assert_not_called()
         akshare_market.assert_not_called()
 
-    def test_auto_stock_pool_does_not_generate_partial_pool(self) -> None:
+    def test_auto_stock_pool_keeps_partial_after_raw_filter_without_refill(self) -> None:
         partial_quotes = quote_frame(12)
         empty_efinance = realtime._empty_full_quotes("efinance 失败", "efinance")
         empty_fallback = realtime._empty_full_quotes("AKShare 失败", "AKShare")
@@ -99,10 +98,10 @@ class RealtimePoolTests(TestCase):
         ):
             pool = realtime.fetch_auto_stock_pool(limit=30, source="自动切换")
 
-        self.assertTrue(pool.empty)
-        self.assertIn("只获取到 12/30", pool.attrs["message"])
+        self.assertEqual(len(pool), 12)
+        self.assertEqual(pool["成交额排名"].tolist(), list(range(1, 13)))
 
-    def test_auto_stock_pool_merges_partial_sources(self) -> None:
+    def test_auto_stock_pool_does_not_merge_sources_to_refill_raw_ranking(self) -> None:
         rank_quotes = quote_frame(12)
         efinance_quotes = quote_frame(12)
         efinance_quotes["代码"] = [f"600{i:03d}" for i in range(12, 24)]
@@ -120,6 +119,6 @@ class RealtimePoolTests(TestCase):
         ):
             pool = realtime.fetch_auto_stock_pool(limit=30, source="自动切换")
 
-        self.assertEqual(len(pool), 30)
-        self.assertEqual(pool.attrs["source"], "多源合并")
-        self.assertEqual(pool["成交额排名"].tolist(), list(range(1, 31)))
+        self.assertEqual(len(pool), 12)
+        self.assertEqual(pool.attrs["source"], "东方财富")
+        self.assertEqual(pool["成交额排名"].tolist(), list(range(1, 13)))
