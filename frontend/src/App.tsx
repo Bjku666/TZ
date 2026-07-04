@@ -94,6 +94,14 @@ const DEFAULT_FEE_SETTINGS: FeeSettings = {
   ...ZERO_FEE_SETTINGS
 };
 
+const REAL_A_SHARE_FEE_SETTINGS: FeeSettings = {
+  feeProfile: "real_a_share",
+  commissionRate: 0.00025,
+  minCommission: 5,
+  stampDutyRate: 0.0005,
+  transferFeeRate: 0.00001
+};
+
 type ActivityLogEntry = {
   time: string;
   icon: string;
@@ -278,6 +286,10 @@ function feeProfileForValues(settings: FeeSettings): FeeProfile {
 function feeSettingsWithValue(settings: FeeSettings, key: keyof Omit<FeeSettings, "feeProfile">, value: number): FeeSettings {
   const next = { ...settings, [key]: value };
   return { ...next, feeProfile: feeProfileForValues(next) };
+}
+
+function feeSettingsForProfile(profile: FeeProfile): FeeSettings {
+  return profile === "ths_simulation" ? { ...DEFAULT_FEE_SETTINGS } : { ...REAL_A_SHARE_FEE_SETTINGS };
 }
 
 function feeSettingsLabel(settings: FeeSettings, mode: AccountMode): string {
@@ -1782,7 +1794,7 @@ export default function App() {
   };
 
   // 保存系统交易费用费率配置
-  const handleSaveFees = async (newFees: typeof feeSettings) => {
+  const handleSaveFees = async (newFees: typeof feeSettings, recalculateImmediately = false) => {
     try {
       const res = await fetch("/api/settings", {
         method: "POST",
@@ -1797,9 +1809,14 @@ export default function App() {
         const settings = await res.json();
         applyRuntimeSettings(settings);
         logAction(`⚙️ ${currentMode === "real" ? "实盘" : "模拟"}交易费用已更新为：${feeSettingsLabel(feeSettingsFromApi(settings), currentMode)}。`);
-        if (window.confirm("费用配置已保存。是否立即按当前费用配置重算当前账户全部历史交易费用？")) {
-          await handleRecalculateFees(true);
-          logAction(`⚙️ 已按当前费用配置重算${currentMode === "real" ? "实盘" : "模拟"}历史交易。`);
+        if (
+          recalculateImmediately ||
+          window.confirm("费用配置已保存。是否立即按当前费用配置重算当前账户全部历史交易费用？")
+        ) {
+          const recalculated = await handleRecalculateFees(true);
+          if (recalculated) {
+            logAction(`⚙️ 已按当前费用配置重算${currentMode === "real" ? "实盘" : "模拟"}历史交易。`);
+          }
         } else {
           loadAllData(true);
         }
@@ -5007,6 +5024,31 @@ export default function App() {
                   </span>
                 </div>
 
+                <div className="grid grid-cols-2 rounded border border-slate-700 bg-slate-950 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setFeeSettings(feeSettingsForProfile("ths_simulation"))}
+                    className={`px-3 py-2 text-xs font-semibold rounded transition ${
+                      feeSettings.feeProfile === "ths_simulation"
+                        ? "bg-cyan-600 text-white"
+                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                    }`}
+                  >
+                    同花顺模拟
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFeeSettings(feeSettingsForProfile("real_a_share"))}
+                    className={`px-3 py-2 text-xs font-semibold rounded transition ${
+                      feeSettings.feeProfile === "real_a_share"
+                        ? "bg-cyan-600 text-white"
+                        : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                    }`}
+                  >
+                    A股费用
+                  </button>
+                </div>
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
                     <label className="text-xs font-bold text-slate-300 block mb-1">券商佣金比例 (双向收取)</label>
@@ -5058,6 +5100,14 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-end gap-2 pt-2 border-t border-slate-800/60">
+                  <button
+                    type="button"
+                    onClick={() => handleSaveFees(feeSettingsForProfile("ths_simulation"), true)}
+                    className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-cyan-950 hover:bg-cyan-900 border border-cyan-800 text-cyan-200 rounded text-xs font-semibold transition"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    <span>一键对齐同花顺</span>
+                  </button>
                   <button
                     onClick={() => handleRecalculateFees(false)}
                     className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-slate-950 hover:bg-slate-900 border border-slate-700 text-slate-300 rounded text-xs font-semibold transition"

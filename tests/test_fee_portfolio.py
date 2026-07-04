@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from backend.main import create_app
 from backend.services import portfolio_service
 from src.data import HOLDING_COLUMNS, TRADE_COLUMNS, WATCHLIST_COLUMNS
 from src.portfolio import account_state_from_trades, build_positions_from_trades, calculate_trade_fees
@@ -68,6 +69,12 @@ def _watchlist(china_jushi_price: float = 70.9) -> pd.DataFrame:
 
 
 class FeePortfolioTests(TestCase):
+    def test_recalculate_fees_route_is_mounted_as_post(self) -> None:
+        schema = create_app().openapi()
+
+        self.assertIn("/api/trades/recalculate-fees", schema["paths"])
+        self.assertIn("post", schema["paths"]["/api/trades/recalculate-fees"])
+
     def test_simulation_zero_fee_acceptance_account_assets(self) -> None:
         trades = _acceptance_trades()
         positions = build_positions_from_trades(
@@ -145,6 +152,11 @@ class FeePortfolioTests(TestCase):
             patch.object(portfolio_service, "load_quote_snapshot", return_value=pd.DataFrame()),
             patch.object(portfolio_service, "load_last_refresh", return_value={}),
             patch.object(portfolio_service, "load_cached_history", return_value=shilan_history),
+            patch.object(
+                portfolio_service,
+                "_reference_from_quote_archives",
+                return_value=(pd.Timestamp("2026-07-02 19:55:57"), 50.5),
+            ),
             patch.object(portfolio_service, "initial_cash", return_value=10000),
         ):
             snapshot = portfolio_service.portfolio_snapshot("simulation")
@@ -155,3 +167,31 @@ class FeePortfolioTests(TestCase):
         self.assertEqual(snapshot["accountState"]["holdingValue"], 7218.72)
         self.assertEqual(snapshot["accountState"]["totalPnL"], -57.28)
         self.assertEqual(snapshot["accountState"]["todayPnL"], -242.27)
+
+    def test_today_pnl_prefers_newer_quote_archive_over_stale_history(self) -> None:
+        trades = _acceptance_trades()
+        stale_history = pd.DataFrame(
+            [
+                {"日期": "2026-06-30", "收盘": 54.66},
+                {"日期": "2026-07-01", "收盘": 53.15},
+            ]
+        )
+
+        with (
+            patch.object(portfolio_service.trade_repository, "load_trade_frame", return_value=trades),
+            patch.object(portfolio_service, "load_watchlist", return_value=_watchlist(china_jushi_price=70.9)),
+            patch.object(portfolio_service, "load_holdings", return_value=pd.DataFrame(columns=HOLDING_COLUMNS)),
+            patch.object(portfolio_service, "load_quote_snapshot", return_value=pd.DataFrame()),
+            patch.object(portfolio_service, "load_last_refresh", return_value={}),
+            patch.object(portfolio_service, "load_cached_history", return_value=stale_history),
+            patch.object(
+                portfolio_service,
+                "_reference_from_quote_archives",
+                return_value=(pd.Timestamp("2026-07-02 19:55:57"), 50.5),
+            ),
+            patch.object(portfolio_service, "initial_cash", return_value=10000),
+        ):
+            snapshot = portfolio_service.portfolio_snapshot("simulation", as_of_date="2026-07-03")
+
+        self.assertEqual(snapshot["accountState"]["totalPnL"], -186.00)
+        self.assertEqual(snapshot["accountState"]["todayPnL"], -236.00)

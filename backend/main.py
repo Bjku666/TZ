@@ -8,8 +8,8 @@ from backend.storage.sqlite_store import init_db
 from src.data import ensure_data_dir
 
 APP_NAME = "强势回踩短线交易纪律系统 API"
-APP_VERSION = "0.1.2"
-API_CONTRACT_VERSION = "trade-link-v6"
+APP_VERSION = "0.1.4"
+API_CONTRACT_VERSION = "trade-link-v8"
 
 
 def create_app() -> FastAPI:

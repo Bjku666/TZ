@@ -165,7 +165,7 @@ def _reference_from_trade_snapshots(flow: pd.DataFrame, code: str, today: date) 
     return None
 
 
-def _reference_from_history(code: str, today: date) -> float | None:
+def _reference_from_history(code: str, today: date) -> tuple[pd.Timestamp, float] | None:
     history = load_cached_history(code)
     if history is None or history.empty or "日期" not in history or "收盘" not in history:
         return None
@@ -174,10 +174,15 @@ def _reference_from_history(code: str, today: date) -> float | None:
     out = out[out["日期"].dt.date < today].dropna(subset=["日期"])
     if out.empty:
         return None
-    return _positive_number(out.iloc[-1].get("收盘"))
+    latest = out.sort_values("日期").iloc[-1]
+    price = _positive_number(latest.get("收盘"))
+    if price is None:
+        return None
+    close_timestamp = pd.Timestamp.combine(latest["日期"].date(), time.max)
+    return close_timestamp, price
 
 
-def _reference_from_quote_archives(code: str, today: date) -> float | None:
+def _reference_from_quote_archives(code: str, today: date) -> tuple[pd.Timestamp, float] | None:
     backup_dir = DATA_DIR / "backups"
     if not backup_dir.exists():
         return None
@@ -203,7 +208,7 @@ def _reference_from_quote_archives(code: str, today: date) -> float | None:
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0])
-    return candidates[-1][1]
+    return candidates[-1]
 
 
 def _opening_reference_price(
@@ -217,17 +222,29 @@ def _opening_reference_price(
     today: date,
 ) -> float:
     code = clean_code(code)
-    candidates = [
+    direct_candidates = [
         _reference_from_quote(quote_rows.get(code), today),
         _reference_from_watchlist(watchlist_rows.get(code), use_watchlist_pct),
         _reference_from_trade_snapshots(flow, code, today),
-        _reference_from_quote_archives(code, today),
+    ]
+    for value in direct_candidates:
+        if value is not None:
+            return value
+
+    dated_candidates = [
         _reference_from_history(code, today),
+        _reference_from_quote_archives(code, today),
+    ]
+    available_dated = [item for item in dated_candidates if item is not None]
+    if available_dated:
+        return max(available_dated, key=lambda item: item[0])[1]
+
+    fallback_candidates = [
         _positive_number((legacy_rows.get(code) or {}).get("当前价")),
         _positive_number(opening_row.get("平均成本")),
         _positive_number(opening_row.get("当前价")),
     ]
-    for value in candidates:
+    for value in fallback_candidates:
         if value is not None:
             return value
     return 0.0
@@ -402,14 +419,14 @@ def portfolio_snapshot(
         )
 
     account_state = {
-        "initialCash": number(state.get("初始本金")),
-        "availableCash": number(state.get("当前现金")),
-        "holdingValue": number(state.get("持仓市值")),
-        "totalAssets": number(state.get("当前总资产")),
-        "realizedPnL": number(state.get("已实现盈亏")),
-        "floatingPnL": number(state.get("浮动盈亏")),
-        "totalPnL": number(state.get("总盈亏")),
-        "totalReturnPct": number(state.get("总收益率%")),
+        "initialCash": round(number(state.get("初始本金")), 2),
+        "availableCash": round(number(state.get("当前现金")), 2),
+        "holdingValue": round(number(state.get("持仓市值")), 2),
+        "totalAssets": round(number(state.get("当前总资产")), 2),
+        "realizedPnL": round(number(state.get("已实现盈亏")), 2),
+        "floatingPnL": round(number(state.get("浮动盈亏")), 2),
+        "totalPnL": round(number(state.get("总盈亏")), 2),
+        "totalReturnPct": round(number(state.get("总收益率%")), 2),
         "todayPnL": round(today_pnl, 2),
         "todayRealizedPnL": round(today_realized_pnl, 2),
         "asOfDate": settlement_date.isoformat(),

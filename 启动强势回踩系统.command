@@ -6,8 +6,9 @@ PROJECT_DIR="/Users/lulu/Desktop/touzi"
 BACKEND_URL="http://127.0.0.1:8000"
 BACKEND_PORT="8000"
 FRONTEND_URL="http://127.0.0.1:5173"
-BACKEND_REQUIRED_CONTRACT="trade-link-v6"
+BACKEND_REQUIRED_CONTRACT="trade-link-v8"
 BACKEND_REQUIRED_ROUTES=(
+  "/api/trades/recalculate-fees"
   "/api/watchlist/scan-turnover-changes"
   "/api/watchlist/include-turnover-stock"
 )
