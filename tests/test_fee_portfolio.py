@@ -234,4 +234,8 @@ class FeePortfolioTests(TestCase):
         self.assertEqual(account["accountPnL"], -193.87)
         self.assertEqual(account["totalPnL"], -193.87)
         self.assertEqual(account["totalReturnPct"], -1.94)
-        self.assertEqual(snapshot["positions"][0]["avgCost"], 71.473)
+        position = snapshot["positions"][0]
+        self.assertEqual(position["avgCost"], 71.473)
+        self.assertEqual(position["currentPrice"], 70.900)
+        self.assertEqual(position["marketValue"], 7090.00)
+        self.assertEqual(position["floatingPnL"], -57.28)

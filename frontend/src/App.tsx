@@ -3033,12 +3033,6 @@ export default function App() {
             <span className="font-bold text-slate-100 text-[14px]">{accountState.availableCash.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
           </div>
           <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
-            <span className="text-slate-400 text-[12px]" title="当前全部持仓浮动盈亏之和；对应同花顺模拟账户的总盈亏">持仓总盈亏:</span>
-            <span className={`font-bold text-[14px] ${accountState.holdingPnL >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
-              {signedCurrency(accountState.holdingPnL)}
-            </span>
-          </div>
-          <div className="flex items-center space-x-1.5 border-r border-slate-800 pr-4 last:border-0">
             <span className="text-slate-400 text-[12px]" title={accountState.asOfDate ? `最近交易日 ${accountState.asOfDate}` : undefined}>当日参考盈亏:</span>
             <span className={`font-bold text-[14px] ${todayTotalPnLForAccount >= 0 ? "text-rose-500" : "text-emerald-500"}`}>
               {signedCurrency(todayTotalPnLForAccount)}
