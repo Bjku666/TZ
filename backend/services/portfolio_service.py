@@ -434,8 +434,9 @@ def portfolio_snapshot(
         "asOfDate": settlement_date.isoformat(),
     }
     settings = get_settings()
-    reconciliation = settings.get("thsReconciliation") or {}
-    if active_mode == "simulation" and reconciliation.get("enabled"):
+    reconciliation_key = "realThsReconciliation" if active_mode == "real" else "simulationThsReconciliation"
+    reconciliation = settings.get(reconciliation_key) or settings.get("thsReconciliation") or {}
+    if reconciliation.get("enabled"):
         discipline_capital = number(state.get("初始本金"))
         broker_capital = number(reconciliation.get("accountCapital"), 200000)
         capital_offset = broker_capital - discipline_capital

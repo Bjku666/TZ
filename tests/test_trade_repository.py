@@ -36,6 +36,52 @@ def _trade(trade_id: str, code: str = "600000") -> dict[str, object]:
 
 
 class TradeRepositoryTests(TestCase):
+    def test_real_and_simulation_trades_are_fully_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "app.db"
+            csv_path = root / "trades" / "trade_log.csv"
+
+            def load_csv() -> pd.DataFrame:
+                if not csv_path.exists():
+                    return pd.DataFrame(columns=TRADE_COLUMNS)
+                return pd.read_csv(csv_path, dtype={"代码": str}, encoding="utf-8-sig")
+
+            def save_csv(frame: pd.DataFrame) -> None:
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+            real_trade = {**_trade("T000001", "600002"), "accountMode": "实盘记录"}
+            with (
+                patch.object(sqlite_store, "DB_PATH", db_path),
+                patch.object(trade_repository, "load_csv_trades", load_csv),
+                patch.object(trade_repository, "save_csv_trades", save_csv),
+            ):
+                sqlite_store.init_db()
+                trade_repository.append_api_trade("simulation", "模拟训练", _trade("T000001", "600001"))
+                trade_repository.append_api_trade("real", "实盘记录", real_trade)
+
+                self.assertEqual(
+                    [item["code"] for item in trade_repository.list_api_trades("simulation", "模拟训练")],
+                    ["600001"],
+                )
+                self.assertEqual(
+                    [item["code"] for item in trade_repository.list_api_trades("real", "实盘记录")],
+                    ["600002"],
+                )
+
+                trade_repository.delete_all_api_trades("real", "实盘记录")
+
+                self.assertEqual(trade_repository.list_api_trades("real", "实盘记录"), [])
+                self.assertEqual(
+                    [item["code"] for item in trade_repository.list_api_trades("simulation", "模拟训练")],
+                    ["600001"],
+                )
+
+    def test_rejects_unknown_account_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不支持的账户模式"):
+            trade_repository.list_api_trades("default", "模拟训练")
+
     def test_append_delete_and_csv_mirror_use_sqlite_primary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

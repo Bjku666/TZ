@@ -87,6 +87,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ths_holding_value": 7090.0,
     "ths_holding_pnl": -57.28,
     "ths_today_pnl": -242.27,
+    "live_ths_reconciliation_enabled": False,
+    "live_ths_account_capital": 5000.0,
+    "live_ths_total_assets": 5000.0,
+    "live_ths_available_cash": 5000.0,
+    "live_ths_holding_value": 0.0,
+    "live_ths_holding_pnl": 0.0,
+    "live_ths_today_pnl": 0.0,
 }
 
 

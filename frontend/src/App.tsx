@@ -1806,7 +1806,7 @@ export default function App() {
       const res = await fetch("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ thsReconciliation })
+        body: JSON.stringify({ thsReconciliation, currentMode })
       });
       if (!res.ok) throw new Error("保存失败");
       const settings = await res.json();
@@ -5081,11 +5081,12 @@ export default function App() {
                 </div>
               </div>
 
-              {currentMode === "simulation" && (
-                <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-4">
+              <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-4">
                   <div className="flex items-center justify-between gap-3 border-b border-slate-800 pb-3">
                     <div>
-                      <h3 className="text-sm font-bold text-slate-200">同花顺对账模式</h3>
+                      <h3 className="text-sm font-bold text-slate-200">
+                        {currentMode === "real" ? "实盘同花顺对账" : "模拟同花顺对账"}
+                      </h3>
                       <CardText className="mt-1 text-[10px] text-slate-500">
                         手工录入截图数字；总资产和可用资金按纪律本金换算，市值与盈亏保持原值。
                       </CardText>
@@ -5140,7 +5141,6 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-              )}
 
               <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-4">
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2">

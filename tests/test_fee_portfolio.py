@@ -264,3 +264,38 @@ class FeePortfolioTests(TestCase):
         self.assertEqual(position["currentPrice"], 70.900)
         self.assertEqual(position["marketValue"], 7090.00)
         self.assertEqual(position["floatingPnL"], -57.28)
+
+    def test_real_ths_reconciliation_uses_independent_real_settings(self) -> None:
+        trades = pd.DataFrame(columns=TRADE_COLUMNS)
+        reconciliation_settings = {
+            "thsReconciliation": {"enabled": False},
+            "simulationThsReconciliation": {"enabled": False},
+            "realThsReconciliation": {
+                "enabled": True,
+                "accountCapital": 100000,
+                "totalAssets": 99800,
+                "availableCash": 99800,
+                "holdingValue": 0,
+                "holdingPnL": 0,
+                "todayPnL": -200,
+            },
+        }
+
+        with (
+            patch.object(portfolio_service.trade_repository, "load_trade_frame", return_value=trades),
+            patch.object(portfolio_service, "load_watchlist", return_value=pd.DataFrame(columns=WATCHLIST_COLUMNS)),
+            patch.object(portfolio_service, "load_holdings", return_value=pd.DataFrame(columns=HOLDING_COLUMNS)),
+            patch.object(portfolio_service, "load_quote_snapshot", return_value=pd.DataFrame()),
+            patch.object(portfolio_service, "load_last_refresh", return_value={}),
+            patch.object(portfolio_service, "initial_cash", return_value=5000),
+            patch.object(portfolio_service, "get_settings", return_value=reconciliation_settings),
+        ):
+            snapshot = portfolio_service.portfolio_snapshot("real")
+
+        account = snapshot["accountState"]
+        self.assertEqual(account["totalAssets"], 4800.00)
+        self.assertEqual(account["availableCash"], 4800.00)
+        self.assertEqual(account["accountPnL"], -200.00)
+        self.assertEqual(account["totalReturnPct"], -4.00)
+        self.assertEqual(account["todayPnL"], -200.00)
+        self.assertTrue(account["reconciliationMode"])

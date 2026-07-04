@@ -16,6 +16,14 @@ from backend.storage.csv_adapter import (
     trades_to_api,
 )
 
+SUPPORTED_MODES = {"simulation", "real"}
+
+
+def _validated_mode(mode: str) -> str:
+    if mode not in SUPPORTED_MODES:
+        raise ValueError(f"不支持的账户模式: {mode}")
+    return mode
+
 
 def _trade_frame_from_api(api_trades: list[dict[str, Any]], mode_name: str | None = None) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
@@ -48,6 +56,7 @@ def _trade_frame_from_api(api_trades: list[dict[str, Any]], mode_name: str | Non
 
 
 def _bootstrap_mode_from_csv(mode_name: str, sqlite_mode: str) -> list[dict[str, Any]]:
+    sqlite_mode = _validated_mode(sqlite_mode)
     csv_frame = ensure_trade_frame(load_csv_trades())
     mode_frame = csv_frame[csv_frame["账户模式"].map(trade_account_mode_name) == mode_name].reset_index(drop=True)
     api_trades = trades_to_api(mode_frame)
@@ -57,31 +66,37 @@ def _bootstrap_mode_from_csv(mode_name: str, sqlite_mode: str) -> list[dict[str,
 
 
 def ensure_mode_loaded(mode: str, mode_name: str) -> None:
+    mode = _validated_mode(mode)
     if not sqlite_store.has_trades(mode):
         _bootstrap_mode_from_csv(mode_name, mode)
 
 
 def list_api_trades(mode: str, mode_name: str) -> list[dict[str, Any]]:
+    mode = _validated_mode(mode)
     if not sqlite_store.has_trades(mode):
         return _bootstrap_mode_from_csv(mode_name, mode)
     return sqlite_store.list_trades(mode)
 
 
 def load_trade_frame(mode: str, mode_name: str) -> pd.DataFrame:
+    mode = _validated_mode(mode)
     return _trade_frame_from_api(list_api_trades(mode, mode_name), mode_name)
 
 
 def next_trade_id(mode: str, mode_name: str) -> str:
+    mode = _validated_mode(mode)
     ensure_mode_loaded(mode, mode_name)
     return sqlite_store.next_trade_id(mode)
 
 
 def save_api_trades(mode: str, mode_name: str, api_trades: list[dict[str, Any]]) -> None:
+    mode = _validated_mode(mode)
     sqlite_store.replace_trades(mode, api_trades_for_sqlite(api_trades))
     sync_csv_mode(mode, mode_name)
 
 
 def append_api_trade(mode: str, mode_name: str, api_trade: dict[str, Any]) -> None:
+    mode = _validated_mode(mode)
     ensure_mode_loaded(mode, mode_name)
     sqlite_row = api_trades_for_sqlite([api_trade])[0]
     sqlite_store.upsert_trade(mode, sqlite_row)
@@ -89,6 +104,7 @@ def append_api_trade(mode: str, mode_name: str, api_trade: dict[str, Any]) -> No
 
 
 def delete_api_trade(mode: str, mode_name: str, trade_id: str) -> None:
+    mode = _validated_mode(mode)
     ensure_mode_loaded(mode, mode_name)
     remaining: list[dict[str, Any]] = []
     deleted = False
@@ -105,12 +121,14 @@ def delete_api_trade(mode: str, mode_name: str, trade_id: str) -> None:
 
 
 def delete_all_api_trades(mode: str, mode_name: str) -> None:
+    mode = _validated_mode(mode)
     ensure_mode_loaded(mode, mode_name)
     sqlite_store.delete_trades(mode)
     sync_csv_mode(mode, mode_name)
 
 
 def recalculate_api_trade_fees(mode: str, mode_name: str, fee_settings: dict[str, Any]) -> list[dict[str, Any]]:
+    mode = _validated_mode(mode)
     frame = load_trade_frame(mode, mode_name).reset_index(drop=True)
     if frame.empty:
         save_api_trades(mode, mode_name, [])
@@ -130,6 +148,7 @@ def recalculate_api_trade_fees(mode: str, mode_name: str, fee_settings: dict[str
 
 
 def sync_csv_mode(mode: str, mode_name: str) -> None:
+    mode = _validated_mode(mode)
     current = ensure_trade_frame(load_csv_trades())
     other_modes = current[current["账户模式"].map(trade_account_mode_name) != mode_name].reset_index(drop=True)
     mode_frame = _trade_frame_from_api(sqlite_store.list_trades(mode), mode_name)

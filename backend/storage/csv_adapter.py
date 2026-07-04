@@ -117,6 +117,8 @@ def frontend_settings(settings: dict[str, Any]) -> dict[str, Any]:
     active_fees = mode_fee_settings(settings, current_mode)
     simulation_fees = mode_fee_settings(settings, "simulation")
     real_fees = mode_fee_settings(settings, "real")
+    simulation_reconciliation = _reconciliation_from_settings(settings, "simulation")
+    real_reconciliation = _reconciliation_from_settings(settings, "real")
     return {
         **settings,
         "initialCash": number(settings.get("simulation_capital"), 10000),
@@ -145,15 +147,24 @@ def frontend_settings(settings: dict[str, Any]) -> dict[str, Any]:
             "stampDutyRate": real_fees["stamp_tax_rate"],
             "transferFeeRate": real_fees["transfer_fee_rate"],
         },
-        "thsReconciliation": {
-            "enabled": bool(settings.get("ths_reconciliation_enabled", False)),
-            "accountCapital": number(settings.get("ths_account_capital"), 200000),
-            "totalAssets": number(settings.get("ths_total_assets"), 199806.13),
-            "availableCash": number(settings.get("ths_available_cash"), 192716.13),
-            "holdingValue": number(settings.get("ths_holding_value"), 7090),
-            "holdingPnL": number(settings.get("ths_holding_pnl"), -57.28),
-            "todayPnL": number(settings.get("ths_today_pnl"), -242.27),
-        },
+        "thsReconciliation": real_reconciliation if current_mode == "real" else simulation_reconciliation,
+        "simulationThsReconciliation": simulation_reconciliation,
+        "realThsReconciliation": real_reconciliation,
+    }
+
+
+def _reconciliation_from_settings(settings: dict[str, Any], mode: str) -> dict[str, Any]:
+    is_real = mode == "real"
+    prefix = "live_ths" if is_real else "ths"
+    default_capital = number(settings.get("live_capital"), 5000) if is_real else 200000
+    return {
+        "enabled": bool(settings.get(f"{prefix}_reconciliation_enabled", False)),
+        "accountCapital": number(settings.get(f"{prefix}_account_capital"), default_capital),
+        "totalAssets": number(settings.get(f"{prefix}_total_assets"), default_capital),
+        "availableCash": number(settings.get(f"{prefix}_available_cash"), default_capital),
+        "holdingValue": number(settings.get(f"{prefix}_holding_value"), 0 if is_real else 7090),
+        "holdingPnL": number(settings.get(f"{prefix}_holding_pnl"), 0 if is_real else -57.28),
+        "todayPnL": number(settings.get(f"{prefix}_today_pnl"), 0 if is_real else -242.27),
     }
 
 
@@ -167,17 +178,21 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
         out["live_capital"] = number(updates["realInitialCash"], number(current.get("live_capital"), 5000))
     if isinstance(updates.get("thsReconciliation"), dict):
         reconciliation = updates["thsReconciliation"]
-        out["ths_reconciliation_enabled"] = bool(reconciliation.get("enabled", False))
-        for api_key, internal_key, default in (
-            ("accountCapital", "ths_account_capital", 200000),
-            ("totalAssets", "ths_total_assets", 199806.13),
-            ("availableCash", "ths_available_cash", 192716.13),
-            ("holdingValue", "ths_holding_value", 7090),
-            ("holdingPnL", "ths_holding_pnl", -57.28),
-            ("todayPnL", "ths_today_pnl", -242.27),
+        reconciliation_mode = updates.get("currentMode") or api_mode_from_account_mode(out.get("account_mode"))
+        is_real = reconciliation_mode == "real"
+        prefix = "live_ths" if is_real else "ths"
+        default_capital = number(out.get("live_capital"), 5000) if is_real else 200000
+        out[f"{prefix}_reconciliation_enabled"] = bool(reconciliation.get("enabled", False))
+        for api_key, suffix, default in (
+            ("accountCapital", "account_capital", default_capital),
+            ("totalAssets", "total_assets", default_capital),
+            ("availableCash", "available_cash", default_capital),
+            ("holdingValue", "holding_value", 0 if is_real else 7090),
+            ("holdingPnL", "holding_pnl", 0 if is_real else -57.28),
+            ("todayPnL", "today_pnl", 0 if is_real else -242.27),
         ):
             if api_key in reconciliation:
-                out[internal_key] = number(reconciliation[api_key], default)
+                out[f"{prefix}_{suffix}"] = number(reconciliation[api_key], default)
 
     mode_for_fee = updates.get("currentMode") or api_mode_from_account_mode(out.get("account_mode"))
     fee_prefix = fee_prefix_for_mode(mode_for_fee)
