@@ -182,41 +182,50 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
         out["simulation_capital"] = number(updates["initialCash"], number(current.get("simulation_capital"), 10000))
     if "realInitialCash" in updates:
         out["live_capital"] = number(updates["realInitialCash"], number(current.get("live_capital"), 5000))
+
+    direct_reconciliation_keys = {
+        "simulation": "simulationThsReconciliation",
+        "real": "realThsReconciliation",
+    }
+    for reconciliation_mode, key in direct_reconciliation_keys.items():
+        if isinstance(updates.get(key), dict):
+            _apply_reconciliation_settings(out, reconciliation_mode, updates[key])
+
     if isinstance(updates.get("thsReconciliation"), dict):
         reconciliation = updates["thsReconciliation"]
         reconciliation_mode = updates.get("currentMode") or api_mode_from_account_mode(out.get("account_mode"))
-        is_real = reconciliation_mode == "real"
-        prefix = "live_ths" if is_real else "ths"
-        default_capital = number(out.get("live_capital"), 5000) if is_real else 200000
-        out[f"{prefix}_reconciliation_enabled"] = bool(reconciliation.get("enabled", False))
-        for api_key, suffix, default in (
-            ("accountCapital", "account_capital", default_capital),
-            ("totalAssets", "total_assets", default_capital),
-            ("availableCash", "available_cash", default_capital),
-            ("holdingValue", "holding_value", 0 if is_real else 7090),
-            ("holdingPnL", "holding_pnl", 0 if is_real else -57.28),
-            ("todayPnL", "today_pnl", 0 if is_real else -242.27),
-        ):
-            if api_key in reconciliation:
-                out[f"{prefix}_{suffix}"] = number(reconciliation[api_key], default)
+        direct_key = direct_reconciliation_keys["real" if reconciliation_mode == "real" else "simulation"]
+        if not isinstance(updates.get(direct_key), dict):
+            _apply_reconciliation_settings(out, reconciliation_mode, reconciliation)
+
+    direct_fee_keys = {
+        "simulation": "simulationFees",
+        "real": "realFees",
+    }
+    for fee_mode, key in direct_fee_keys.items():
+        if isinstance(updates.get(key), dict):
+            _apply_fee_settings(out, fee_mode, updates[key])
 
     mode_for_fee = updates.get("currentMode") or api_mode_from_account_mode(out.get("account_mode"))
     fee_prefix = fee_prefix_for_mode(mode_for_fee)
+    direct_fee_key = direct_fee_keys["real" if mode_for_fee == "real" else "simulation"]
+    direct_fee_update_for_active_mode = isinstance(updates.get(direct_fee_key), dict)
     explicit_profile_update = "feeProfile" in updates or "fee_profile" in updates
     fee_value_update = any(api_key in updates for api_key in FEE_API_ALIASES)
-    if explicit_profile_update and not fee_value_update:
+    if explicit_profile_update and not fee_value_update and not direct_fee_update_for_active_mode:
         profile = normalize_fee_profile(updates.get("feeProfile", updates.get("fee_profile")), fee_prefix)
         out[f"{fee_prefix}_fee_profile"] = profile
         defaults = fee_defaults_for_profile(profile)
         for internal_key, default in defaults.items():
             out[f"{fee_prefix}_{internal_key}"] = number(updates.get(_api_key_for_fee(internal_key)), default)
 
-    for api_key, internal_key in FEE_API_ALIASES.items():
-        if api_key in updates:
-            default = FEE_DEFAULTS[internal_key]
-            mode_key = f"{fee_prefix}_{internal_key}"
-            out[mode_key] = number(updates[api_key], number(current.get(mode_key), default))
-    if fee_value_update:
+    if not direct_fee_update_for_active_mode:
+        for api_key, internal_key in FEE_API_ALIASES.items():
+            if api_key in updates:
+                default = FEE_DEFAULTS[internal_key]
+                mode_key = f"{fee_prefix}_{internal_key}"
+                out[mode_key] = number(updates[api_key], number(current.get(mode_key), default))
+    if fee_value_update and not direct_fee_update_for_active_mode:
         out[f"{fee_prefix}_fee_profile"] = normalize_fee_profile(
             updates.get("feeProfile", updates.get("fee_profile", FEE_PROFILE_CUSTOM)),
             fee_prefix,
@@ -230,6 +239,34 @@ def settings_from_frontend(current: dict[str, Any], updates: dict[str, Any]) -> 
             FEE_DEFAULTS[internal_key],
         )
     return out
+
+
+def _apply_reconciliation_settings(out: dict[str, Any], mode: Any, reconciliation: dict[str, Any]) -> None:
+    reconciliation_mode = "real" if str(mode or "").strip() in {"real", "live", "实盘记录"} else "simulation"
+    is_real = reconciliation_mode == "real"
+    prefix = "live_ths" if is_real else "ths"
+    default_capital = number(out.get("live_capital"), 5000) if is_real else 200000
+    out[f"{prefix}_reconciliation_enabled"] = bool(reconciliation.get("enabled", False))
+    for api_key, suffix, default in (
+        ("accountCapital", "account_capital", default_capital),
+        ("totalAssets", "total_assets", default_capital),
+        ("availableCash", "available_cash", default_capital),
+        ("holdingValue", "holding_value", 0 if is_real else 7090),
+        ("holdingPnL", "holding_pnl", 0 if is_real else -57.28),
+        ("todayPnL", "today_pnl", 0 if is_real else -242.27),
+    ):
+        if api_key in reconciliation:
+            out[f"{prefix}_{suffix}"] = number(reconciliation[api_key], default)
+
+
+def _apply_fee_settings(out: dict[str, Any], mode: Any, fees: dict[str, Any]) -> None:
+    fee_prefix = fee_prefix_for_mode(mode)
+    profile = normalize_fee_profile(fees.get("feeProfile", fees.get("fee_profile", FEE_PROFILE_CUSTOM)), fee_prefix)
+    out[f"{fee_prefix}_fee_profile"] = profile
+    defaults = fee_defaults_for_profile(profile)
+    for api_key, internal_key in FEE_API_ALIASES.items():
+        if api_key in fees:
+            out[f"{fee_prefix}_{internal_key}"] = number(fees[api_key], defaults[internal_key])
 
 
 def _api_key_for_fee(internal_key: str) -> str:

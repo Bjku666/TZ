@@ -1,14 +1,17 @@
 import { useEffect, useState, useRef } from "react";
-import { KLinePoint } from "../types";
+import { KLinePoint, TradeLog } from "../types";
 import { TrendingUp, AlertTriangle } from "lucide-react";
 
 interface KLineChartProps {
   code: string;
   name: string;
   onClose?: () => void;
+  selectionDate?: string;
+  touchDate?: string;
+  trades?: TradeLog[];
 }
 
-export default function KLineChart({ code, name }: KLineChartProps) {
+export default function KLineChart({ code, name, selectionDate, touchDate, trades = [] }: KLineChartProps) {
   const [klines, setKlines] = useState<KLinePoint[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -40,10 +43,10 @@ export default function KLineChart({ code, name }: KLineChartProps) {
 
   if (loading) {
     return (
-      <div className="flex h-72 items-center justify-center rounded-lg border border-slate-200 bg-white shadow-sm">
+      <div className="flex h-72 items-center justify-center rounded border border-slate-800 bg-slate-950 shadow-sm">
         <div className="text-center text-slate-500">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-500 mx-auto mb-2"></div>
-          <p className="text-xs">加载 K 线数据中...</p>
+          <p className="text-xs text-slate-500">加载 K 线数据中...</p>
         </div>
       </div>
     );
@@ -51,9 +54,9 @@ export default function KLineChart({ code, name }: KLineChartProps) {
 
   if (error || klines.length === 0) {
     return (
-      <div className="flex flex-col h-72 items-center justify-center rounded-lg border border-slate-200 bg-white p-4 text-center text-slate-500 shadow-sm">
+      <div className="flex flex-col h-72 items-center justify-center rounded border border-slate-800 bg-slate-950 p-4 text-center text-slate-500 shadow-sm">
         <AlertTriangle className="h-8 w-8 text-amber-500 mb-2" />
-        <p className="text-sm font-medium text-slate-900">{error || "缺少历史K线数据"}</p>
+        <p className="text-sm font-medium text-slate-200">{error || "缺少历史K线数据"}</p>
         <p className="text-xs text-slate-500 mt-1">代码: {code} | 名称: {name}</p>
         <button
           onClick={() => {
@@ -69,7 +72,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
               .catch(() => setError("下载历史数据失败"))
               .finally(() => setLoading(false));
           }}
-          className="mt-4 px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded transition shadow-sm"
+          className="mt-4 rounded bg-cyan-600 px-3 py-1.5 text-xs font-bold text-white shadow-sm transition hover:bg-cyan-500"
         >
           立即下载历史 K 线
         </button>
@@ -128,6 +131,16 @@ export default function KLineChart({ code, name }: KLineChartProps) {
   const ma5Path = generateLinePath('ma5');
   const ma10Path = generateLinePath('ma10');
   const ma20Path = generateLinePath('ma20');
+  const dateIndex = (value?: string) => {
+    if (!value) return -1;
+    const date = value.slice(0, 10);
+    return klines.findIndex(k => k.date.slice(0, 10) === date);
+  };
+  const selectionIndex = dateIndex(selectionDate);
+  const touchIndex = dateIndex(touchDate);
+  const tradeMarkers = trades
+    .map(trade => ({ trade, index: dateIndex(trade.date) }))
+    .filter(item => item.index >= 0);
 
   // 当前 hover 或最新的点
   const activeIndex = hoveredIndex === null ? count - 1 : clampIndex(hoveredIndex);
@@ -165,12 +178,12 @@ export default function KLineChart({ code, name }: KLineChartProps) {
   ];
 
   return (
-    <div className="rounded-lg border border-slate-200 bg-white p-4 font-sans text-slate-900 shadow-sm select-none">
+    <div className="select-none rounded border border-slate-800 bg-slate-950 p-4 font-sans text-slate-200 shadow-sm">
       {/* 头部信息 */}
-      <div className="mb-3 space-y-2 overflow-hidden border-b border-slate-200 pb-3">
+      <div className="mb-3 space-y-2 overflow-hidden border-b border-slate-800 pb-3">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="shrink-0 whitespace-nowrap text-base font-bold text-slate-900">{name}</span>
-          <span className="shrink-0 whitespace-nowrap rounded border border-slate-200 bg-slate-50 px-2 py-0.5 font-mono text-xs text-slate-500">{code}</span>
+          <span className="shrink-0 whitespace-nowrap text-base font-bold text-slate-100">{name}</span>
+          <span className="shrink-0 whitespace-nowrap rounded border border-slate-800 bg-slate-900 px-2 py-0.5 font-mono text-xs text-slate-500">{code}</span>
         </div>
         {activePoint && (
           <dl
@@ -180,7 +193,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
             {quoteMetrics.map(metric => (
               <div key={metric.label} className="flex min-w-0 items-baseline gap-1">
                 <dt className="shrink-0 text-slate-500">{metric.label}:</dt>
-                <dd className={`min-w-0 truncate font-semibold ${metric.valueClassName || "text-slate-700"}`}>
+                <dd className={`min-w-0 truncate font-semibold ${metric.valueClassName || "text-slate-300"}`}>
                   {metric.value}
                 </dd>
               </div>
@@ -217,9 +230,9 @@ export default function KLineChart({ code, name }: KLineChartProps) {
         {/* K线主图 */}
         <svg viewBox={`0 0 ${svgWidth} ${klineSvgHeight}`} className="w-full h-auto">
           {/* 背景网格线 */}
-          <line x1={padding.left} y1={getY(minPrice)} x2={svgWidth - padding.right} y2={getY(minPrice)} stroke="#e5e7eb" strokeDasharray="2,2" />
-          <line x1={padding.left} y1={getY((maxPrice + minPrice) / 2)} x2={svgWidth - padding.right} y2={getY((maxPrice + minPrice) / 2)} stroke="#e5e7eb" strokeDasharray="2,2" />
-          <line x1={padding.left} y1={getY(maxPrice)} x2={svgWidth - padding.right} y2={getY(maxPrice)} stroke="#e5e7eb" strokeDasharray="2,2" />
+          <line x1={padding.left} y1={getY(minPrice)} x2={svgWidth - padding.right} y2={getY(minPrice)} stroke="#2b2b2b" strokeDasharray="2,2" />
+          <line x1={padding.left} y1={getY((maxPrice + minPrice) / 2)} x2={svgWidth - padding.right} y2={getY((maxPrice + minPrice) / 2)} stroke="#2b2b2b" strokeDasharray="2,2" />
+          <line x1={padding.left} y1={getY(maxPrice)} x2={svgWidth - padding.right} y2={getY(maxPrice)} stroke="#2b2b2b" strokeDasharray="2,2" />
 
           {/* 价格 Y 轴刻度 */}
           <text x={padding.left - 8} y={getY(maxPrice) + 4} textAnchor="end" className="text-[10px] font-mono fill-slate-500">{maxPrice.toFixed(2)}</text>
@@ -259,6 +272,25 @@ export default function KLineChart({ code, name }: KLineChartProps) {
           {ma10Path && <path d={ma10Path} fill="none" stroke="#0891b2" strokeWidth={1.5} />}
           {ma20Path && <path d={ma20Path} fill="none" stroke="#db2777" strokeWidth={1.5} />}
 
+          {selectionIndex >= 0 && (
+            <g>
+              <line x1={getX(selectionIndex)} y1={padding.top} x2={getX(selectionIndex)} y2={klineSvgHeight - padding.bottom} stroke="#38bdf8" strokeWidth={1} strokeDasharray="4,3" />
+              <text x={getX(selectionIndex) + 3} y={padding.top + 10} className="fill-cyan-300 font-mono text-[9px]">入选</text>
+            </g>
+          )}
+          {touchIndex >= 0 && (
+            <g>
+              <line x1={getX(touchIndex)} y1={padding.top} x2={getX(touchIndex)} y2={klineSvgHeight - padding.bottom} stroke="#f59e0b" strokeWidth={1} strokeDasharray="4,3" />
+              <text x={getX(touchIndex) + 3} y={padding.top + 22} className="fill-amber-300 font-mono text-[9px]">回踩</text>
+            </g>
+          )}
+          {tradeMarkers.map(({ trade, index }) => (
+            <g key={`${trade.id}_${index}`}>
+              <circle cx={getX(index)} cy={getY(trade.price)} r={3.5} fill={trade.type === "BUY" ? "#e11d48" : "#10b981"} />
+              <text x={getX(index) + 4} y={getY(trade.price) - 4} className="fill-slate-300 font-mono text-[9px]">{trade.type === "BUY" ? "B" : "S"}</text>
+            </g>
+          ))}
+
           {/* Hover 十字竖线 */}
           {hoveredIndex !== null && (
             <line
@@ -274,7 +306,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
         </svg>
 
         {/* 交易量主图 */}
-        <div className="my-1 border-t border-slate-200"></div>
+        <div className="my-1 border-t border-slate-800"></div>
         <svg viewBox={`0 0 ${svgWidth} ${volSvgHeight}`} className="w-full h-auto">
           {/* 量柱子 */}
           {klines.map((k, i) => {
@@ -332,7 +364,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
 
       <div className="mt-2 flex items-center justify-center space-x-1 text-center font-mono text-[10px] text-slate-500">
         <TrendingUp className="h-3 w-3 text-rose-400" />
-        <span>支持鼠标悬停查看每根日K线细节与均线信息。MA5回踩容差采用后端规则配置。</span>
+        <span>支持鼠标悬停查看日K、均线、入选日、回踩提示和买卖记录标记。</span>
       </div>
     </div>
   );

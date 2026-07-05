@@ -7,6 +7,7 @@ import pandas as pd
 
 from backend.main import create_app
 from backend.services import portfolio_service
+from backend.storage.csv_adapter import frontend_settings, settings_from_frontend
 from backend.storage import trade_repository
 from src.data import HOLDING_COLUMNS, TRADE_COLUMNS, WATCHLIST_COLUMNS
 from src.portfolio import account_state_from_trades, build_positions_from_trades, calculate_trade_fees
@@ -301,3 +302,78 @@ class FeePortfolioTests(TestCase):
         self.assertEqual(account["totalReturnPct"], -4.00)
         self.assertEqual(account["todayPnL"], -200.00)
         self.assertTrue(account["reconciliationMode"])
+
+    def test_settings_update_keeps_simulation_and_real_reconciliation_separate(self) -> None:
+        current = normalize_settings({})
+        merged = settings_from_frontend(
+            current,
+            {
+                "currentMode": "real",
+                "thsReconciliation": {
+                    "enabled": True,
+                    "accountCapital": 11111,
+                    "totalAssets": 11111,
+                    "availableCash": 11111,
+                    "holdingValue": 0,
+                    "holdingPnL": 0,
+                    "todayPnL": 0,
+                },
+                "simulationThsReconciliation": {
+                    "enabled": True,
+                    "accountCapital": 200000,
+                    "totalAssets": 199800,
+                    "availableCash": 192700,
+                    "holdingValue": 7100,
+                    "holdingPnL": -60,
+                    "todayPnL": -240,
+                },
+                "realThsReconciliation": {
+                    "enabled": True,
+                    "accountCapital": 5000,
+                    "totalAssets": 5100,
+                    "availableCash": 5100,
+                    "holdingValue": 0,
+                    "holdingPnL": 0,
+                    "todayPnL": 100,
+                },
+            },
+        )
+        api_settings = frontend_settings(merged)
+
+        self.assertEqual(api_settings["currentMode"], "real")
+        self.assertEqual(api_settings["thsReconciliation"]["accountCapital"], 5000)
+        self.assertEqual(api_settings["realThsReconciliation"]["todayPnL"], 100)
+        self.assertEqual(api_settings["simulationThsReconciliation"]["accountCapital"], 200000)
+        self.assertEqual(api_settings["simulationThsReconciliation"]["todayPnL"], -240)
+
+    def test_settings_update_keeps_simulation_and_real_fee_profiles_separate(self) -> None:
+        current = normalize_settings({})
+        merged = settings_from_frontend(
+            current,
+            {
+                "currentMode": "real",
+                "commissionRate": 0.00999,
+                "minCommission": 99,
+                "simulationFees": {
+                    "feeProfile": "ths_simulation",
+                    "commissionRate": 0.00031,
+                    "minCommission": 0,
+                    "stampDutyRate": 0.0005,
+                    "transferFeeRate": 0.00001,
+                },
+                "realFees": {
+                    "feeProfile": "real_a_share",
+                    "commissionRate": 0.00025,
+                    "minCommission": 5,
+                    "stampDutyRate": 0.0005,
+                    "transferFeeRate": 0.00001,
+                },
+            },
+        )
+        api_settings = frontend_settings(merged)
+
+        self.assertEqual(api_settings["currentMode"], "real")
+        self.assertEqual(api_settings["commissionRate"], 0.00025)
+        self.assertEqual(api_settings["minCommission"], 5)
+        self.assertEqual(api_settings["realFees"]["commissionRate"], 0.00025)
+        self.assertEqual(api_settings["simulationFees"]["commissionRate"], 0.00031)

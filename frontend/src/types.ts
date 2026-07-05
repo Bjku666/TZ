@@ -1,3 +1,5 @@
+export type AccountMode = "simulation" | "real";
+
 export type CandidateState =
   | "INITIAL_SCREENED"
   | "INITIAL_REJECTED"
@@ -12,9 +14,29 @@ export type CandidateState =
   | "DEFERRED_TO_AFTERNOON"
   | "AFTERNOON_EXIT_DUE"
   | "LIMIT_UP_HOLD"
+  | "LIMIT_UP_OPENED_EXIT_DUE"
   | "CLOSED"
   | "INVALIDATED"
   | "CANCELLED";
+
+export type MarketPhase =
+  | "pre_market"
+  | "trading"
+  | "lunch_break"
+  | "after_close"
+  | "weekend"
+  | "holiday"
+  | "unknown";
+
+export interface HealthPayload {
+  status: string;
+  version: string;
+  contract: string;
+  gitCommit: string;
+  buildTime: string;
+  serverTime: string;
+  timezone: string;
+}
 
 export interface RuleConfig {
   strategyName: string;
@@ -45,8 +67,8 @@ export interface SelectionItem {
   name: string;
   rawRank: number;
   turnover: number;
-  closePrice: number;
-  ma5Close: number;
+  closePrice: number | null;
+  ma5Close: number | null;
   marketAllowed: boolean;
   exclusionReason: string;
   aboveMa5: boolean;
@@ -65,45 +87,43 @@ export interface Candidate {
   eligibleFrom: string;
   state: CandidateState;
   waitingTradeDays: number;
-  lastClose: number;
-  lastMa5Close: number;
-  lastLivePrice: number;
-  lastMa5Live: number;
-  lastDeviation: number;
-  touchStartedAt?: string;
-  touchDetectedAt?: string;
-  boughtTradeId?: string;
-  invalidatedReason?: string;
-  createdAt?: string;
-  updatedAt?: string;
+  lastClose: number | null;
+  lastMa5Close: number | null;
+  lastLivePrice: number | null;
+  lastMa5Live: number | null;
+  lastDeviation: number | null;
+  touchStartedAt?: string | null;
+  touchDetectedAt?: string | null;
+  boughtTradeId?: string | null;
+  invalidatedReason?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  signalQualified?: boolean | null;
+  signalReason?: string;
+  executionAllowed?: boolean | null;
+  executionBlockReasons?: string[];
+  manualConfirmationRequired?: boolean;
+  maxBuyableLotQuantity?: number;
 }
 
-export interface Stock {
-  code: string;
-  name: string;
-  price: number;
-  pct: number;
-  volume: number;
-  rank: number;
-  ma5: number;
-  ma10?: number;
-  ma20?: number;
-  deviation5: number;
-  signalQualified: boolean;
-  signalReason: string;
-  executionAllowed: boolean;
-  executionBlockReasons: string[];
-  manualConfirmationRequired: boolean;
-  maxBuyableLotQuantity?: number;
-  group: "初筛" | "观察" | "待买";
-  stage: CandidateState | string;
-  reason: string;
-  reminder: string;
-  lastUpdated: string;
-  poolBatchId?: string;
-  poolSource?: string;
-  poolGeneratedAt?: string;
-  poolRankAtGeneration?: number;
+export interface CandidateEvent {
+  id?: string;
+  candidate_id?: string;
+  event_type?: string;
+  eventTime?: string;
+  event_time?: string;
+  tradeDate?: string;
+  trade_date?: string;
+  price?: number;
+  ma5?: number;
+  deviation?: number;
+  quoteTime?: string;
+  quote_time?: string;
+  quoteAgeSeconds?: number;
+  quote_age_seconds?: number;
+  source?: string;
+  reason?: string;
+  payload?: Record<string, unknown>;
 }
 
 export interface Position {
@@ -120,7 +140,7 @@ export interface Position {
   valuationDate: string;
   nextSellableTradeDate: string;
   nextActionTime: string;
-  marketPhase: string;
+  marketPhase: MarketPhase | string;
   canExecuteSellNow: boolean;
   sellBlockedReason: string;
   avgCost: number;
@@ -128,10 +148,14 @@ export interface Position {
   marketValue: number;
   floatingPnL: number;
   floatingPnLPct: number;
+  ma5: number;
+  deviation5: number;
+  holdDays: number;
+  belowMa5Days: number;
   buyDate: string;
   advice: string;
   riskLevel: "normal" | "warning" | "danger";
-  originalExitState?: CandidateState;
+  originalExitState?: CandidateState | string;
   originalExitMessage?: string;
   nextOriginalActionTime?: string;
   isLimitUp?: boolean;
@@ -140,6 +164,28 @@ export interface Position {
   executionBlockReason?: string;
   originalRuleViolation?: boolean;
   programCompletionNote?: string;
+  tradeLink?: StockTradeLink;
+}
+
+export interface TradeRuleSnapshot {
+  candidateCycleId?: string;
+  selectionBatchId?: string;
+  selectionDate?: string;
+  eligibleFrom?: string;
+  tradeDateTime?: string;
+  tradePrice?: number;
+  ma5Live?: number;
+  deviation?: number;
+  buyWindow?: string;
+  quoteAgeSeconds?: number;
+  signalQualified?: boolean;
+  executionAllowed?: boolean;
+  executionBlockReasons?: string[];
+  manualConfirmationRequired?: boolean;
+  marketInfoNote?: string;
+  ruleBoundaryNote?: string;
+  positionBeforeTrade?: Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export interface TradeLog {
@@ -160,7 +206,7 @@ export interface TradeLog {
   remark: string;
   rulesConclusion: "符合规则" | "违规交易" | "部分不符" | "其他";
   violationTags: string[];
-  snapshot: Record<string, unknown>;
+  snapshot: TradeRuleSnapshot | Record<string, unknown>;
 }
 
 export interface AccountState {
@@ -170,11 +216,15 @@ export interface AccountState {
   totalAssets: number;
   realizedPnL: number;
   floatingPnL: number;
+  holdingPnL?: number;
   totalPnL: number;
+  accountPnL?: number;
   totalReturnPct: number;
   todayPnL?: number;
   todayRealizedPnL?: number;
   asOfDate?: string;
+  operationDate?: string;
+  valuationDate?: string;
   reconciliationMode?: boolean;
 }
 
@@ -187,8 +237,10 @@ export interface TurnoverChangeStock {
   currentRank?: number | null;
   volume?: number;
   price?: number;
+  pct?: number;
   marketAllowed?: boolean;
   exclusionReason?: string;
+  isPinned?: boolean;
 }
 
 export interface TurnoverChanges {
@@ -196,6 +248,11 @@ export interface TurnoverChanges {
   dropped: TurnoverChangeStock[];
   rankUp: TurnoverChangeStock[];
   rankDown: TurnoverChangeStock[];
+}
+
+export interface IntradayPreview {
+  items: TurnoverChangeStock[];
+  changes: TurnoverChanges;
 }
 
 export interface WorkbenchPayload {
@@ -209,6 +266,133 @@ export interface WorkbenchPayload {
   sourceHealth?: unknown;
   durationMs?: number;
   message?: string;
+  requestId?: string;
+  source?: string;
+  isStale?: boolean;
+  dataAgeSeconds?: number;
+  quoteFreshnessSeconds?: number;
+  serverTime?: string;
+  success?: boolean;
+  inProgress?: boolean;
+  intradayPreview?: IntradayPreview;
+}
+
+export interface Stock {
+  code: string;
+  name: string;
+  price: number;
+  pct: number;
+  volume: number;
+  rank: number;
+  ma5: number;
+  ma10?: number;
+  ma20?: number;
+  deviation5: number;
+  signalQualified?: boolean;
+  signalReason?: string;
+  executionAllowed?: boolean;
+  executionBlockReasons?: string[];
+  manualConfirmationRequired?: boolean;
+  maxBuyableLotQuantity?: number;
+  group: "初筛" | "观察" | "待买";
+  stage: CandidateState | string;
+  reason: string;
+  reminder: string;
+  lastUpdated: string;
+  historyStatus?: string;
+  poolBatchId?: string;
+  poolSource?: string;
+  poolGeneratedAt?: string;
+  poolRankAtGeneration?: number;
+}
+
+export interface StockTradeLink {
+  lastBuy?: Partial<TradeLog> | null;
+  lastSell?: Partial<TradeLog> | null;
+  todayTrades?: Partial<TradeLog>[];
+  hasComplianceIssue?: boolean;
+  complianceTags?: string[];
+  tradeCount?: number;
+}
+
+export interface ReviewContext {
+  todayTrades: TradeLog[];
+  currentPositions: Position[];
+  accountState: AccountState;
+  asOfDate: string;
+  todayPnL?: number;
+  realizedPnL?: number;
+  marketSnapshot?: Record<string, unknown>;
+  sectors?: Array<Record<string, unknown>>;
+  holdingDeviation?: Array<Record<string, unknown>>;
+  stockLinks?: Array<Record<string, unknown>>;
+  summaryStatistics?: {
+    complianceRate?: number;
+    buyComplianceRate?: number;
+    sellComplianceRate?: number;
+  };
+}
+
+export interface TodayReview {
+  date: string;
+  todayTrades: TradeLog[];
+  positions: Position[];
+  accountState: AccountState;
+  audit: Record<string, unknown>;
+  stockLinks: Array<Record<string, unknown>>;
+}
+
+export interface ReportRecord {
+  id: string;
+  type: "daily" | "weekly" | "monthly";
+  date: string;
+  summary?: string;
+  tomorrowPlan?: string;
+  createdTime?: string;
+  [key: string]: unknown;
+}
+
+export interface SettingsPayload {
+  currentMode?: AccountMode;
+  initialCash?: number;
+  realInitialCash?: number;
+  activeInitialCash?: number;
+  quoteSource?: string;
+  quote_source?: string;
+  historySource?: string;
+  autoRefresh?: boolean;
+  refreshIntervalSeconds?: number;
+  feeProfile?: string;
+  commissionRate?: number;
+  minCommission?: number;
+  stampDutyRate?: number;
+  transferFeeRate?: number;
+  soundNotification?: boolean;
+  desktopNotification?: boolean;
+  simulationFees?: FeeConfig;
+  realFees?: FeeConfig;
+  thsReconciliation?: ReconciliationConfig;
+  simulationThsReconciliation?: ReconciliationConfig;
+  realThsReconciliation?: ReconciliationConfig;
+  [key: string]: unknown;
+}
+
+export interface FeeConfig {
+  feeProfile?: string;
+  commissionRate?: number;
+  minCommission?: number;
+  stampDutyRate?: number;
+  transferFeeRate?: number;
+}
+
+export interface ReconciliationConfig {
+  enabled?: boolean;
+  accountCapital?: number;
+  totalAssets?: number;
+  availableCash?: number;
+  holdingValue?: number;
+  holdingPnL?: number;
+  todayPnL?: number;
 }
 
 export interface KLinePoint {
@@ -217,8 +401,35 @@ export interface KLinePoint {
   high: number;
   low: number;
   close: number;
+  volume?: number;
+  amount?: number;
   ma5?: number;
   ma10?: number;
   ma20?: number;
-  volume?: number;
+}
+
+export interface HistoryJob {
+  success?: boolean;
+  inProgress?: boolean;
+  jobId?: string;
+  status: "running" | "completed" | "failed";
+  total: number;
+  completed: number;
+  fetched: number;
+  failed: number;
+  skipped: number;
+  error?: string;
+  results?: Record<string, { success: boolean; status?: string; error?: string }>;
+  list?: Stock[];
+}
+
+export type ActivityKind = "info" | "success" | "warning" | "danger" | "refresh" | "trade" | "report";
+
+export interface ActivityEntry {
+  id: string;
+  kind: ActivityKind;
+  title: string;
+  detail?: string;
+  time: string;
+  source?: string;
 }
