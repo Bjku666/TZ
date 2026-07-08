@@ -1,27 +1,31 @@
 name: Apply Agent Patch
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/zip-workstation-v3
-    paths:
-      - .agent/READY
+      - main
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: github.head_ref == 'agent/zip-workstation-v3'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: agent/zip-workstation-v3
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
       - name: Rebuild TZ workspace
         shell: bash
         run: |
           set -euo pipefail
+          if [ ! -f .agent/READY ]; then
+            echo "Patch already applied"
+            exit 0
+          fi
           cat .agent/tz_patch.part* | base64 --decode > /tmp/tz_patch.zip
           rm -rf frontend/src/components frontend/src/api frontend/src/hooks frontend/src/layout frontend/src/pages
           rm -f frontend/src/App.tsx frontend/src/types.ts frontend/src/main.tsx frontend/src/index.css frontend/package-lock.json
@@ -32,4 +36,4 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add -A
           git commit -m "3.0 rebuild account discipline workstation"
-          git push origin HEAD:agent/zip-workstation-v3
+          git push origin HEAD:${{ github.head_ref }}
