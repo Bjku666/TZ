@@ -1,79 +1,16 @@
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
+.pytest_cache/
+.venv/
 venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Environment variables
 .env
-.env.local
-.env.*.local
-
-# Data files (keep structure, exclude large/sensitive data)
-data/history/
-data/processed/
-data/raw/
-data/exports/
-data/trades/
-data/runtime/
-data/backups/
-
-# Reports and exports
-data/reports/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Cache
-.cache/
-*.cache
-
-# Frontend
-node_modules/
+.env.*
+!.env.example
 frontend/node_modules/
 frontend/dist/
-frontend/.vite/
-
-# Logs
-*.log
-logs/
-
-# Temporary files
-*.tmp
-*.bak
-data/app.db
+.DS_Store
+.vscode/
+data/*.sqlite
+data/*.sqlite3
+data/*.db
+data/*.db-journal
