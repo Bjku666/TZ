@@ -1,250 +1,64 @@
-import { useCallback, useEffect, useState } from "react";
-import { AlertCircle, Loader2 } from "lucide-react";
-import { AppShell } from "./layout/AppShell";
-import type { PageKey } from "./layout/Sidebar";
-import { DashboardPage } from "./pages/DashboardPage";
-import { StockPoolPage } from "./pages/StockPoolPage";
-import { IntradayPage } from "./pages/IntradayPage";
-import { PositionsPage } from "./pages/PositionsPage";
-import { TradesPage } from "./pages/TradesPage";
-import { AssetsPage } from "./pages/AssetsPage";
-import { ReviewPage } from "./pages/ReviewPage";
-import { ImportPage } from "./pages/ImportPage";
-import { SettingsPage } from "./pages/SettingsPage";
-import { BuyTradeModal } from "./components/trade/BuyTradeModal";
-import { SellTradeModal } from "./components/trade/SellTradeModal";
-import { EditTradeModal } from "./components/trade/EditTradeModal";
-import { useActivityLog } from "./hooks/useActivityLog";
-import { useQuoteRefresh } from "./hooks/useQuoteRefresh";
-import { useWorkbench } from "./hooks/useWorkbench";
-import type { AccountMode, Candidate, Position, TradeLog } from "./types";
-
-const pageKeys: PageKey[] = ["dashboard", "stockPool", "intraday", "positions", "trades", "assets", "review", "import", "settings"];
-
-function pageFromHash(): PageKey {
-  const key = window.location.hash.replace(/^#\/?/, "") as PageKey;
-  return pageKeys.includes(key) ? key : "dashboard";
-}
+import { useEffect, useRef, useState } from "react";
+import { AlertTriangle } from "lucide-react";
+import type { Mode, Page, Side, Trade, Workspace } from "./types";
+import { apiPath, request } from "./lib";
+import { Header, Loading, Sidebar } from "./ui";
+import { Today } from "./Today";
+import { Positions } from "./Positions";
+import { Trades } from "./Trades";
+import { Reviews } from "./Reviews";
+import { Notices, SettingsDrawer, TradeModal } from "./Overlays";
 
 export default function App() {
-  const [page, setPage] = useState<PageKey>(() => pageFromHash());
-  const [buyTarget, setBuyTarget] = useState<Candidate | null>(null);
-  const [sellTarget, setSellTarget] = useState<Position | null>(null);
-  const [editTarget, setEditTarget] = useState<TradeLog | null>(null);
-  const activityLog = useActivityLog();
-  const workbench = useWorkbench({
-    addActivity: activityLog.add,
-    addActivities: activityLog.addMany,
-  });
-  const onPaused = useCallback(
-    (reason: string) => {
-      activityLog.add({ kind: "info", title: "自动刷新暂停", detail: reason });
-    },
-    [activityLog.add],
-  );
-  const quoteRefresh = useQuoteRefresh({
-    enabled: Boolean(workbench.settings.autoRefresh ?? true),
-    refresh: workbench.refreshQuotes,
-    onPaused,
-  });
-  const handlePageChange = useCallback((nextPage: PageKey) => {
-    setPage(nextPage);
-    window.history.replaceState(null, "", `#/${nextPage}`);
-  }, []);
-  const handleModeChange = useCallback(
-    (nextMode: AccountMode) => {
-      void workbench.switchMode(nextMode);
-    },
-    [workbench],
-  );
+  const [mode, setMode] = useState<Mode>(() => (localStorage.getItem("tz-mode") as Mode) || "simulation");
+  const [page, setPage] = useState<Page>("today");
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [noticesOpen, setNoticesOpen] = useState(false);
+  const [tradeModal, setTradeModal] = useState<{ open: boolean; side: Side; code?: string; editing?: Trade }>({ open: false, side: "BUY" });
+  const abortRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    const onHashChange = () => setPage(pageFromHash());
-    window.addEventListener("hashchange", onHashChange);
-    return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
-
-  const renderPage = () => {
-    if (workbench.loading) {
-      return (
-        <div className="flex min-h-[28rem] items-center justify-center rounded border border-slate-800 bg-slate-950/60">
-          <div className="text-center">
-            <Loader2 className="mx-auto h-8 w-8 animate-spin text-cyan-300" />
-            <div className="mt-3 text-sm font-bold text-slate-300">正在加载后端真实数据</div>
-          </div>
-        </div>
-      );
-    }
-
-    if (workbench.error) {
-      return (
-        <div className="rounded border border-rose-900 bg-rose-950/25 p-4 text-sm text-rose-200">
-          <AlertCircle className="mr-2 inline h-4 w-4" />
-          {workbench.error}
-        </div>
-      );
-    }
-
-    switch (page) {
-      case "dashboard":
-        return (
-          <DashboardPage
-            official={workbench.officialSelection}
-            initial={workbench.initialPool}
-            observation={workbench.observationPool}
-            buyReady={workbench.buyReadyPool}
-            positions={workbench.positions}
-            trades={workbench.trades}
-            stocks={workbench.stocks}
-            account={workbench.account}
-            phase={quoteRefresh.phase}
-            busy={workbench.busy}
-            onGenerate={() => void workbench.generateOfficial()}
-            onRefresh={() => void quoteRefresh.manualRefresh()}
-            onBackfill={() => void workbench.startHistoryBackfill()}
-            onNavigate={handlePageChange}
-          />
-        );
-      case "stockPool":
-        return (
-          <StockPoolPage
-            initial={workbench.initialPool}
-            observation={workbench.observationPool}
-            buyReady={workbench.buyReadyPool}
-            candidateEvents={workbench.candidateEvents}
-            trades={workbench.trades}
-            historyJob={workbench.historyJob}
-            busy={workbench.busy}
-            onOpenBuy={setBuyTarget}
-            onSelectCandidate={workbench.setSelectedCandidateId}
-            onFetchOne={code => void workbench.fetchSingleHistory(code)}
-            onFetchAll={() => void workbench.startHistoryBackfill()}
-          />
-        );
-      case "intraday":
-        return (
-          <IntradayPage
-            payload={workbench.workbench}
-            settings={workbench.settings}
-            phase={quoteRefresh.phase}
-            autoRefreshActive={quoteRefresh.active}
-            countdown={quoteRefresh.countdown}
-            intervalSeconds={quoteRefresh.intervalSeconds}
-            running={quoteRefresh.running}
-            busy={workbench.busy}
-            preview={workbench.preview}
-            onRefresh={() => void quoteRefresh.manualRefresh()}
-            onPreview={() => void workbench.loadPreview()}
-          />
-        );
-      case "positions":
-        return (
-          <PositionsPage
-            positions={workbench.positions}
-            onSell={setSellTarget}
-            onDefer={position => void workbench.deferExit(position, "用户选择延迟至14:30后处理")}
-          />
-        );
-      case "trades":
-        return <TradesPage trades={workbench.trades} onEdit={setEditTarget} onDelete={workbench.deleteTrade} />;
-      case "assets":
-        return <AssetsPage account={workbench.account} mode={workbench.mode} />;
-      case "review":
-        return (
-          <ReviewPage
-            initial={workbench.initialPool}
-            observation={workbench.observationPool}
-            buyReady={workbench.buyReadyPool}
-            trades={workbench.trades}
-            positions={workbench.positions}
-            account={workbench.account}
-            reviewContext={workbench.reviewContext}
-            reports={workbench.reports}
-            busy={workbench.busy}
-            onSave={async payload => {
-              await workbench.saveReport(payload);
-            }}
-          />
-        );
-      case "import":
-        return <ImportPage busy={workbench.busy} onImport={workbench.importSelection} />;
-      case "settings":
-        return (
-          <SettingsPage
-            settings={workbench.settings}
-            rules={workbench.rules}
-            busy={workbench.busy}
-            mode={workbench.mode}
-            onSave={workbench.saveSettings}
-            onRecalculateFees={workbench.recalculateFees}
-          />
-        );
-      default:
-        return null;
+  const load = async (target: Mode = mode, refresh = false) => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setLoading(true); setError(""); setWorkspace(null);
+    try {
+      const data = await request<Workspace>(apiPath(target, refresh ? "/refresh" : "/workspace"), refresh ? { method: "POST", body: "{}", signal: controller.signal } : { signal: controller.signal });
+      if (!controller.signal.aborted) setWorkspace(data);
+    } catch (err) {
+      if (!controller.signal.aborted) setError(err instanceof Error ? err.message : "加载失败");
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
     }
   };
+  useEffect(() => { localStorage.setItem("tz-mode", mode); void load(mode); return () => abortRef.current?.abort(); }, [mode]);
+
+  const mutate = async (promise: Promise<Workspace>) => {
+    setLoading(true);
+    try { setWorkspace(await promise); setError(""); }
+    catch (err) { const message = err instanceof Error ? err.message : "操作失败"; setError(message); window.alert(message); }
+    finally { setLoading(false); }
+  };
+  const switchMode = (next: Mode) => { if (next !== mode) { setPage("today"); setTradeModal({ open: false, side: "BUY" }); setMode(next); } };
+  const unread = workspace?.notifications.filter((item) => !item.read).length || 0;
 
   return (
-    <>
-      <AppShell
-        page={page}
-        onPageChange={handlePageChange}
-        health={workbench.health}
-        mode={workbench.mode}
-        onModeChange={handleModeChange}
-        modeSwitching={workbench.busy === "mode"}
-        phase={quoteRefresh.phase}
-        rules={workbench.rules}
-        settings={workbench.settings}
-        account={workbench.account}
-        payload={workbench.workbench}
-        countdown={quoteRefresh.countdown}
-        autoRefreshActive={quoteRefresh.active}
-        refreshing={quoteRefresh.running || workbench.busy === "refresh"}
-        onRefresh={() => void quoteRefresh.manualRefresh()}
-        activities={activityLog.entries}
-        onClearActivities={activityLog.clear}
-      >
-        {renderPage()}
-      </AppShell>
-
-      {buyTarget && (
-        <BuyTradeModal
-          candidate={buyTarget}
-          account={workbench.account}
-          rules={workbench.rules}
-          settings={workbench.settings}
-          onClose={() => setBuyTarget(null)}
-          onSubmit={async payload => {
-            await workbench.createTrade(payload);
-          }}
-        />
-      )}
-
-      {sellTarget && (
-        <SellTradeModal
-          position={sellTarget}
-          settings={workbench.settings}
-          onClose={() => setSellTarget(null)}
-          onSubmit={async payload => {
-            await workbench.createTrade(payload);
-          }}
-          onDefer={async reason => {
-            await workbench.deferExit(sellTarget, reason);
-          }}
-        />
-      )}
-
-      {editTarget && (
-        <EditTradeModal
-          trade={editTarget}
-          settings={workbench.settings}
-          onClose={() => setEditTarget(null)}
-          onSubmit={async (tradeId, payload) => {
-            await workbench.updateTrade(tradeId, payload);
-          }}
-        />
-      )}
-    </>
+    <div className="flex h-screen overflow-hidden bg-[#080b12] text-slate-200">
+      <Sidebar mode={mode} page={page} onMode={switchMode} onPage={setPage} />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <Header page={page} mode={mode} phase={workspace?.marketPhase || "连接中"} unread={unread} loading={loading} onRefresh={() => void load(mode, true)} onSettings={() => setSettingsOpen(true)} onNotices={() => setNoticesOpen(true)} />
+        <main className="min-h-0 flex-1 overflow-y-auto p-5 lg:p-7">
+          {error && <div className="mb-4 flex items-center justify-between rounded-xl border border-rose-900 bg-rose-950/40 p-3 text-sm text-rose-300"><span className="flex items-center gap-2"><AlertTriangle size={16} />{error}</span><button onClick={() => void load(mode)} className="btn">重试</button></div>}
+          {!workspace ? <Loading /> : page === "today" ? <Today workspace={workspace} onTrade={(side, code) => setTradeModal({ open: true, side, code })} /> : page === "positions" ? <Positions workspace={workspace} onTrade={(side, code) => setTradeModal({ open: true, side, code })} onMutate={mutate} /> : page === "trades" ? <Trades workspace={workspace} onTrade={(side) => setTradeModal({ open: true, side })} onEdit={(editing) => setTradeModal({ open: true, side: editing.type, code: editing.code, editing })} onMutate={mutate} /> : <Reviews workspace={workspace} onMutate={mutate} />}
+        </main>
+      </div>
+      {tradeModal.open && workspace && <TradeModal mode={mode} workspace={workspace} config={tradeModal} onClose={() => setTradeModal({ open: false, side: "BUY" })} onMutate={mutate} />}
+      {settingsOpen && workspace && <SettingsDrawer mode={mode} settings={workspace.settings} onClose={() => setSettingsOpen(false)} onMutate={mutate} />}
+      {noticesOpen && workspace && <Notices mode={mode} items={workspace.notifications} onClose={() => setNoticesOpen(false)} onReload={() => void load(mode)} />}
+    </div>
   );
 }
+

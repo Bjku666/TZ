@@ -1,62 +1,123 @@
-# 视频原版五日线回踩隔日超短交易纪律系统
+# TZ 五日线回踩交易纪律工作台
 
-本仓库只保留一套策略：视频原版“五日线回踩隔日超短”。系统负责生成正式收盘批次、跨日候选、盘中 MA5 回踩信号、人工交易记录、T+1 持仓提醒、费用和复盘审计；不连接券商，不自动下单。
+TZ 是与同花顺配合使用的个人交易纪律与复盘工作台。它不做全市场选股、不提供实时荐股、不连接券商，也不自动下单。
 
-## 核心规则
+同花顺负责行情、股票选择和真实下单；TZ 负责：
 
-- 正式初筛从全市场原始成交额前 20 开始，先取原始榜，再过滤创业板、科创板、北交所、ST、退市、停牌或无有效价格股票。
-- 过滤后不足 20 只时不从第 21 名以后补位。
-- `000725 京东方A` 不特殊排除。
-- 入选日收盘价必须大于等于入选日 `MA5 close`。
-- 入选当天不能买，`eligible_from` 为下一交易日。
-- 候选从下一交易日起跨日等待 MA5 回踩，不设置任意过期天数。
-- 盘中 MA5 使用“前 4 个完成交易日收盘价 + 当前实时价格”计算。
-- 回踩工程容差为 `±0.5%`，属于测量口径，不是视频新增选股条件。
-- 买入时间为 `09:30 <= t < 10:00` 和 `14:30 <= t < 15:00`。
-- 买入后按隔日超短管理，下一交易日早盘观察，10 点前不能涨停则提示卖出；用户可显式选择延迟至 14:30 后处理。
+- 模拟训练与实盘记录两套完全独立的账户账本；
+- 人工登记买入、卖出和历史成交；
+- T+1 可卖数量、现金、100 股整数倍和买入时段校验；
+- 当前持仓、10:00 行动节点、延迟至 14:30 尾盘处理；
+- 手续费、印花税、过户费和累计盈亏重算；
+- 通知、持仓备注、同花顺期末数手工对账；
+- 计划、执行、结果、下一步四段式复盘。
 
-## 规则边界
+## 产品结构
 
-- 视频原版信号：正式前 20、入选日站上 MA5、跨日等待回踩、视频买入时段、隔日卖出提醒。
-- 执行约束：100 股整数倍、现金、T+1、可卖数量、停牌、费用、人工确认。
-- 工程口径：MA5 触线容差、行情新鲜度、10 点涨停后最小补全。
+一级页面只保留四个：
 
-大盘、板块、MA10、MA20、浮亏风险只作为辅助信息展示，不参与初筛、观察、待买分组和买入违规审计。
+1. **今日执行**：账户概览、今日待办、成交记录和违规提醒。
+2. **当前持仓**：持仓数量、可卖数量、T+1 锁定和行动状态。
+3. **交易记录**：当前账户的完整流水、编辑、删除、费用重算和 CSV 导出。
+4. **复盘分析**：统计指标与四段式有效复盘。
 
-## 数据模型
+设置与通知通过顶部抽屉打开，不占用一级页面。
 
-SQLite 新增并维护：
+## 账户隔离
 
-- `schema_migrations`
-- `selection_batches`
-- `selection_items`
-- `candidate_cycles`
-- `candidate_events`
-- `signal_events`
+所有业务数据都以 `mode` 为强制分区键：
 
-`data/watchlist.csv` 仅作为兼容导出和展示缓存，不再是候选生命周期的唯一权威数据。
+- `simulation`：模拟训练账户；
+- `real`：实盘记录账户。
+
+交易、持仓推导、现金、费用设置、对账数字、延迟决定、备注、通知和复盘均不会跨账户读取或修改。共享内容只包括程序代码和规则定义。
 
 ## 本地运行
 
-```bash
-./启动强势回踩系统.command
-```
-
-后端默认 `http://127.0.0.1:8000`，前端默认 `http://127.0.0.1:5173`。
-
-## 验证
+### 1. 后端
 
 ```bash
-PYTHONPATH=. .venv/bin/pytest -q
-npm --prefix frontend run lint
-npm --prefix frontend run build
+python -m venv .venv
 ```
 
-## 文档
+Windows PowerShell：
 
-- `docs/VIDEO_ORIGINAL_RULES.md`
-- `docs/RULE_BOUNDARIES.md`
-- `docs/CANDIDATE_STATE_MACHINE.md`
-- `docs/DATA_MODEL.md`
-- `docs/MIGRATION_REPORT.md`
-- `docs/TEST_REPORT.md`
+```powershell
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+macOS / Linux：
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### 2. 前端
+
+另开一个终端：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+浏览器访问：
+
+```text
+http://127.0.0.1:5173
+```
+
+Vite 会把 `/api` 请求代理到 `http://127.0.0.1:8000`。
+
+## 测试
+
+```bash
+python -m pytest
+cd frontend
+npm install
+npm run lint
+npm run build
+```
+
+## 数据文件
+
+SQLite 默认写入：
+
+```text
+data/tz_workspace.sqlite3
+```
+
+可以通过环境变量 `TZ_DATA_DIR` 更改数据目录。数据库文件不会提交到 GitHub。
+
+## 核心 API
+
+```text
+GET    /api/accounts/{mode}/workspace
+POST   /api/accounts/{mode}/refresh
+
+POST   /api/accounts/{mode}/trades
+PUT    /api/accounts/{mode}/trades/{trade_id}
+DELETE /api/accounts/{mode}/trades/{trade_id}
+POST   /api/accounts/{mode}/trades/recalculate-fees
+
+POST   /api/accounts/{mode}/positions/{code}/defer-exit
+DELETE /api/accounts/{mode}/positions/{code}/defer-exit
+POST   /api/accounts/{mode}/positions/{code}/notes
+
+GET    /api/accounts/{mode}/settings
+PUT    /api/accounts/{mode}/settings
+
+GET    /api/accounts/{mode}/reviews
+POST   /api/accounts/{mode}/reviews
+
+PUT    /api/accounts/{mode}/notifications/{id}/read
+POST   /api/accounts/{mode}/notifications/read-all
+DELETE /api/accounts/{mode}/notifications
+```
+
+旧的选股、候选池、盘中扫描、行情抓取、股票池和荐股 API 不再存在。

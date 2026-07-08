@@ -4,7 +4,6 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
-  const apiTarget = process.env.VITE_API_TARGET || 'http://127.0.0.1:8000';
   return {
     plugins: [react(), tailwindcss()],
     resolve: {
@@ -13,14 +12,9 @@ export default defineConfig(() => {
       },
     },
     server: {
-      proxy: {
-        '/api': {
-          target: apiTarget,
-          changeOrigin: true,
-        },
-      },
-      // HMR is disabled when DISABLE_HMR=true.
+      // 可通过 DISABLE_HMR 环境变量关闭热更新。
       hmr: process.env.DISABLE_HMR !== 'true',
+      // 关闭热更新时同步关闭文件监听。
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
   };
