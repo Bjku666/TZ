@@ -1,0 +1,35 @@
+name: Apply Agent Patch
+
+on:
+  push:
+    branches:
+      - agent/zip-workstation-v3
+    paths:
+      - .agent/READY
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/zip-workstation-v3
+          fetch-depth: 0
+      - name: Rebuild TZ workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .agent/tz_patch.part* | base64 --decode > /tmp/tz_patch.zip
+          rm -rf frontend/src/components frontend/src/api frontend/src/hooks frontend/src/layout frontend/src/pages
+          rm -f frontend/src/App.tsx frontend/src/types.ts frontend/src/main.tsx frontend/src/index.css frontend/package-lock.json
+          rm -f backend/api/candidates.py backend/api/market.py backend/api/portfolio.py backend/api/review.py backend/api/rules.py backend/api/selection.py backend/api/settings.py backend/api/watchlist.py
+          unzip -oq /tmp/tz_patch.zip -d .
+          rm -rf .agent .github/workflows/apply-agent-patch.yml
+          git config user.name "TZ Agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "3.0 rebuild account discipline workstation"
+          git push origin HEAD:agent/zip-workstation-v3
