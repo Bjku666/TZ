@@ -14,3 +14,4 @@ data/*.sqlite
 data/*.sqlite3
 data/*.db
 data/*.db-journal
+.tmp/
