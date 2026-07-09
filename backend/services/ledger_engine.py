@@ -7,6 +7,7 @@ from math import isfinite
 from typing import Any
 from uuid import uuid4
 
+from backend.services.strategy_rules import position_decision, validate_strategy
 from backend.storage import account_store as store
 
 
@@ -87,7 +88,8 @@ class Lot:
     unit_cost: float
 
 
-def _simulate(mode: str, trades: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]], list[float]]:
+def _simulate(mode: str, trades: list[dict[str, Any]], strategy_id: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], list[float]]:
+    strategy_id = validate_strategy(strategy_id)
     settings = store.get_settings(mode)
     cash = float(settings.get("initialCash", 0))
     realized_pnl = 0.0
@@ -142,32 +144,21 @@ def _simulate(mode: str, trades: list[dict[str, Any]]) -> tuple[dict[str, Any], 
         available = sum(lot.quantity for lot in queue if lot.date < today)
         locked = quantity - available
         buy_date = min(lot.date for lot in queue)
-        state = store.get_position_state(mode, code)
+        state = store.get_position_state(mode, code, strategy_id)
         deferred = bool(state.get("deferred"))
         now = _minutes(_now_hm())
-        if locked == quantity:
-            status = "T+1 锁定"
-            advice = "当日买入不可卖出；下一交易日再进入观察。"
-            next_action = "下一交易日 09:30"
-        elif deferred and now < 14 * 60 + 30:
-            status = "已延迟至尾盘"
-            advice = state.get("deferReason") or "等待 14:30 后重新处理。"
-            next_action = "14:30"
-        elif deferred and now >= 14 * 60 + 30:
-            status = "尾盘待处理"
-            advice = "已到尾盘处理时段，请根据原计划记录卖出或撤销延迟。"
-            next_action = "现在"
-        elif now < 10 * 60:
-            status = "次日观察"
-            advice = "10:00 前观察承接；不符合预案时按纪律退出。"
-            next_action = "10:00"
-        else:
-            status = "10:00 待处理"
-            advice = "已到纪律处理节点，请记录卖出或明确延迟至尾盘。"
-            next_action = "现在"
+        decision = position_decision(
+            strategy_id,
+            locked_quantity=locked,
+            total_quantity=quantity,
+            deferred=deferred,
+            defer_reason=str(state.get("deferReason", "")),
+            now_minutes=now,
+        )
         position = {
             "code": code,
             "name": names.get(code, code),
+            "strategyId": strategy_id,
             "quantity": quantity,
             "availableQuantity": available,
             "t1LockedQuantity": locked,
@@ -180,9 +171,12 @@ def _simulate(mode: str, trades: list[dict[str, Any]]) -> tuple[dict[str, Any], 
             "deviation5": 0.0,
             "buyDate": buy_date,
             "holdDays": _trading_days(buy_date, today),
-            "status": status,
-            "advice": advice,
-            "nextActionTime": next_action,
+            "status": decision.status,
+            "advice": decision.advice,
+            "nextActionTime": decision.nextActionTime,
+            "actionType": decision.actionType,
+            "actionPriority": decision.actionPriority,
+            "actionTitle": decision.actionTitle,
             "canExecuteSellNow": available > 0,
             "sellBlockedReason": "T+1 可卖数量为 0" if available <= 0 else "",
             "isLimitUp": False,
@@ -210,6 +204,7 @@ def _simulate(mode: str, trades: list[dict[str, Any]]) -> tuple[dict[str, Any], 
     initial_cash = float(settings.get("initialCash", 0))
     account = {
         "mode": mode,
+        "strategyId": strategy_id,
         "initialCash": _round(initial_cash),
         "availableCash": _round(available_cash),
         "holdingValue": _round(holding_value),
@@ -233,5 +228,3 @@ def _today_realized(trades: list[dict[str, Any]], today: str) -> float:
 def _today_pnl(trades: list[dict[str, Any]], today: str, _code_realized: dict[str, float]) -> float:
     # Without a live quote feed, today's posted change is represented by today's fees and closed trade results.
     return _today_realized(trades, today)
-
-

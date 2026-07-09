@@ -77,6 +77,49 @@ def test_account_specific_settings_do_not_leak(client: TestClient):
     assert real["account"]["initialCash"] == 5000
 
 
+def test_full_settings_payload_updates_both_accounts_independently(client: TestClient):
+    current = client.get("/api/accounts/simulation/workspace").json()["settings"]
+    current["simulation"]["initialCash"] = 180000
+    current["simulation"]["commissionRate"] = 0.00031
+    current["real"]["initialCash"] = 6800
+    current["real"]["commissionRate"] = 0.00019
+    current["reconciliation"]["simulation"]["enabled"] = False
+    current["reconciliation"]["real"]["enabled"] = True
+    current["reconciliation"]["real"]["totalAssets"] = 7000
+
+    response = client.put("/api/accounts/simulation/settings", json=current)
+    assert response.status_code == 200
+    assert response.json()["account"]["initialCash"] == 180000
+
+    simulation = client.get("/api/accounts/simulation/workspace").json()
+    real = client.get("/api/accounts/real/workspace").json()
+    assert simulation["account"]["initialCash"] == 180000
+    assert real["account"]["initialCash"] == 6800
+    assert simulation["settings"]["simulation"]["commissionRate"] == 0.00031
+    assert real["settings"]["real"]["commissionRate"] == 0.00019
+    assert simulation["settings"]["reconciliation"]["simulation"]["enabled"] is False
+    assert real["settings"]["reconciliation"]["real"]["enabled"] is True
+    assert real["settings"]["reconciliation"]["real"]["totalAssets"] == 7000
+
+
+def test_simulation_and_real_fee_settings_are_independent(client: TestClient):
+    current = client.get("/api/accounts/simulation/workspace").json()["settings"]
+    current["simulation"]["commissionRate"] = 0.001
+    current["simulation"]["enableMinCommission"] = False
+    current["simulation"]["transferFeeRate"] = 0
+    current["real"]["commissionRate"] = 0.002
+    current["real"]["enableMinCommission"] = False
+    current["real"]["transferFeeRate"] = 0
+    response = client.put("/api/accounts/simulation/settings", json=current)
+    assert response.status_code == 200
+
+    simulation = client.post("/api/accounts/simulation/trades", json=trade_payload()).json()
+    real = client.post("/api/accounts/real/trades", json=trade_payload()).json()
+
+    assert simulation["trades"][0]["totalFee"] == 10
+    assert real["trades"][0]["totalFee"] == 20
+
+
 def test_trade_update_delete_and_fee_recalculation(client: TestClient):
     created = client.post("/api/accounts/simulation/trades", json=trade_payload()).json()
     trade = created["trades"][0]
@@ -92,6 +135,62 @@ def test_trade_update_delete_and_fee_recalculation(client: TestClient):
     deleted = client.delete(f"/api/accounts/simulation/trades/{trade['id']}")
     assert deleted.status_code == 200
     assert deleted.json()["trades"] == []
+
+
+def test_manual_fee_and_historical_audit_are_persisted(client: TestClient):
+    response = client.post("/api/accounts/simulation/trades", json=trade_payload(
+        manualFeeOverride=True,
+        commission=1.2,
+        stampDuty=0.5,
+        transferFee=0.03,
+        rulesConclusion="违规交易",
+        violationTags="追高、历史补录",
+    ))
+    assert response.status_code == 200
+    trade = response.json()["trades"][0]
+    assert trade["manualFeeOverride"] is True
+    assert trade["commission"] == 1.2
+    assert trade["stampDuty"] == 0.5
+    assert trade["transferFee"] == 0.03
+    assert trade["totalFee"] == 1.73
+    assert trade["rulesConclusion"] == "违规交易"
+    assert trade["violationTags"] == ["追高", "历史补录"]
+
+    recalculated = client.post("/api/accounts/simulation/trades/recalculate-fees", json={}).json()
+    assert recalculated["trades"][0]["totalFee"] == 1.73
+
+
+def test_realtime_manual_quote_updates_position_and_security_lookup(client: TestClient):
+    created = client.post("/api/accounts/simulation/trades", json=trade_payload(
+        code="600176",
+        name="本地旧名",
+        price=70,
+        quantity=100,
+    ))
+    assert created.status_code == 200
+
+    settings = client.get("/api/accounts/simulation/workspace").json()["settings"]
+    settings["market"]["enableRealtime"] = True
+    settings["market"]["provider"] = "manual"
+    settings["market"]["manualQuotes"] = {
+        "600176": {"name": "中国巨石", "price": 72.5, "previousClose": 71.0, "updatedAt": "2026-07-09 14:30:00"},
+        "002594": {"name": "比亚迪", "price": 101.0, "updatedAt": "2026-07-09 14:30:00"},
+    }
+    updated = client.put("/api/accounts/simulation/settings", json=settings)
+    assert updated.status_code == 200
+
+    workspace = client.get("/api/accounts/simulation/workspace").json()
+    position = workspace["positions"][0]
+    assert workspace["quoteUpdatedAt"] == "手工行情快照"
+    assert position["name"] == "中国巨石"
+    assert position["currentPrice"] == 72.5
+    assert position["marketValue"] == 7250
+    assert position["quoteSource"] == "manual"
+
+    lookup = client.get("/api/accounts/simulation/securities/002594").json()
+    assert lookup["found"] is True
+    assert lookup["name"] == "比亚迪"
+    assert "实时行情" in lookup["source"]
 
 
 def test_defer_note_review_and_notifications_are_mode_scoped(client: TestClient):
@@ -135,3 +234,38 @@ def test_sell_cannot_cross_t1_or_account_boundary(client: TestClient):
 
     response_real = client.post("/api/accounts/real/trades", json=sell)
     assert response_real.status_code == 400
+
+
+def test_strategy_catalog_and_strategy_scoped_workspace(client: TestClient):
+    catalog = client.get("/api/accounts/simulation/strategies")
+    assert catalog.status_code == 200
+    assert {item["id"] for item in catalog.json()} >= {"ma5_pullback", "mode2", "mode3"}
+
+    created = client.post("/api/accounts/simulation/trades?strategy=mode2", json=trade_payload(code="600176", name="中国巨石"))
+    assert created.status_code == 200
+    assert created.json()["strategyId"] == "mode2"
+    assert created.json()["trades"][0]["strategyId"] == "mode2"
+    assert len(created.json()["positions"]) == 1
+
+    default_workspace = client.get("/api/accounts/simulation/workspace").json()
+    mode2_workspace = client.get("/api/accounts/simulation/workspace?strategy=mode2").json()
+    mode3_workspace = client.get("/api/accounts/simulation/workspace?strategy=mode3").json()
+
+    assert default_workspace["strategyId"] == "ma5_pullback"
+    assert default_workspace["trades"] == []
+    assert mode2_workspace["trades"][0]["code"] == "600176"
+    assert mode3_workspace["trades"] == []
+
+
+def test_placeholder_strategy_does_not_apply_ma5_time_window(client: TestClient):
+    payload = trade_payload(historicalBackfill=False, time="11:15:00")
+
+    default_response = client.post("/api/accounts/simulation/trades", json=payload)
+    assert default_response.status_code == 200
+    assert default_response.json()["trades"][0]["rulesConclusion"] == "部分不符"
+    assert default_response.json()["trades"][0]["violationTags"] == ["不在纪律买入时段"]
+
+    mode2_response = client.post("/api/accounts/simulation/trades?strategy=mode2", json=payload)
+    assert mode2_response.status_code == 200
+    assert mode2_response.json()["trades"][0]["rulesConclusion"] == "符合规则"
+    assert mode2_response.json()["trades"][0]["violationTags"] == []
