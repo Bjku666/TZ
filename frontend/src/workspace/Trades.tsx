@@ -44,6 +44,7 @@ export function Trades({
   const sellCount = workspace.trades.filter((item) => item.type === "SELL").length;
   const turnover = workspace.trades.reduce((sum, item) => sum + item.amount, 0);
   const compliant = workspace.trades.filter((item) => item.rulesConclusion === "符合规则").length;
+  const strategyAccount = workspace.strategyAccount || workspace.account;
 
   const reset = () => {
     setQuery("");
@@ -103,7 +104,7 @@ export function Trades({
         <Stat label="总成交金额" value={`¥${money(turnover)}`} />
         <Stat label="总手续费" value={`¥${money(workspace.reviewSummary.totalFees)}`} />
         <Stat label="符合规则比例" value={`${(workspace.trades.length ? (compliant / workspace.trades.length) * 100 : 100).toFixed(1)}%`} />
-        <Stat label="累计盈亏" value={signedMoney(workspace.account.totalPnL)} valueClass={tone(workspace.account.totalPnL)} />
+        <Stat label="当前模式盈亏" value={signedMoney(strategyAccount.totalPnL)} valueClass={tone(strategyAccount.totalPnL)} />
       </div>
 
       <Card className="p-4">

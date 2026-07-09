@@ -183,22 +183,29 @@ def workspace(mode: str, strategy_id: str | None = None) -> dict[str, Any]:
     mode = store.validate_mode(mode)
     strategy_id = validate_strategy(strategy_id)
     trades = store.list_trades(mode, strategy_id)
-    account, positions, cycle_pnls = _simulate(mode, trades, strategy_id)
+    account_trades = store.list_account_trades(mode)
+    strategy_account, positions, cycle_pnls = _simulate(mode, trades, strategy_id)
+    account, account_positions, _account_cycle_pnls = _simulate(mode, account_trades, strategy_id)
     settings = app_settings()
-    quotes, quote_status = quote_service.get_quotes([item["code"] for item in positions], settings["market"])
-    account, positions = _apply_quotes(account, positions, quotes)
-    review_summary = _review_summary(mode, strategy_id, trades, account, cycle_pnls)
+    quote_codes = sorted({item["code"] for item in [*positions, *account_positions]})
+    quotes, quote_status = quote_service.get_quotes(quote_codes, settings["market"])
+    strategy_account, positions = _apply_quotes(strategy_account, positions, quotes)
+    account, account_positions = _apply_quotes(account, account_positions, quotes)
+    review_summary = _review_summary(mode, strategy_id, trades, strategy_account, cycle_pnls)
     return {
         "mode": mode,
         "strategyId": strategy_id,
         "strategy": get_strategy(strategy_id),
         "strategies": list_strategies(),
         "account": account,
+        "strategyAccount": strategy_account,
+        "accountPositions": account_positions,
         "positions": positions,
         "trades": trades,
         "pendingActions": _pending_actions(mode, strategy_id, positions),
         "reviewSummary": review_summary,
-        "capitalAnalysis": _capital_analysis(mode, strategy_id, trades, account, positions),
+        "capitalAnalysis": _capital_analysis(mode, strategy_id, account_trades, account, account_positions),
+        "strategyCapitalAnalysis": _capital_analysis(mode, strategy_id, trades, strategy_account, positions),
         "reviews": store.list_reviews(mode, strategy_id),
         "notifications": store.list_notifications(mode, strategy_id),
         "settings": settings,

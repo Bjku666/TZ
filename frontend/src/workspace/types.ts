@@ -59,14 +59,18 @@ export type CapitalAnalysis = {
   positionCount: number;
   daily: CapitalPoint[];
 };
+export type AccountSummary = { initialCash: number; availableCash: number; holdingValue: number; totalAssets: number; realizedPnL: number; floatingPnL: number; totalPnL: number; totalReturnPct: number; todayPnL: number; todayRealizedPnL: number; asOfDate: string; reconciliationMode: boolean };
 export type Workspace = {
   mode: Mode;
   strategyId: StrategyId;
   strategy: StrategyMode;
   strategies: StrategyMode[];
-  account: { initialCash: number; availableCash: number; holdingValue: number; totalAssets: number; realizedPnL: number; floatingPnL: number; totalPnL: number; totalReturnPct: number; todayPnL: number; todayRealizedPnL: number; asOfDate: string; reconciliationMode: boolean };
+  account: AccountSummary;
+  strategyAccount?: AccountSummary;
+  accountPositions?: Position[];
   positions: Position[]; trades: Trade[]; pendingActions: Action[];
   reviewSummary: { tradeCount: number; completedCycles: number; winRate: number; averageWin: number; averageLoss: number; profitLossRatio: number; totalPnL: number; totalReturnPct: number; maxSingleWin: number; maxSingleLoss: number; totalFees: number; complianceRate: number; violationCount: number };
   capitalAnalysis: CapitalAnalysis;
+  strategyCapitalAnalysis?: CapitalAnalysis;
   reviews: Review[]; notifications: Notice[]; settings: AppSettings; marketPhase: string; quoteUpdatedAt?: string;
 };

@@ -365,6 +365,16 @@ def list_trades(mode: str, strategy_id: str | None = None) -> list[dict[str, Any
     return [_trade_row(row) for row in rows]
 
 
+def list_account_trades(mode: str) -> list[dict[str, Any]]:
+    validate_mode(mode)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE mode=? ORDER BY trade_date DESC, trade_time DESC, created_at DESC",
+            (mode,),
+        ).fetchall()
+    return [_trade_row(row) for row in rows]
+
+
 def get_trade(mode: str, trade_id: str, strategy_id: str | None = None) -> dict[str, Any] | None:
     strategy_id = validate_strategy(strategy_id)
     with connect() as conn:

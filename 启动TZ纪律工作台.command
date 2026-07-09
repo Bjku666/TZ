@@ -6,9 +6,11 @@ PROJECT_DIR="/Users/lulu/Desktop/touzi"
 BACKEND_URL="http://127.0.0.1:8001"
 BACKEND_PORT="8001"
 FRONTEND_URL="http://127.0.0.1:5174"
+FRONTEND_PORT="5174"
 BACKEND_REQUIRED_CONTRACT="account-workspace-v3"
 BACKEND_REQUIRED_ROUTES=(
   "/api/accounts/{mode}/workspace"
+  "/api/accounts/{mode}/strategies"
   "/api/accounts/{mode}/trades"
   "/api/accounts/{mode}/trades/recalculate-fees"
   "/api/accounts/{mode}/positions/{code}/defer-exit"
@@ -100,6 +102,25 @@ stop_project_backend() {
   sleep 1
 }
 
+stop_project_frontend() {
+  local pids pid command_line
+  pids=("${(@f)$(/usr/sbin/lsof -tiTCP:${FRONTEND_PORT} -sTCP:LISTEN 2>/dev/null || true)}")
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for pid in "${pids[@]}"; do
+    command_line="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_line" == *"vite"* && "$command_line" == *"$PROJECT_DIR/frontend"* || "$command_line" == *"vite --host 127.0.0.1 --port ${FRONTEND_PORT}"* ]]; then
+      echo "正在停止旧 React/Vite 前端进程：$pid"
+      /bin/kill "$pid" 2>/dev/null || true
+    else
+      echo "警告：端口 ${FRONTEND_PORT} 被非本项目进程占用：$command_line"
+    fi
+  done
+  sleep 1
+}
+
 start_backend() {
   echo "正在启动 Python FastAPI 后端..."
   PYTHONPATH="$PROJECT_DIR" nohup .venv/bin/uvicorn backend.main:app \
@@ -108,29 +129,29 @@ start_backend() {
     > "$PROJECT_DIR/.tmp/backend.log" 2>&1 &
 }
 
-if /usr/bin/curl --silent --fail "$BACKEND_URL/api/health" >/dev/null 2>&1; then
-  if backend_has_required_contract && backend_has_required_routes; then
-    echo "Python 后端已在运行且接口完整：$BACKEND_URL"
-  else
-    echo "Python 后端已在运行，但版本或接口不是最新，正在重启..."
-    stop_project_backend
-    start_backend
-  fi
-else
-  echo "Python 后端未响应，正在清理旧后端并重新启动..."
-  stop_project_backend
-  start_backend
-fi
+start_frontend() {
+  echo "正在启动 React/Vite 前端..."
+  VITE_API_TARGET="$BACKEND_URL" nohup npm --prefix frontend run dev -- \
+    --host 127.0.0.1 \
+    --port "$FRONTEND_PORT" \
+    --strictPort \
+    > "$PROJECT_DIR/.tmp/frontend.log" 2>&1 &
+}
+
+echo "每次启动都会重启本项目服务，确保使用当前目录下的最新代码。"
+
+stop_project_frontend
+stop_project_backend
+start_backend
 
 wait_for_url "$BACKEND_URL/api/health" "Python 后端"
 
-if /usr/bin/curl --silent --fail "$FRONTEND_URL" >/dev/null 2>&1; then
-  echo "React 前端已在运行：$FRONTEND_URL"
-else
-  echo "正在启动 React/Vite 前端..."
-  nohup npm --prefix frontend run dev \
-    > "$PROJECT_DIR/.tmp/frontend.log" 2>&1 &
+if ! backend_has_required_contract || ! backend_has_required_routes; then
+  echo "后端已启动，但接口版本检查未通过，请查看 .tmp/backend.log。"
+  exit 1
 fi
+
+start_frontend
 
 wait_for_url "$FRONTEND_URL" "React 前端"
 

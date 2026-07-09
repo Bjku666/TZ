@@ -17,7 +17,10 @@ export function Today({
   onPositions: () => void;
 }) {
   const account = w.account;
+  const strategyAccount = w.strategyAccount || w.account;
   const capital = w.capitalAnalysis;
+  const strategyCapital = w.strategyCapitalAnalysis || w.capitalAnalysis;
+  const accountPositionCount = w.accountPositions?.length ?? w.positions.length;
   const todayTrades = w.trades.filter((item) => item.date === account.asOfDate);
   const todayBuys = todayTrades.filter((item) => item.type === "BUY");
   const todaySells = todayTrades.filter((item) => item.type === "SELL");
@@ -42,8 +45,8 @@ export function Today({
         <Stat label="当前总资产" value={`¥ ${money(account.totalAssets)}`} sub={`相对本金 ${pct(account.totalReturnPct)}`} valueClass={tone(account.totalPnL)} />
         <Stat label="可用现金余额" value={`¥ ${money(account.availableCash)}`} sub={`现金比重 ${capital.cashRatioPct.toFixed(1)}%`} valueClass="text-cyan-300" />
         <Stat label="今日总盈亏" value={signedMoney(account.todayPnL)} sub={`已实现/浮动 ${signedMoney(account.todayRealizedPnL)} / ${signedMoney(account.floatingPnL)}`} valueClass={tone(account.todayPnL)} />
-        <Stat label="持仓与市值" value={`¥ ${money(account.holdingValue)}`} sub={`${w.positions.length} 只持仓 / T+1 ${t1Count} 只`} />
-        <Stat label="今日交易流水" value={`${todayTrades.length} 笔登记`} sub={`买 ${todayBuys.length} / 卖 ${todaySells.length} / 费 ¥${money(todayFees)}`} />
+        <Stat label="账户持仓与市值" value={`¥ ${money(account.holdingValue)}`} sub={`${accountPositionCount} 只账户持仓 / 本模式 T+1 ${t1Count} 只`} />
+        <Stat label="当前模式流水" value={`${todayTrades.length} 笔登记`} sub={`买 ${todayBuys.length} / 卖 ${todaySells.length} / 费 ¥${money(todayFees)}`} />
         <Stat
           label="今日纪律执行"
           value={todayComplianceRate === null ? "今日无交易" : `${todayComplianceRate.toFixed(1)}%`}
@@ -130,19 +133,19 @@ export function Today({
             />
             <AuditMetric
               label="累计资产差额"
-              value={signedMoney(capital.assetChange)}
-              extra={pct(capital.assetChangePct)}
-              detail={`本金 ¥${money(account.initialCash)}`}
-              cls={tone(capital.assetChange)}
+              value={signedMoney(strategyAccount.totalPnL)}
+              extra={pct(strategyAccount.totalReturnPct)}
+              detail={`当前模式 / 本金 ¥${money(strategyAccount.initialCash)}`}
+              cls={tone(strategyAccount.totalPnL)}
             />
             <AuditMetric
-              label="累计净买入"
-              value={`¥ ${money(capital.netBuyAmount)}`}
+              label="当前模式净买入"
+              value={`¥ ${money(strategyCapital.netBuyAmount)}`}
               detail={w.positions.length ? `${w.positions.length} 只持仓` : "当前空仓"}
             />
             <AuditMetric
-              label="累计费用"
-              value={`¥ ${money(capital.totalFees)}`}
+              label="当前模式费用"
+              value={`¥ ${money(strategyCapital.totalFees)}`}
               detail={`${w.trades.length} 笔历史成交`}
             />
           </div>

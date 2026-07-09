@@ -381,6 +381,8 @@ function VisualDashboard({
   violationStats: Array<{ tag: string; count: number }>;
   reviews: Review[];
 }) {
+  const strategyAccount = w.strategyAccount || w.account;
+  const strategyCapital = w.strategyCapitalAnalysis || w.capitalAnalysis;
   const violations = w.trades.filter((trade) => trade.rulesConclusion !== "符合规则");
   const violationFees = violations.reduce((sum, trade) => sum + trade.totalFee, 0);
   const averageFee = w.trades.length ? w.reviewSummary.totalFees / w.trades.length : 0;
@@ -391,30 +393,30 @@ function VisualDashboard({
   return (
     <div className="space-y-6">
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
-        <Stat label="总资产" value={`¥${money(w.account.totalAssets)}`} sub={`初始 ¥${money(w.account.initialCash)}`} />
-        <Stat label="累计盈亏" value={signedMoney(w.account.totalPnL)} sub={pct(w.account.totalReturnPct)} valueClass={tone(w.account.totalPnL)} />
-        <Stat label="已实现盈亏" value={signedMoney(w.account.realizedPnL)} valueClass={tone(w.account.realizedPnL)} />
-        <Stat label="浮动盈亏" value={signedMoney(w.account.floatingPnL)} valueClass={tone(w.account.floatingPnL)} />
+        <Stat label="账户总资产" value={`¥${money(w.account.totalAssets)}`} sub={`账户本金 ¥${money(w.account.initialCash)}`} />
+        <Stat label="当前模式盈亏" value={signedMoney(strategyAccount.totalPnL)} sub={pct(strategyAccount.totalReturnPct)} valueClass={tone(strategyAccount.totalPnL)} />
+        <Stat label="模式已实现盈亏" value={signedMoney(strategyAccount.realizedPnL)} valueClass={tone(strategyAccount.realizedPnL)} />
+        <Stat label="模式浮动盈亏" value={signedMoney(strategyAccount.floatingPnL)} valueClass={tone(strategyAccount.floatingPnL)} />
         <Stat label="纪律执行率" value={`${stats.complianceRate.toFixed(1)}%`} sub={`违规 ${stats.violations} / ${stats.count}`} valueClass={stats.complianceRate >= 90 ? "text-emerald-300" : "text-amber-300"} />
-        <Stat label="总费用" value={`¥${money(stats.fees)}`} sub={`${stats.buyCount}/${stats.sellCount} 买卖`} />
+        <Stat label="当前模式费用" value={`¥${money(stats.fees)}`} sub={`${stats.buyCount}/${stats.sellCount} 买卖`} />
       </div>
 
       <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <Card className="p-5">
-          <SectionTitle title="全周期总资产净增长曲线" subtitle="总资产、已实现盈亏、浮动盈亏和费用放在同一张复盘视野里。" action={<BarChart3 size={18} className="mode-accent" />} />
+          <SectionTitle title="账户总资产净增长曲线" subtitle="资金曲线按模拟/实盘账户汇总；右侧指标和交易归因按当前交易模式统计。" action={<BarChart3 size={18} className="mode-accent" />} />
           <div className="mt-5">
             <EquityCurve points={w.capitalAnalysis.daily} fallbackValue={w.account.totalAssets} />
           </div>
           <div className="mt-4 grid gap-3 sm:grid-cols-4">
-            <Mini label="现金变化" value={signedMoney(w.capitalAnalysis.cashChange)} cls={tone(w.capitalAnalysis.cashChange)} />
-            <Mini label="资金占用" value={`${w.capitalAnalysis.capitalDeploymentPct.toFixed(1)}%`} />
-            <Mini label="现金比例" value={`${w.capitalAnalysis.cashRatioPct.toFixed(1)}%`} />
-            <Mini label="完成周期" value={`${w.reviewSummary.completedCycles} 个`} />
+            <Mini label="账户现金变化" value={signedMoney(w.capitalAnalysis.cashChange)} cls={tone(w.capitalAnalysis.cashChange)} />
+            <Mini label="账户资金占用" value={`${w.capitalAnalysis.capitalDeploymentPct.toFixed(1)}%`} />
+            <Mini label="账户现金比例" value={`${w.capitalAnalysis.cashRatioPct.toFixed(1)}%`} />
+            <Mini label="模式完成周期" value={`${w.reviewSummary.completedCycles} 个`} />
           </div>
         </Card>
 
         <Card className="p-5">
-          <SectionTitle title="个股盈亏结构" subtitle="已完成标的按买卖净额归因，红色为盈利，绿色为亏损。" />
+          <SectionTitle title="当前模式个股盈亏结构" subtitle="只统计当前交易模式内已完成标的，红色为盈利，绿色为亏损。" />
           <div className="mt-5">
             <NetFlowBars items={netFlows} />
           </div>

@@ -255,6 +255,24 @@ def test_strategy_catalog_and_strategy_scoped_workspace(client: TestClient):
     assert default_workspace["trades"] == []
     assert mode2_workspace["trades"][0]["code"] == "600176"
     assert mode3_workspace["trades"] == []
+    assert default_workspace["account"]["availableCash"] == mode2_workspace["account"]["availableCash"]
+    assert default_workspace["account"]["totalAssets"] == mode2_workspace["account"]["totalAssets"]
+    assert mode2_workspace["strategyAccount"]["availableCash"] != mode3_workspace["strategyAccount"]["availableCash"]
+
+    review = {
+        "accountMode": "simulation",
+        "strategyId": "mode2",
+        "type": "daily",
+        "date": "2026-07-08",
+        "planAndBasis": "模式2 条件复盘",
+        "executionAndDeviation": "",
+        "resultAndEmotion": "",
+        "improvementAndNextPlan": "",
+    }
+    saved = client.post("/api/accounts/simulation/reviews?strategy=mode2", json=review)
+    assert saved.status_code == 200
+    assert saved.json()["reviews"][0]["strategyId"] == "mode2"
+    assert client.get("/api/accounts/simulation/workspace").json()["reviews"] == []
 
 
 def test_placeholder_strategy_does_not_apply_ma5_time_window(client: TestClient):
