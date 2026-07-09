@@ -44,6 +44,29 @@ def trade_payload(**overrides):
     return payload
 
 
+def mode3_snapshot(**overrides):
+    snapshot = {
+        "entryChecklist": {
+            "priorVolumeExpansion": True,
+            "bearishCandle": True,
+            "pullbackVolumeShrunk": True,
+            "nearMa10": True,
+            "ma10Uptrend": True,
+            "midTermDistanceOk": True,
+            "notFirstPullbackBearish": True,
+            "positionSplit": True,
+        },
+        "ma10AtEntry": 98.5,
+        "distanceToMa10Pct": 1.52,
+        "priorLimitUp": False,
+        "plannedExitRule": "NEXT_TRADING_DAY",
+        "entryPatternNote": "缩量阴线回踩十日线",
+        "manualJudgement": "趋势未破坏",
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
 def test_health_and_removed_legacy_api(client: TestClient):
     health = client.get("/api/health")
     assert health.status_code == 200
@@ -287,3 +310,92 @@ def test_placeholder_strategy_does_not_apply_ma5_time_window(client: TestClient)
     assert mode2_response.status_code == 200
     assert mode2_response.json()["trades"][0]["rulesConclusion"] == "符合规则"
     assert mode2_response.json()["trades"][0]["violationTags"] == []
+
+
+def test_mode3_buy_snapshot_audit_and_position_reference(client: TestClient):
+    catalog = client.get("/api/accounts/simulation/strategies").json()
+    mode3 = next(item for item in catalog if item["id"] == "mode3")
+    assert mode3["name"] == "十日线缩量回踩隔日反弹"
+    assert mode3["placeholder"] is False
+
+    response = client.post("/api/accounts/simulation/trades?strategy=mode3", json=trade_payload(
+        historicalBackfill=False,
+        date="2026-07-08",
+        time="14:55:00",
+        price=100,
+        strategySnapshot=mode3_snapshot(),
+    ))
+    assert response.status_code == 200
+    trade = response.json()["trades"][0]
+    position = response.json()["positions"][0]
+    assert trade["rulesConclusion"] == "符合规则"
+    assert trade["strategySnapshot"]["plannedExitRule"] == "NEXT_TRADING_DAY"
+    assert position["referenceLine"] == "MA10"
+    assert position["referencePrice"] == 98.5
+    assert position["targetPrice"] > position["avgCost"]
+    assert position["warningStopPrice"] == 97.515
+    assert position["hardStopPrice"] == 95.545
+
+
+def test_mode3_buy_hard_and_soft_deviations(client: TestClient):
+    response = client.post("/api/accounts/simulation/trades?strategy=mode3", json=trade_payload(
+        historicalBackfill=False,
+        time="14:40:00",
+        price=100,
+        strategySnapshot=mode3_snapshot(entryChecklist={
+            "priorVolumeExpansion": True,
+            "bearishCandle": False,
+            "pullbackVolumeShrunk": False,
+            "nearMa10": False,
+            "ma10Uptrend": True,
+            "midTermDistanceOk": False,
+            "notFirstPullbackBearish": False,
+            "positionSplit": False,
+        }),
+    ))
+    assert response.status_code == 200
+    trade = response.json()["trades"][0]
+    assert trade["rulesConclusion"] == "违规交易"
+    assert "14:50以前买入" in trade["violationTags"]
+    assert "买入阳线" in trade["violationTags"]
+    assert "回调未缩量" in trade["violationTags"]
+    assert "未回踩十日线" in trade["violationTags"]
+    assert "十日线与中期均线距离偏大" in trade["violationTags"]
+    assert "未完成分仓确认" in trade["violationTags"]
+
+
+def test_mode3_sell_audit_and_review_metrics(client: TestClient):
+    buy_response = client.post("/api/accounts/simulation/trades?strategy=mode3", json=trade_payload(
+        historicalBackfill=False,
+        date="2026-07-08",
+        time="14:55:00",
+        price=100,
+        quantity=100,
+        strategySnapshot=mode3_snapshot(),
+    ))
+    assert buy_response.status_code == 200
+
+    sell_response = client.post("/api/accounts/simulation/trades?strategy=mode3", json=trade_payload(
+        type="SELL",
+        historicalBackfill=False,
+        date="2026-07-09",
+        time="09:50:00",
+        price=102.2,
+        quantity=100,
+        strategySnapshot={
+            "exitReason": "TARGET_PROFIT",
+            "extendedObservation": False,
+            "maxProfitPct": 2.2,
+            "exitNote": "次日目标止盈",
+        },
+    ))
+    assert sell_response.status_code == 200
+    sell = sell_response.json()["trades"][0]
+    summary = sell_response.json()["reviewSummary"]
+    assert sell["type"] == "SELL"
+    assert sell["rulesConclusion"] == "符合规则"
+    assert sell["strategySnapshot"]["exitReason"] == "TARGET_PROFIT"
+    assert summary["mode3TradeCount"] == 2
+    assert summary["nextDayExitRate"] == 100
+    assert summary["exitBefore10Rate"] == 100
+    assert summary["targetProfitRate"] == 100

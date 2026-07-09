@@ -86,6 +86,7 @@ class Lot:
     date: str
     quantity: int
     unit_cost: float
+    strategy_snapshot: dict[str, Any]
 
 
 def _simulate(mode: str, trades: list[dict[str, Any]], strategy_id: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], list[float]]:
@@ -110,7 +111,7 @@ def _simulate(mode: str, trades: list[dict[str, Any]], strategy_id: str | None =
         if trade["type"] == "BUY":
             cash -= amount + fee
             unit_cost = (amount + fee) / qty
-            lots[code].append(Lot(trade["date"], qty, unit_cost))
+            lots[code].append(Lot(trade["date"], qty, unit_cost, dict(trade.get("strategySnapshot") or {})))
         else:
             cash += amount - fee
             remaining = qty
@@ -144,6 +145,7 @@ def _simulate(mode: str, trades: list[dict[str, Any]], strategy_id: str | None =
         available = sum(lot.quantity for lot in queue if lot.date < today)
         locked = quantity - available
         buy_date = min(lot.date for lot in queue)
+        hold_days = _trading_days(buy_date, today)
         state = store.get_position_state(mode, code, strategy_id)
         deferred = bool(state.get("deferred"))
         now = _minutes(_now_hm())
@@ -154,7 +156,23 @@ def _simulate(mode: str, trades: list[dict[str, Any]], strategy_id: str | None =
             deferred=deferred,
             defer_reason=str(state.get("deferReason", "")),
             now_minutes=now,
+            hold_days=hold_days,
         )
+        first_snapshot = next((lot.strategy_snapshot for lot in queue if lot.strategy_snapshot), {})
+        reference_line = "MA5"
+        reference_price = current_price
+        distance_to_reference_pct = 0.0
+        target_price = None
+        warning_stop_price = None
+        hard_stop_price = None
+        if strategy_id == "mode3":
+            reference_line = "MA10"
+            reference_price = float(first_snapshot.get("ma10AtEntry") or 0)
+            if reference_price > 0:
+                distance_to_reference_pct = _round((current_price - reference_price) / reference_price * 100)
+                warning_stop_price = _round(reference_price * 0.99, 4)
+                hard_stop_price = _round(reference_price * 0.97, 4)
+            target_price = _round(avg_cost * 1.02, 4)
         position = {
             "code": code,
             "name": names.get(code, code),
@@ -167,10 +185,16 @@ def _simulate(mode: str, trades: list[dict[str, Any]], strategy_id: str | None =
             "marketValue": _round(market_value),
             "floatingPnL": _round(pnl),
             "floatingPnLPct": _round((pnl / cost_value * 100) if cost_value else 0),
-            "ma5": _round(current_price, 4),
-            "deviation5": 0.0,
+            "ma5": _round(current_price, 4) if strategy_id != "mode3" else None,
+            "deviation5": 0.0 if strategy_id != "mode3" else None,
+            "referenceLine": reference_line,
+            "referencePrice": _round(reference_price, 4) if reference_price else None,
+            "distanceToReferencePct": distance_to_reference_pct,
+            "targetPrice": target_price,
+            "warningStopPrice": warning_stop_price,
+            "hardStopPrice": hard_stop_price,
             "buyDate": buy_date,
-            "holdDays": _trading_days(buy_date, today),
+            "holdDays": hold_days,
             "status": decision.status,
             "advice": decision.advice,
             "nextActionTime": decision.nextActionTime,
@@ -179,6 +203,11 @@ def _simulate(mode: str, trades: list[dict[str, Any]], strategy_id: str | None =
             "actionTitle": decision.actionTitle,
             "canExecuteSellNow": available > 0,
             "sellBlockedReason": "T+1 可卖数量为 0" if available <= 0 else "",
+            "isTodayBuy": locked > 0,
+            "isNextDaySellable": available > 0,
+            "extendedObservation": deferred,
+            "deferReason": str(state.get("deferReason", "")),
+            "entryStrategySnapshot": first_snapshot,
             "isLimitUp": False,
             "quoteUpdatedAt": "",
             "quoteAgeSeconds": None,

@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react";
 import { Download, Minus, Plus, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
-import type { Side, Trade, Workspace } from "./types";
+import type { Side, StrategySnapshot, Trade, Workspace } from "./types";
 import { apiPath, defaultStrategies, money, normalizeStrategyId, request, signedMoney, today, tone } from "./lib";
 import { Badge, Card, Stat, TradeTable } from "./ui";
 
 type ConclusionFilter = "ALL" | "符合规则" | "部分不符" | "违规交易" | "无法判断";
+type ExitReasonFilter = "ALL" | string;
 
 export function Trades({
   workspace: w,
@@ -25,6 +26,7 @@ export function Trades({
   const [backfillOnly, setBackfillOnly] = useState(false);
   const [manualFeeOnly, setManualFeeOnly] = useState(false);
   const [remarkOnly, setRemarkOnly] = useState(false);
+  const [exitReason, setExitReason] = useState<ExitReasonFilter>("ALL");
 
   const rows = useMemo(() => {
     return workspace.trades.filter((trade) => {
@@ -36,9 +38,10 @@ export function Trades({
       if (backfillOnly && !trade.historicalBackfill) return false;
       if (manualFeeOnly && !trade.manualFeeOverride) return false;
       if (remarkOnly && !trade.remark && !trade.reason) return false;
+      if (exitReason !== "ALL" && String(snapshotOf(trade).exitReason || "") !== exitReason) return false;
       return true;
     });
-  }, [workspace.trades, query, side, conclusion, tradeDate, backfillOnly, manualFeeOnly, remarkOnly]);
+  }, [workspace.trades, query, side, conclusion, tradeDate, backfillOnly, manualFeeOnly, remarkOnly, exitReason]);
 
   const buyCount = workspace.trades.filter((item) => item.type === "BUY").length;
   const sellCount = workspace.trades.filter((item) => item.type === "SELL").length;
@@ -54,10 +57,23 @@ export function Trades({
     setBackfillOnly(false);
     setManualFeeOnly(false);
     setRemarkOnly(false);
+    setExitReason("ALL");
   };
 
   const exportCsv = () => {
-    const header = ["日期", "时间", "方向", "代码", "名称", "价格", "数量", "成交金额", "费用", "纪律结论", "原因", "备注"];
+    const mode3Header = [
+      "入场检查表",
+      "买入十日线",
+      "距十日线%",
+      "前期涨停",
+      "计划退出规则",
+      "退出原因",
+      "延长观察",
+      "最高盈利%",
+      "退出备注",
+      "规则快照JSON",
+    ];
+    const header = ["日期", "时间", "方向", "代码", "名称", "价格", "数量", "成交金额", "费用", "纪律结论", "偏差标签", "原因", "备注", ...mode3Header];
     const body = rows.map((trade) => [
       trade.date,
       trade.time,
@@ -69,8 +85,19 @@ export function Trades({
       trade.amount,
       trade.totalFee,
       trade.rulesConclusion,
+      trade.violationTags.join("、"),
       trade.reason,
       trade.remark,
+      mode3ChecklistCsv(trade),
+      snapshotOf(trade).ma10AtEntry ?? "",
+      snapshotOf(trade).distanceToMa10Pct ?? "",
+      snapshotOf(trade).priorLimitUp === undefined ? "" : snapshotOf(trade).priorLimitUp ? "是" : "否",
+      snapshotOf(trade).plannedExitRule ?? "",
+      mode3ExitReasonLabel(String(snapshotOf(trade).exitReason || "")),
+      snapshotOf(trade).extendedObservation === undefined ? "" : snapshotOf(trade).extendedObservation ? "是" : "否",
+      snapshotOf(trade).maxProfitPct ?? "",
+      snapshotOf(trade).exitNote ?? "",
+      JSON.stringify(snapshotOf(trade)),
     ]);
     const csv = [header, ...body]
       .map((line) => line.map((cell) => `"${String(cell ?? "").replaceAll('"', '""')}"`).join(","))
@@ -165,6 +192,12 @@ export function Trades({
             <input type="checkbox" checked={remarkOnly} onChange={(event) => setRemarkOnly(event.target.checked)} />
             有原因/备注
           </label>
+          {workspace.strategyId === "mode3" && (
+            <select className="input h-9 max-w-56 py-1 text-xs" value={exitReason} onChange={(event) => setExitReason(event.target.value)}>
+              <option value="ALL">全部退出原因</option>
+              {mode3ExitReasonOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          )}
           <Badge tone="slate">当前结果 {rows.length} 笔</Badge>
         </div>
       </Card>
@@ -243,6 +276,12 @@ function normalizeTradeWorkspace(input: Workspace): Workspace {
       totalFees: numberValue(reviewSummary.totalFees),
       complianceRate: numberValue(reviewSummary.complianceRate),
       violationCount: numberValue(reviewSummary.violationCount),
+      mode3TradeCount: numberValue(reviewSummary.mode3TradeCount),
+      nextDayExitRate: numberValue(reviewSummary.nextDayExitRate),
+      exitBefore10Rate: numberValue(reviewSummary.exitBefore10Rate),
+      targetProfitRate: numberValue(reviewSummary.targetProfitRate),
+      averageHoldingTradingDays: numberValue(reviewSummary.averageHoldingTradingDays),
+      overduePositionCount: numberValue(reviewSummary.overduePositionCount),
     },
     trades: trades.map((item, index) => {
       const trade = objectValue(item);
@@ -267,9 +306,51 @@ function normalizeTradeWorkspace(input: Workspace): Workspace {
         remark: textValue(trade.remark),
         rulesConclusion: textValue(trade.rulesConclusion, "无法判断"),
         violationTags: Array.isArray(trade.violationTags) ? trade.violationTags.filter(Boolean).map(String) : [],
+        strategySnapshot: snapshotObject(trade.strategySnapshot),
         historicalBackfill: Boolean(trade.historicalBackfill),
         manualFeeOverride: Boolean(trade.manualFeeOverride),
       } as Trade;
     }),
   };
+}
+
+function snapshotObject(value: unknown): StrategySnapshot {
+  return value && typeof value === "object" ? value as StrategySnapshot : {};
+}
+
+function snapshotOf(trade: Trade): StrategySnapshot {
+  return snapshotObject(trade.strategySnapshot);
+}
+
+const mode3ChecklistLabels: Array<[string, string]> = [
+  ["priorVolumeExpansion", "前期放量"],
+  ["bearishCandle", "阴线"],
+  ["pullbackVolumeShrunk", "缩量"],
+  ["nearMa10", "回踩十日线"],
+  ["ma10Uptrend", "趋势未破坏"],
+  ["midTermDistanceOk", "均线距离"],
+  ["notFirstPullbackBearish", "非首阴"],
+  ["positionSplit", "分仓"],
+];
+
+function mode3ChecklistCsv(trade: Trade) {
+  const checks = snapshotObject(snapshotOf(trade).entryChecklist);
+  return mode3ChecklistLabels
+    .map(([key, label]) => `${label}:${checks[key] ? "是" : "否"}`)
+    .join("；");
+}
+
+const mode3ExitReasonOptions: Array<[string, string]> = [
+  ["TARGET_PROFIT", "2%目标止盈"],
+  ["OPEN_BELOW_MA10", "开盘跌破十日线"],
+  ["INTRADAY_AVERAGE_BROKEN", "跌破分时均价线"],
+  ["MA5_PRESSURE_FAILED", "五日线突破失败"],
+  ["MA10_STOP", "十日线止损"],
+  ["HARD_STOP", "硬止损"],
+  ["EXTENDED_SAME_DAY_EXIT", "延长后尾盘退出"],
+  ["OTHER", "其他"],
+];
+
+function mode3ExitReasonLabel(value: string) {
+  return mode3ExitReasonOptions.find(([key]) => key === value)?.[1] || value;
 }

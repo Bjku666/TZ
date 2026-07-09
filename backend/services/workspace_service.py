@@ -1,18 +1,27 @@
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from math import isfinite
 from typing import Any
 from uuid import uuid4
 
 from backend.services import quote_service
 from backend.services.ledger_engine import _now_hm, _round, _simulate, _today, calculate_fees
-from backend.services.strategy_rules import audit_buy, get_strategy, list_strategies, validate_strategy
+from backend.services.strategy_rules import MODE3_STRATEGY_ID, audit_buy, audit_sell, get_strategy, list_strategies, validate_strategy
 from backend.storage import account_store as store
 
 
 def _money_sum(trades: list[dict[str, Any]], side: str) -> float:
     return _round(sum(float(item["amount"]) for item in trades if item["type"] == side))
+
+
+def _minutes(text: str) -> int:
+    try:
+        hour, minute = map(int, str(text)[:5].split(":"))
+        return hour * 60 + minute
+    except (ValueError, AttributeError):
+        return -1
+
 
 def _pending_actions(mode: str, strategy_id: str, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
@@ -33,7 +42,62 @@ def _pending_actions(mode: str, strategy_id: str, positions: list[dict[str, Any]
             "nextActionTime": position.get("nextActionTime"),
             "position": position,
         })
+    if strategy_id == MODE3_STRATEGY_ID and not positions:
+        action = _mode3_selection_action(mode, strategy_id)
+        if action:
+            actions.append(action)
     return actions
+
+
+def _mode3_selection_action(mode: str, strategy_id: str) -> dict[str, Any] | None:
+    now_minutes = _minutes(_now_hm())
+    schedule = [
+        (10 * 60, "10:00", "第一次筛选", "人工在同花顺完成第一次筛选：前期明显放量、上升趋势、缩量阴线回踩十日线。"),
+        (11 * 60, "11:00", "第二次筛选", "人工在同花顺复核候选，不在 TZ 内自动扫描股票。"),
+        (13 * 60 + 30, "13:30", "第三次筛选", "继续核对缩量回踩和十日线支撑，剔除趋势已破坏标的。"),
+        (14 * 60 + 30, "14:30", "形成最终候选", "形成尾盘候选清单，只保留接近十日线且非第一根回调阴线的标的。"),
+        (14 * 60 + 50, "14:50", "执行尾盘买入", "14:50-15:00 是本模式唯一买入登记窗口，执行分仓买入。"),
+    ]
+    if now_minutes >= 15 * 60:
+        return {
+            "id": f"{mode}:{strategy_id}:selection:closed",
+            "accountMode": mode,
+            "strategyId": strategy_id,
+            "code": "MODE3",
+            "name": "十日线缩量回踩",
+            "type": "SELECTION_CLOSED",
+            "priority": "normal",
+            "title": "停止新增买入",
+            "message": "15:00 以后停止新增买入，只做记录、复盘和次日计划准备。",
+            "nextActionTime": "下一交易日 10:00",
+        }
+    next_item = next(((minute, time_text, title, message) for minute, time_text, title, message in schedule if now_minutes < minute), None)
+    if not next_item:
+        return {
+            "id": f"{mode}:{strategy_id}:selection:entry-window",
+            "accountMode": mode,
+            "strategyId": strategy_id,
+            "code": "MODE3",
+            "name": "十日线缩量回踩",
+            "type": "MODE3_ENTRY_WINDOW",
+            "priority": "warning",
+            "title": "执行尾盘买入",
+            "message": "当前处于 14:50-15:00 买入窗口；只登记已人工确认的缩量阴线十日线回踩，并完成分仓。",
+            "nextActionTime": "15:00",
+        }
+    _minute, time_text, title, message = next_item
+    return {
+        "id": f"{mode}:{strategy_id}:selection:{time_text}",
+        "accountMode": mode,
+        "strategyId": strategy_id,
+        "code": "MODE3",
+        "name": "十日线缩量回踩",
+        "type": "MODE3_SELECTION_REMINDER",
+        "priority": "normal",
+        "title": title,
+        "message": message,
+        "nextActionTime": time_text,
+    }
 
 
 def _review_summary(mode: str, strategy_id: str, trades: list[dict[str, Any]], account: dict[str, Any], cycle_pnls: list[float]) -> dict[str, Any]:
@@ -43,7 +107,7 @@ def _review_summary(mode: str, strategy_id: str, trades: list[dict[str, Any]], a
     avg_win = sum(wins) / len(wins) if wins else 0.0
     avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
     dates = [item["date"] for item in trades]
-    return {
+    summary = {
         "mode": mode,
         "strategyId": strategy_id,
         "startDate": min(dates) if dates else _today(),
@@ -62,6 +126,61 @@ def _review_summary(mode: str, strategy_id: str, trades: list[dict[str, Any]], a
         "complianceRate": _round((len(trades) - violations) / len(trades) * 100 if trades else 100),
         "violationCount": violations,
     }
+    if strategy_id == MODE3_STRATEGY_ID:
+        summary.update(_mode3_review_metrics(trades))
+    return summary
+
+
+def _mode3_review_metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(trades)
+    sells = [item for item in trades if item["type"] == "SELL"]
+    buy_dates_by_code: dict[str, list[str]] = {}
+    for trade in sorted(trades, key=lambda item: (item["date"], item["time"], item.get("createdAt", ""))):
+        if trade["type"] == "BUY":
+            buy_dates_by_code.setdefault(trade["code"], []).append(trade["date"])
+    next_day_exits = 0
+    before_10_exits = 0
+    target_hits = 0
+    holding_days: list[int] = []
+    overdue = 0
+    for sell in sells:
+        buy_date = buy_dates_by_code.get(sell["code"], [sell["date"]])[0]
+        hold_days = _trading_days_for_summary(buy_date, sell["date"])
+        holding_days.append(hold_days)
+        if hold_days <= 2:
+            next_day_exits += 1
+        else:
+            overdue += 1
+        if _minutes(str(sell.get("time", ""))) < 10 * 60:
+            before_10_exits += 1
+        snapshot = sell.get("strategySnapshot") or {}
+        if isinstance(snapshot, dict) and (snapshot.get("exitReason") == "TARGET_PROFIT" or float(snapshot.get("maxProfitPct") or 0) >= 2):
+            target_hits += 1
+    return {
+        "mode3TradeCount": total,
+        "nextDayExitRate": _round(next_day_exits / len(sells) * 100 if sells else 0),
+        "exitBefore10Rate": _round(before_10_exits / len(sells) * 100 if sells else 0),
+        "targetProfitRate": _round(target_hits / len(sells) * 100 if sells else 0),
+        "averageHoldingTradingDays": _round(sum(holding_days) / len(holding_days) if holding_days else 0),
+        "overduePositionCount": overdue,
+    }
+
+
+def _trading_days_for_summary(start: str, end: str) -> int:
+    try:
+        start_date = datetime.fromisoformat(start[:10]).date()
+        end_date = datetime.fromisoformat(end[:10]).date()
+    except ValueError:
+        return 0
+    if end_date < start_date:
+        return 0
+    count = 0
+    cursor = start_date
+    while cursor <= end_date:
+        if cursor.weekday() < 5:
+            count += 1
+        cursor += timedelta(days=1)
+    return count
 
 
 def _capital_analysis(mode: str, strategy_id: str, trades: list[dict[str, Any]], account: dict[str, Any], positions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -245,6 +364,9 @@ def _apply_quotes(account: dict[str, Any], positions: list[dict[str, Any]], quot
             "quoteUpdatedAt": quote.get("updatedAt", ""),
             "quoteSource": quote.get("source", ""),
         }
+        reference_price = float(updated.get("referencePrice") or 0)
+        if reference_price > 0:
+            updated["distanceToReferencePct"] = _round((current_price - reference_price) / reference_price * 100)
         if previous_close > 0:
             updated["deviation5"] = _round((current_price - previous_close) / previous_close * 100)
         updated_positions.append(updated)
@@ -304,15 +426,30 @@ def create_trade(mode: str, payload: dict[str, Any], strategy_id: str | None = N
         raise ValueError("价格和数量必须大于 0")
     fees = _fees_from_payload(payload, calculate_fees(side, price, quantity, settings))
     historical = bool(payload.get("historicalBackfill", False))
+    strategy_snapshot = _normalize_strategy_snapshot(strategy_id, side, payload.get("strategySnapshot"))
     if historical:
         conclusion, tags = _historical_audit(payload)
     elif side == "BUY":
-        conclusion, tags = audit_buy(strategy_id, price, quantity, str(payload.get("time", _now_hm())), current_workspace["account"]["availableCash"], fees)
+        conclusion, tags = audit_buy(
+            strategy_id,
+            price,
+            quantity,
+            str(payload.get("time", _now_hm())),
+            current_workspace["account"]["availableCash"],
+            fees,
+            strategy_snapshot,
+        )
     else:
         position = next((item for item in current_workspace["positions"] if item["code"] == str(payload.get("code", ""))), None)
         if not position or quantity > int(position["availableQuantity"]):
             raise ValueError("卖出数量超过当前账户的可卖数量，或该账户不存在此持仓")
-        conclusion, tags = "符合规则", []
+        conclusion, tags = audit_sell(
+            strategy_id,
+            trade_date=str(payload.get("date") or _today()),
+            trade_time=str(payload.get("time", _now_hm())),
+            position=position,
+            strategy_snapshot=strategy_snapshot,
+        )
     trade = {
         "id": str(payload.get("id") or f"trade-{uuid4().hex}"),
         "accountMode": mode,
@@ -330,6 +467,7 @@ def create_trade(mode: str, payload: dict[str, Any], strategy_id: str | None = N
         "remark": str(payload.get("remark", "")),
         "rulesConclusion": conclusion,
         "violationTags": tags,
+        "strategySnapshot": strategy_snapshot,
         "historicalBackfill": historical,
         "manualFeeOverride": bool(payload.get("manualFeeOverride", False)),
     }
@@ -352,13 +490,54 @@ def update_trade(mode: str, trade_id: str, payload: dict[str, Any], strategy_id:
     merged["amount"] = _round(price * quantity)
     auto_fees = calculate_fees(merged["type"], price, quantity, store.get_settings(mode))
     merged.update(_fees_from_payload(merged, auto_fees))
+    merged["strategySnapshot"] = _normalize_strategy_snapshot(strategy_id, str(merged.get("type", "BUY")), merged.get("strategySnapshot"))
     if merged.get("historicalBackfill"):
         conclusion, tags = _historical_audit(merged)
+        merged["rulesConclusion"] = conclusion
+        merged["violationTags"] = tags
+    elif str(merged.get("type", "BUY")).upper() == "BUY":
+        current_workspace = workspace(mode, strategy_id)
+        conclusion, tags = audit_buy(
+            strategy_id,
+            price,
+            quantity,
+            str(merged.get("time", _now_hm())),
+            current_workspace["account"]["availableCash"],
+            auto_fees,
+            merged["strategySnapshot"],
+        )
+        merged["rulesConclusion"] = conclusion
+        merged["violationTags"] = tags
+    elif strategy_id == MODE3_STRATEGY_ID:
+        current_workspace = workspace(mode, strategy_id)
+        position = next((item for item in current_workspace["positions"] if item["code"] == str(merged.get("code", ""))), None)
+        conclusion, tags = audit_sell(
+            strategy_id,
+            trade_date=str(merged.get("date") or _today()),
+            trade_time=str(merged.get("time", _now_hm())),
+            position=position,
+            strategy_snapshot=merged["strategySnapshot"],
+        )
         merged["rulesConclusion"] = conclusion
         merged["violationTags"] = tags
     store.upsert_trade(mode, merged, strategy_id)
     store.add_notification(mode, "INFO", "交易记录已更新", f"{merged['name']} 的成交记录和账户汇总已重算。", merged["code"], strategy_id)
     return workspace(mode, strategy_id)
+
+
+def _normalize_strategy_snapshot(strategy_id: str, side: str, value: Any) -> dict[str, Any]:
+    snapshot = dict(value) if isinstance(value, dict) else {}
+    if strategy_id != MODE3_STRATEGY_ID:
+        return snapshot
+    if side.upper() == "BUY":
+        entry = snapshot.get("entryChecklist") if isinstance(snapshot.get("entryChecklist"), dict) else {}
+        snapshot["entryChecklist"] = dict(entry)
+        snapshot.setdefault("plannedExitRule", "NEXT_TRADING_DAY")
+    else:
+        if snapshot.get("extendedObservation") is None:
+            snapshot["extendedObservation"] = False
+        snapshot.setdefault("exitReason", "")
+    return snapshot
 
 
 def delete_trade(mode: str, trade_id: str, strategy_id: str | None = None) -> dict[str, Any]:

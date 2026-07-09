@@ -28,6 +28,13 @@ const dailyFields: Array<[ReviewField, string, string]> = [
   ["improvementAndNextPlan", "04 明日硬规则", "只保留明天能检查的时间、条件和动作"],
 ];
 
+const mode3DailyFields: Array<[ReviewField, string, string]> = [
+  ["planAndBasis", "01 今日计划与交易依据", "买入是否满足放量、缩量阴线、十日线条件，是否在14:50以后执行并分仓"],
+  ["executionAndDeviation", "02 执行偏差", "是否提前买入、买了阳线/放量阴线/第一根阴线，是否追涨、补仓或计划外交易"],
+  ["resultAndEmotion", "03 结果归因与情绪", "盈亏来自策略概率还是执行偏差，是否因为想多赚错过止盈或因亏损不愿止损"],
+  ["improvementAndNextPlan", "04 下一交易日硬规则", "14:50以前不买入，未到十日线不买，次日10:00前完成主要处理"],
+];
+
 const weeklyFields: Array<[ReviewField, string, string]> = [
   ["planAndBasis", "01 本周核心模式", "本周最有效或最应避免的入场条件、持仓处理和退出节奏"],
   ["executionAndDeviation", "02 冲动偏差归因", "提前买、追高、犹豫、延迟卖出、补录失真等行为来源"],
@@ -157,6 +164,7 @@ function normalizeWorkspace(input: Workspace): Workspace {
       violationTags: Array.isArray(trade.violationTags) ? trade.violationTags.filter(Boolean).map(String) : [],
       historicalBackfill: Boolean(trade.historicalBackfill),
       manualFeeOverride: Boolean(trade.manualFeeOverride),
+      strategySnapshot: objectValue(trade.strategySnapshot),
       } as Trade;
     }),
     reviewSummary: {
@@ -173,6 +181,12 @@ function normalizeWorkspace(input: Workspace): Workspace {
       totalFees: numberValue(reviewSummary.totalFees),
       complianceRate: numberValue(reviewSummary.complianceRate),
       violationCount: numberValue(reviewSummary.violationCount),
+      mode3TradeCount: numberValue(reviewSummary.mode3TradeCount),
+      nextDayExitRate: numberValue(reviewSummary.nextDayExitRate),
+      exitBefore10Rate: numberValue(reviewSummary.exitBefore10Rate),
+      targetProfitRate: numberValue(reviewSummary.targetProfitRate),
+      averageHoldingTradingDays: numberValue(reviewSummary.averageHoldingTradingDays),
+      overduePositionCount: numberValue(reviewSummary.overduePositionCount),
     },
     capitalAnalysis: {
       initialCash: numberValue(capitalAnalysis.initialCash),
@@ -342,6 +356,7 @@ export function Reviews({ workspace: w, onMutate }: { workspace: Workspace; onMu
           date={date}
           stats={stats}
           trades={selectedTrades}
+          strategyId={workspace.strategyId}
           emotion={emotion}
           onEmotion={setEmotion}
           form={form}
@@ -387,6 +402,7 @@ function VisualDashboard({
   const violationFees = violations.reduce((sum, trade) => sum + trade.totalFee, 0);
   const averageFee = w.trades.length ? w.reviewSummary.totalFees / w.trades.length : 0;
   const estimatedFriction = violationFees + averageFee * violations.length;
+  const isMode3 = w.strategyId === "mode3";
   const advice = violationStats.length
     ? `当前最高频偏差是【${violationStats[0].tag}】。下一阶段把这类动作压到 0，买入和卖出都回到【${w.strategy.name}】的规则框架。`
     : "当前交易模式暂无明显违纪类型。下一阶段重点是保持少交易，只记录计划内机会。";
@@ -400,6 +416,17 @@ function VisualDashboard({
         <Stat label="纪律执行率" value={`${stats.complianceRate.toFixed(1)}%`} sub={`违规 ${stats.violations} / ${stats.count}`} valueClass={stats.complianceRate >= 90 ? "text-emerald-300" : "text-amber-300"} />
         <Stat label="当前模式费用" value={`¥${money(stats.fees)}`} sub={`${stats.buyCount}/${stats.sellCount} 买卖`} />
       </div>
+
+      {isMode3 && (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+          <Stat label="模式三总交易" value={`${w.reviewSummary.mode3TradeCount || 0} 笔`} />
+          <Stat label="次日完成退出" value={`${Number(w.reviewSummary.nextDayExitRate || 0).toFixed(1)}%`} />
+          <Stat label="10:00前退出" value={`${Number(w.reviewSummary.exitBefore10Rate || 0).toFixed(1)}%`} />
+          <Stat label="2%目标达到" value={`${Number(w.reviewSummary.targetProfitRate || 0).toFixed(1)}%`} />
+          <Stat label="平均持仓日" value={`${Number(w.reviewSummary.averageHoldingTradingDays || 0).toFixed(1)} 天`} />
+          <Stat label="超期持仓" value={`${w.reviewSummary.overduePositionCount || 0} 次`} valueClass={w.reviewSummary.overduePositionCount ? "text-rose-300" : "text-emerald-300"} />
+        </div>
+      )}
 
       <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <Card className="p-5">
@@ -473,6 +500,7 @@ function DailyReview({
   date,
   stats,
   trades,
+  strategyId,
   emotion,
   onEmotion,
   form,
@@ -482,6 +510,7 @@ function DailyReview({
   date: string;
   stats: ReturnType<typeof summarizeTrades>;
   trades: Trade[];
+  strategyId: Workspace["strategyId"];
   emotion: string;
   onEmotion: (value: string) => void;
   form: Record<ReviewField, string>;
@@ -495,7 +524,7 @@ function DailyReview({
       <ReviewForm
         title="每日盘后复盘日志"
         subtitle="计划依据、执行偏差、结果情绪、明日硬规则"
-        fields={dailyFields}
+        fields={strategyId === "mode3" ? mode3DailyFields : dailyFields}
         date={date}
         stats={stats}
         emotion={emotion}

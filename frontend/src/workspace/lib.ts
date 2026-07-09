@@ -22,13 +22,13 @@ export const defaultStrategies: StrategyMode[] = [
   },
   {
     id: "mode3",
-    name: "模式3",
-    description: "规则名称与交易纪律待配置",
-    ruleStatus: "待配置",
-    buyRuleSummary: "暂只执行基础账户约束：价格有效、100 股整数倍、可用资金充足。",
-    positionRuleSummary: "持仓监控策略待配置，系统先提示人工复核。",
-    reviewFocus: "复盘模板先沿用通用四段式，后续可替换为模式3专用字段。",
-    placeholder: true,
+    name: "十日线缩量回踩隔日反弹",
+    description: "前期明显放量、上升趋势中缩量阴线回踩十日线，尾盘分仓买入，次日早盘利用反弹退出。",
+    ruleStatus: "已启用",
+    buyRuleSummary: "只在 14:50-15:00 尾盘登记买入；必须确认缩量阴线、回踩十日线、趋势未破坏、非第一根回调阴线并完成分仓。",
+    positionRuleSummary: "今日买入 T+1 锁定；次日 09:25 起检查，09:45-10:00 为主要退出窗口，10:00 后需卖出或登记突破五日线延长至尾盘。",
+    reviewFocus: "放量与缩量条件、14:50 后执行、分仓确认、次日退出率、10:00 前处理和超期持仓。",
+    placeholder: false,
   },
 ];
 

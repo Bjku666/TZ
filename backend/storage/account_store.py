@@ -125,6 +125,7 @@ def init_account_storage() -> None:
                 remark TEXT NOT NULL DEFAULT '',
                 rules_conclusion TEXT NOT NULL DEFAULT '无法判断',
                 violation_tags_json TEXT NOT NULL DEFAULT '[]',
+                strategy_snapshot_json TEXT NOT NULL DEFAULT '{}',
                 historical_backfill INTEGER NOT NULL DEFAULT 0,
                 manual_fee_override INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -207,6 +208,7 @@ def _migrate_strategy_scope(conn: sqlite3.Connection) -> None:
     trade_columns = _columns(conn, "trades")
     if "strategy_id" not in trade_columns or _pk_columns(conn, "trades") != ["id", "mode", "strategy_id"]:
         strategy_expr = "COALESCE(strategy_id,'ma5_pullback')" if "strategy_id" in trade_columns else "'ma5_pullback'"
+        snapshot_expr = "COALESCE(strategy_snapshot_json,'{}')" if "strategy_snapshot_json" in trade_columns else "'{}'"
         conn.executescript(
             f"""
             ALTER TABLE trades RENAME TO trades_legacy_strategy_migration;
@@ -230,6 +232,7 @@ def _migrate_strategy_scope(conn: sqlite3.Connection) -> None:
                 remark TEXT NOT NULL DEFAULT '',
                 rules_conclusion TEXT NOT NULL DEFAULT '无法判断',
                 violation_tags_json TEXT NOT NULL DEFAULT '[]',
+                strategy_snapshot_json TEXT NOT NULL DEFAULT '{{}}',
                 historical_backfill INTEGER NOT NULL DEFAULT 0,
                 manual_fee_override INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -239,16 +242,18 @@ def _migrate_strategy_scope(conn: sqlite3.Connection) -> None:
             INSERT OR IGNORE INTO trades(
                 id,mode,strategy_id,code,name,side,trade_date,trade_time,price,quantity,amount,
                 commission,stamp_duty,transfer_fee,total_fee,reason,remark,rules_conclusion,
-                violation_tags_json,historical_backfill,manual_fee_override,created_at,updated_at
+                violation_tags_json,strategy_snapshot_json,historical_backfill,manual_fee_override,created_at,updated_at
             )
             SELECT
                 id,mode,{strategy_expr},code,name,side,trade_date,trade_time,price,quantity,amount,
                 commission,stamp_duty,transfer_fee,total_fee,reason,remark,rules_conclusion,
-                violation_tags_json,historical_backfill,manual_fee_override,created_at,updated_at
+                violation_tags_json,{snapshot_expr},historical_backfill,manual_fee_override,created_at,updated_at
             FROM trades_legacy_strategy_migration;
             DROP TABLE trades_legacy_strategy_migration;
             """
         )
+    elif "strategy_snapshot_json" not in trade_columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN strategy_snapshot_json TEXT NOT NULL DEFAULT '{}'")
 
     position_columns = _columns(conn, "position_state")
     if "strategy_id" not in position_columns or _pk_columns(conn, "position_state") != ["mode", "strategy_id", "code"]:
@@ -397,7 +402,8 @@ def upsert_trade(mode: str, trade: dict[str, Any], strategy_id: str | None = Non
         float(trade["amount"]), float(trade.get("commission", 0)), float(trade.get("stampDuty", 0)),
         float(trade.get("transferFee", 0)), float(trade.get("totalFee", 0)), str(trade.get("reason", "")),
         str(trade.get("remark", "")), str(trade.get("rulesConclusion", "无法判断")),
-        json.dumps(trade.get("violationTags", []), ensure_ascii=False), int(bool(trade.get("historicalBackfill"))),
+        json.dumps(trade.get("violationTags", []), ensure_ascii=False),
+        json.dumps(trade.get("strategySnapshot", {}), ensure_ascii=False), int(bool(trade.get("historicalBackfill"))),
         int(bool(trade.get("manualFeeOverride"))), created_at, now,
     )
     with connect() as conn:
@@ -406,14 +412,15 @@ def upsert_trade(mode: str, trade: dict[str, Any], strategy_id: str | None = Non
             INSERT INTO trades(
                 id,mode,strategy_id,code,name,side,trade_date,trade_time,price,quantity,amount,
                 commission,stamp_duty,transfer_fee,total_fee,reason,remark,rules_conclusion,
-                violation_tags_json,historical_backfill,manual_fee_override,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                violation_tags_json,strategy_snapshot_json,historical_backfill,manual_fee_override,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id,mode,strategy_id) DO UPDATE SET
                 code=excluded.code,name=excluded.name,side=excluded.side,trade_date=excluded.trade_date,
                 trade_time=excluded.trade_time,price=excluded.price,quantity=excluded.quantity,amount=excluded.amount,
                 commission=excluded.commission,stamp_duty=excluded.stamp_duty,transfer_fee=excluded.transfer_fee,
                 total_fee=excluded.total_fee,reason=excluded.reason,remark=excluded.remark,
                 rules_conclusion=excluded.rules_conclusion,violation_tags_json=excluded.violation_tags_json,
+                strategy_snapshot_json=excluded.strategy_snapshot_json,
                 historical_backfill=excluded.historical_backfill,manual_fee_override=excluded.manual_fee_override,
                 updated_at=excluded.updated_at
             """,
@@ -582,6 +589,7 @@ def _trade_row(row: sqlite3.Row) -> dict[str, Any]:
         "stampDuty": row["stamp_duty"], "transferFee": row["transfer_fee"], "totalFee": row["total_fee"],
         "reason": row["reason"], "remark": row["remark"], "rulesConclusion": row["rules_conclusion"],
         "violationTags": json.loads(row["violation_tags_json"] or "[]"),
+        "strategySnapshot": json.loads(row["strategy_snapshot_json"] or "{}"),
         "historicalBackfill": bool(row["historical_backfill"]), "manualFeeOverride": bool(row["manual_fee_override"]),
         "createdAt": row["created_at"], "updatedAt": row["updated_at"],
     }

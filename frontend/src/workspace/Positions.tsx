@@ -29,11 +29,19 @@ export function Positions({
   };
 
   const defer = (position: Position) => {
-    onMutate(request(apiPath(w.mode, `/positions/${position.code}/defer-exit`, w.strategyId), { method: "POST", body: JSON.stringify({ reason: "用户明确延后处理" }) }));
+    const reason = w.strategyId === "mode3" ? "10:00前突破五日线，延长观察至当日尾盘" : "用户明确延后处理";
+    onMutate(request(apiPath(w.mode, `/positions/${position.code}/defer-exit`, w.strategyId), { method: "POST", body: JSON.stringify({ reason }) }));
   };
 
   const cancelDefer = (position: Position) => {
     onMutate(request(apiPath(w.mode, `/positions/${position.code}/defer-exit`, w.strategyId), { method: "DELETE" }));
+  };
+  const startBuy = () => {
+    if (w.strategyId === "mode3" && w.positions.length) {
+      const ok = confirm("本模式原则上不做T、不进行常规补仓，请确认是否属于历史补录或特殊情况。");
+      if (!ok) return;
+    }
+    onTrade("BUY");
   };
 
   return (
@@ -70,9 +78,9 @@ export function Positions({
                 <div className="text-[14px] font-black text-white">当前活动持仓账目明细</div>
                 <p className="mt-1 text-[11px] leading-5 text-[#77808f]">持仓均价、偏离及决策状态均从对应交易流水按 A 股先进先出算法动态推导</p>
               </div>
-              <button className="btn-primary" onClick={() => onTrade("BUY")}>
+              <button className="btn-primary" onClick={startBuy}>
                 <Plus size={14} />
-                补录/加仓登记
+                {w.strategyId === "mode3" ? "补录/特殊买入" : "补录/加仓登记"}
               </button>
             </div>
             {view === "table" ? (
@@ -167,8 +175,10 @@ function PositionTable({
                 <div className="mt-1">{position.floatingPnLPct >= 0 ? "+" : ""}{position.floatingPnLPct.toFixed(2)}%</div>
               </td>
               <td className="px-4 py-3 font-mono">
-                <div>{position.ma5.toFixed(2)}</div>
-                <div className={tone(position.deviation5)}>{position.deviation5 >= 0 ? "+" : ""}{position.deviation5.toFixed(2)}%</div>
+                <div>{referenceLabel(position)} {formatPrice(referencePrice(position), 2)}</div>
+                <div className={tone(referenceDistance(position))}>{formatPct(referenceDistance(position))}</div>
+                {isMode3Position(position) && position.targetPrice ? <div className="mt-1 text-[10px] text-rose-300">目标 {formatPrice(position.targetPrice, 2)}</div> : null}
+                {isMode3Position(position) && position.hardStopPrice ? <div className="mt-1 text-[10px] text-emerald-300">硬止损 {formatPrice(position.hardStopPrice, 2)}</div> : null}
               </td>
               <td className="px-4 py-3 font-mono">
                 <div>{position.buyDate}</div>
@@ -181,8 +191,8 @@ function PositionTable({
               <td className="px-4 py-3">
                 <div className="flex items-center gap-2" onClick={(event) => event.stopPropagation()}>
                   <button className="btn-sell" disabled={!position.canExecuteSellNow} onClick={() => onTrade("SELL", position.code)}>记录卖出</button>
-                  {canDefer(position) && <button className="rounded-md border border-amber-800/70 bg-amber-950/25 px-3 py-1.5 text-[11px] font-black text-amber-200" onClick={() => onDefer(position)}>延后</button>}
-                  {canCancelDefer(position) && <button className="rounded-md border border-slate-700 px-3 py-1.5 text-[11px] font-black text-slate-300" onClick={() => onCancelDefer(position)}>撤销</button>}
+                  {canDefer(position) && <button className="rounded-md border border-amber-800/70 bg-amber-950/25 px-3 py-1.5 text-[11px] font-black text-amber-200" onClick={() => onDefer(position)}>{deferLabel(position)}</button>}
+                  {canCancelDefer(position) && <button className="rounded-md border border-slate-700 px-3 py-1.5 text-[11px] font-black text-slate-300" onClick={() => onCancelDefer(position)}>{isMode3Position(position) ? "撤销延长" : "撤销"}</button>}
                   <button className="grid h-7 w-7 place-items-center rounded-md text-[#9aa3af] hover:bg-[#1d2430] hover:text-white" onClick={() => onSelect(position.code)} title="查看详情">
                     <Eye size={14} />
                   </button>
@@ -223,11 +233,14 @@ function PositionCard({
       </div>
       <div className="mt-4 grid grid-cols-3 gap-3 text-xs">
         <Mini label="数量/可卖" value={`${position.quantity}/${position.availableQuantity}`} />
-        <Mini label="成本/参考价" value={`${position.avgCost.toFixed(2)}/${position.currentPrice.toFixed(2)}`} />
+        <Mini label="成本/现价" value={`${position.avgCost.toFixed(2)}/${position.currentPrice.toFixed(2)}`} />
         <Mini label="浮动盈亏" value={signedMoney(position.floatingPnL)} cls={tone(position.floatingPnL)} />
         <Mini label="T+1 锁定" value={position.t1LockedQuantity} />
         <Mini label="持仓市值" value={`¥${money(position.marketValue)}`} />
         <Mini label="收益率" value={`${position.floatingPnLPct.toFixed(2)}%`} cls={tone(position.floatingPnLPct)} />
+        <Mini label={isMode3Position(position) ? "十日线参考" : "参考线"} value={formatPrice(referencePrice(position), 2)} />
+        <Mini label={isMode3Position(position) ? "距十日线" : "偏离度"} value={formatPct(referenceDistance(position))} cls={tone(referenceDistance(position))} />
+        {isMode3Position(position) && <Mini label="2%目标价" value={formatPrice(position.targetPrice, 2)} cls="text-rose-300" />}
       </div>
       <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3 text-xs leading-5 text-slate-400">
         {position.advice || position.sellBlockedReason || "按原计划继续观察"}
@@ -235,8 +248,8 @@ function PositionCard({
       </div>
       <div className="mt-4 flex flex-wrap gap-2" onClick={(event) => event.stopPropagation()}>
         <button className="btn-sell" disabled={!position.canExecuteSellNow} onClick={() => onTrade("SELL", position.code)}>记录卖出</button>
-        {canDefer(position) && <button className="btn" onClick={onDefer}>延后处理</button>}
-        {canCancelDefer(position) && <button className="btn" onClick={onCancelDefer}>撤销延后</button>}
+        {canDefer(position) && <button className="btn" onClick={onDefer}>{deferLabel(position)}</button>}
+        {canCancelDefer(position) && <button className="btn" onClick={onCancelDefer}>{isMode3Position(position) ? "撤销延长" : "撤销延后"}</button>}
       </div>
     </button>
   );
@@ -287,11 +300,16 @@ function PositionDetail({
       </div>
       <div className="mt-4 grid grid-cols-2 gap-3">
         <Mini label={position.quoteUpdatedAt ? "当前价格 / 行情" : "当前价格"} value={position.quoteUpdatedAt ? `${position.currentPrice.toFixed(3)} / ${position.quoteUpdatedAt}` : position.currentPrice.toFixed(3)} />
-        <Mini label="参考线" value={position.ma5.toFixed(3)} />
+        <Mini label={isMode3Position(position) ? "十日线参考" : "参考线"} value={formatPrice(referencePrice(position), 3)} />
+        <Mini label={isMode3Position(position) ? "距十日线" : "偏离度"} value={formatPct(referenceDistance(position))} cls={tone(referenceDistance(position))} />
         <Mini label="持仓数量" value={position.quantity} />
         <Mini label="可卖/锁定" value={`${position.availableQuantity}/${position.t1LockedQuantity}`} />
         <Mini label="平均成本" value={position.avgCost.toFixed(3)} />
         <Mini label="浮动盈亏" value={signedMoney(position.floatingPnL)} cls={tone(position.floatingPnL)} />
+        {isMode3Position(position) && <Mini label="2%目标价" value={formatPrice(position.targetPrice, 3)} cls="text-rose-300" />}
+        {isMode3Position(position) && <Mini label="十日线下1%" value={formatPrice(position.warningStopPrice, 3)} cls="text-amber-300" />}
+        {isMode3Position(position) && <Mini label="硬止损价" value={formatPrice(position.hardStopPrice, 3)} cls="text-emerald-300" />}
+        {isMode3Position(position) && <Mini label="延长观察" value={position.extendedObservation ? "已登记" : "未登记"} cls={position.extendedObservation ? "text-amber-300" : "text-slate-300"} />}
       </div>
       <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
         <div className="flex items-center gap-2 text-xs font-black text-slate-300">
@@ -303,8 +321,8 @@ function PositionDetail({
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
         <button className="btn-sell" disabled={!position.canExecuteSellNow} onClick={() => onTrade("SELL", position.code)}>记录卖出</button>
-        {canDefer(position) && <button className="btn" onClick={onDefer}>延后处理</button>}
-        {canCancelDefer(position) && <button className="btn" onClick={onCancelDefer}>撤销延后</button>}
+        {canDefer(position) && <button className="btn" onClick={onDefer}>{deferLabel(position)}</button>}
+        {canCancelDefer(position) && <button className="btn" onClick={onCancelDefer}>{isMode3Position(position) ? "撤销延长" : "撤销延后"}</button>}
       </div>
       <div className="mt-5">
         <div className="mb-2 flex items-center gap-2 text-xs font-black text-slate-300">
@@ -348,8 +366,39 @@ function PositionDetail({
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const toneName = status.includes("待") ? "red" : status.includes("锁定") || status.includes("延") ? "amber" : "cyan";
+  const toneName = status.includes("待") || status.includes("必须") || status.includes("超期") ? "red" : status.includes("锁定") || status.includes("延") ? "amber" : "cyan";
   return <Badge tone={toneName}>{status}</Badge>;
+}
+
+function isMode3Position(position: Position) {
+  return position.strategyId === "mode3" || position.referenceLine === "MA10";
+}
+
+function referenceLabel(position: Position) {
+  return isMode3Position(position) ? "MA10" : position.referenceLine || "MA5";
+}
+
+function referencePrice(position: Position) {
+  return Number(position.referencePrice ?? position.ma5 ?? position.currentPrice ?? 0);
+}
+
+function referenceDistance(position: Position) {
+  return Number(position.distanceToReferencePct ?? position.deviation5 ?? 0);
+}
+
+function formatPrice(value: number | null | undefined, digits = 2) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? `¥${parsed.toFixed(digits)}` : "-";
+}
+
+function formatPct(value: number | null | undefined) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return "-";
+  return `${parsed >= 0 ? "+" : ""}${parsed.toFixed(2)}%`;
+}
+
+function deferLabel(position: Position) {
+  return isMode3Position(position) ? "突破五日线，延长至尾盘" : "延后处理";
 }
 
 function canDefer(position: Position) {
@@ -357,5 +406,5 @@ function canDefer(position: Position) {
 }
 
 function canCancelDefer(position: Position) {
-  return position.actionType === "DEFERRED_TO_AFTERNOON" || position.actionType === "AFTERNOON_EXIT_DUE" || position.actionType === "MANUAL_REVIEW_DEFERRED" || position.status.includes("延");
+  return position.actionType === "DEFERRED_TO_AFTERNOON" || position.actionType === "AFTERNOON_EXIT_DUE" || position.actionType === "EXTENDED_AFTER_MA5_BREAK" || position.actionType === "SAME_DAY_FINAL_EXIT_DUE" || position.actionType === "MANUAL_REVIEW_DEFERRED" || position.status.includes("延");
 }

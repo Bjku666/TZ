@@ -15,7 +15,7 @@ import {
   TrendingUp,
   X,
 } from "lucide-react";
-import type { CapitalPoint, Mode, Page, StrategyId, StrategyMode, Trade } from "./types";
+import type { CapitalPoint, Mode, Page, StrategyId, StrategyMode, StrategySnapshot, Trade } from "./types";
 import { modeLabel, money, nowTime, pct, tone } from "./lib";
 
 type IconType = typeof Activity;
@@ -439,10 +439,10 @@ export function TradeTable({ rows, actions }: { rows: Trade[]; actions?: (trade:
   if (!rows.length) return <Empty text="暂无符合条件的交易记录。" />;
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[980px] text-left text-xs">
+      <table className="w-full min-w-[1180px] text-left text-xs">
         <thead className="bg-[#111820] text-[#8a94a3]">
           <tr>
-            {["日期 / 时间", "类型", "股票", "价格", "数量（股）", "成交金额", "佣/税/规费", "审计结论", "动机 / 违纪原因", "操作"].map((h) => (
+            {["日期 / 时间", "类型", "股票", "价格", "数量（股）", "成交金额", "佣/税/规费", "审计结论", "入场/退出节点", "规则快照", "动机 / 违纪原因", "操作"].map((h) => (
               <th key={h} className="px-4 py-3 font-black">{h}</th>
             ))}
           </tr>
@@ -469,6 +469,13 @@ export function TradeTable({ rows, actions }: { rows: Trade[]; actions?: (trade:
                 <td className="px-4 py-3 font-mono text-[#9aa3af]">¥ {money(t.totalFee)}</td>
                 <td className="px-4 py-3">
                   <Badge tone={t.rulesConclusion === "符合规则" ? "green" : t.rulesConclusion === "违规交易" ? "red" : "amber"}>{t.rulesConclusion}</Badge>
+                </td>
+                <td className="px-4 py-3 text-[#9aa3af]">
+                  <div className="font-black text-slate-200">{tradeNodeLabel(t)}</div>
+                  <div className="mt-1 text-[10px] leading-4 text-[#77808f]">{tradeNodeDetail(t)}</div>
+                </td>
+                <td className="max-w-80 px-4 py-3 text-[#9aa3af]">
+                  <SnapshotCell trade={t} />
                 </td>
                 <td className="max-w-72 px-4 py-3 text-[#9aa3af]">
                   <div className="line-clamp-2">{t.reason || t.violationTags.join("、") || t.remark || "无"}</div>
@@ -513,7 +520,113 @@ function normalizeTableTrade(row: Trade, index: number): Trade {
     violationTags: Array.isArray(item.violationTags) ? item.violationTags.filter(Boolean).map(String) : [],
     historicalBackfill: Boolean(item.historicalBackfill),
     manualFeeOverride: Boolean(item.manualFeeOverride),
+    strategySnapshot: snapshotValue(item.strategySnapshot),
   };
+}
+
+function snapshotValue(value: unknown): StrategySnapshot {
+  return value && typeof value === "object" ? value as StrategySnapshot : {};
+}
+
+function tradeNodeLabel(trade: Trade) {
+  return trade.type === "BUY" ? "入场登记" : "退出登记";
+}
+
+function tradeNodeDetail(trade: Trade) {
+  const snapshot = snapshotValue(trade.strategySnapshot);
+  if (trade.strategyId === "mode3" && trade.type === "BUY") return `计划：${snapshot.plannedExitRule || "NEXT_TRADING_DAY"}`;
+  if (trade.strategyId === "mode3" && trade.type === "SELL") return mode3ExitReasonLabel(String(snapshot.exitReason || ""));
+  return trade.type === "BUY" ? "买入节点" : "卖出节点";
+}
+
+function SnapshotCell({ trade }: { trade: Trade }) {
+  const snapshot = snapshotValue(trade.strategySnapshot);
+  const rows = snapshotRows(trade, snapshot);
+  if (!rows.length) return <span className="text-[#687080]">无快照</span>;
+  return (
+    <details>
+      <summary className="cursor-pointer font-black text-cyan-300">{snapshotBrief(trade, snapshot)}</summary>
+      <div className="mt-2 space-y-1 rounded-md border border-[#27313b] bg-[#0f151f] p-2">
+        {rows.map(([label, value]) => (
+          <div key={label} className="grid grid-cols-[86px_1fr] gap-2 text-[10px] leading-4">
+            <span className="text-[#77808f]">{label}</span>
+            <span className="text-slate-300">{value}</span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function snapshotBrief(trade: Trade, snapshot: StrategySnapshot) {
+  if (trade.strategyId === "mode3" && trade.type === "BUY") {
+    const checks = snapshotValue(snapshot.entryChecklist);
+    const total = mode3ChecklistLabels.length;
+    const passed = mode3ChecklistLabels.filter(([key]) => checks[key] === true).length;
+    return `检查表 ${passed}/${total}`;
+  }
+  if (trade.strategyId === "mode3" && trade.type === "SELL") {
+    return mode3ExitReasonLabel(String(snapshot.exitReason || "")) || "退出快照";
+  }
+  return "规则快照";
+}
+
+function snapshotRows(trade: Trade, snapshot: StrategySnapshot): Array<[string, string]> {
+  if (trade.strategyId !== "mode3") {
+    return Object.entries(snapshot).map(([key, value]) => [key, displaySnapshotValue(value)] as [string, string]);
+  }
+  if (trade.type === "BUY") {
+    const checks = snapshotValue(snapshot.entryChecklist);
+    const rows: Array<[string, string]> = [
+      ...mode3ChecklistLabels.map(([key, label]) => [label, checks[key] ? "是" : "否"] as [string, string]),
+      ["十日线价格", displaySnapshotValue(snapshot.ma10AtEntry)],
+      ["距十日线", displaySnapshotValue(snapshot.distanceToMa10Pct)],
+      ["前期涨停", snapshot.priorLimitUp ? "是" : "否"],
+      ["退出规则", displaySnapshotValue(snapshot.plannedExitRule)],
+      ["图形说明", displaySnapshotValue(snapshot.entryPatternNote)],
+      ["人工判断", displaySnapshotValue(snapshot.manualJudgement)],
+    ];
+    return rows.filter(([, value]) => value !== "");
+  }
+  const rows: Array<[string, string]> = [
+    ["退出原因", mode3ExitReasonLabel(String(snapshot.exitReason || ""))],
+    ["延长观察", snapshot.extendedObservation ? "是" : "否"],
+    ["最高盈利", displaySnapshotValue(snapshot.maxProfitPct)],
+    ["退出备注", displaySnapshotValue(snapshot.exitNote)],
+  ];
+  return rows.filter(([, value]) => value !== "");
+}
+
+function displaySnapshotValue(value: unknown) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+const mode3ChecklistLabels: Array<[string, string]> = [
+  ["priorVolumeExpansion", "前期放量"],
+  ["bearishCandle", "阴线"],
+  ["pullbackVolumeShrunk", "缩量"],
+  ["nearMa10", "回踩十日线"],
+  ["ma10Uptrend", "趋势未破坏"],
+  ["midTermDistanceOk", "均线距离"],
+  ["notFirstPullbackBearish", "非首阴"],
+  ["positionSplit", "分仓"],
+];
+
+function mode3ExitReasonLabel(value: string) {
+  const labels: Record<string, string> = {
+    TARGET_PROFIT: "2%目标止盈",
+    OPEN_BELOW_MA10: "开盘跌破十日线",
+    INTRADAY_AVERAGE_BROKEN: "跌破分时均价线",
+    MA5_PRESSURE_FAILED: "五日线突破失败",
+    MA10_STOP: "十日线止损",
+    HARD_STOP: "硬止损",
+    EXTENDED_SAME_DAY_EXIT: "延长后尾盘退出",
+    OTHER: "其他",
+  };
+  return labels[value] || "";
 }
 
 export function NumberField({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {

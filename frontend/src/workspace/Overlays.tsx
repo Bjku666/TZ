@@ -1,15 +1,48 @@
 import { Clock3, Landmark, Minus, Plus, Save, Settings2, ShieldAlert, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import type { AppSettings, Mode, Notice, Reconciliation, SettingsData, Side, StrategyId, Trade, Workspace } from "./types";
+import type { AppSettings, Mode, Notice, Reconciliation, SettingsData, Side, StrategyId, StrategySnapshot, Trade, Workspace } from "./types";
 import { apiPath, modeLabel, money, nowTime, request, signedMoney, today, tone } from "./lib";
 import { Badge, Empty, Field, Mini, NumberField } from "./ui";
 
 type SettingsTab = "account" | "fee" | "reconciliation" | "market";
 type SecurityLookup = { code: string; name: string; found: boolean; source: string };
+type Mode3Fields = {
+  ma10AtEntry: string;
+  distanceToMa10Pct: string;
+  priorLimitUp: boolean;
+  entryPatternNote: string;
+  manualJudgement: string;
+  exitReason: string;
+  extendedObservation: boolean;
+  maxProfitPct: string;
+  exitNote: string;
+};
 const auditOptions = ["符合规则", "部分不符", "违规交易", "无法判断"] as const;
 const hourOptions = Array.from({ length: 24 }, (_, index) => index);
 const minuteOptions = Array.from({ length: 60 }, (_, index) => index);
-const quickTimes = ["09:30", "10:00", "14:55", "15:00"];
+const quickTimes = ["09:30", "10:00", "14:50", "14:55", "15:00"];
+const mode3EntryChecklist = [
+  ["priorVolumeExpansion", "前期存在明显放量上涨"],
+  ["bearishCandle", "当前K线为阴线"],
+  ["pullbackVolumeShrunk", "当前回调成交量缩小"],
+  ["nearMa10", "股价已经接近十日线"],
+  ["ma10Uptrend", "十日线保持向上，整体趋势未破坏"],
+  ["midTermDistanceOk", "十日线与二十日线、三十日线距离不过大"],
+  ["notFirstPullbackBearish", "当前不是第一根回调阴线"],
+  ["positionSplit", "已进行分仓，没有集中买入单只股票"],
+] as const;
+type Mode3EntryCheckKey = typeof mode3EntryChecklist[number][0];
+const mode3ExitReasons = [
+  ["", "请选择退出原因"],
+  ["TARGET_PROFIT", "次日盈利约2%止盈"],
+  ["OPEN_BELOW_MA10", "开盘跌破十日线并确认支撑失效"],
+  ["INTRADAY_AVERAGE_BROKEN", "冲高后跌破分时均价线"],
+  ["MA5_PRESSURE_FAILED", "反弹无法突破五日线"],
+  ["MA10_STOP", "跌破十日线止损"],
+  ["HARD_STOP", "触及约3%硬止损"],
+  ["EXTENDED_SAME_DAY_EXIT", "突破五日线延长后当日尾盘退出"],
+  ["OTHER", "其他人工原因"],
+] as const;
 
 export function TradeModal({
   mode,
@@ -47,9 +80,12 @@ export function TradeModal({
     rulesConclusion: edit?.rulesConclusion || "无法判断",
     violationTags: edit?.violationTags?.join("、") || "",
   });
+  const [mode3Entry, setMode3Entry] = useState<Record<Mode3EntryCheckKey, boolean>>(() => initialMode3EntryChecklist(edit?.strategySnapshot));
+  const [mode3Fields, setMode3Fields] = useState<Mode3Fields>(() => initialMode3Fields(edit?.strategySnapshot));
   const [nameTouched, setNameTouched] = useState(Boolean(edit?.name));
   const [lookupHint, setLookupHint] = useState("");
   const side = form.type as Side;
+  const isMode3 = strategyId === "mode3";
   const activePosition = w.positions.find((item) => item.code === form.code) || position;
   const price = Number(form.price || 0);
   const quantity = Number(form.quantity || 0);
@@ -75,6 +111,8 @@ export function TradeModal({
     return w.positions.find((item) => item.code === normalized) || w.trades.find((trade) => trade.code === normalized);
   };
   const set = (key: keyof typeof form, value: string | boolean) => setForm((current) => ({ ...current, [key]: value }));
+  const setMode3Check = (key: Mode3EntryCheckKey, value: boolean) => setMode3Entry((current) => ({ ...current, [key]: value }));
+  const setMode3Field = (key: keyof typeof mode3Fields, value: string | boolean) => setMode3Fields((current) => ({ ...current, [key]: value }));
   const setManualFeeOverride = (checked: boolean) => {
     setForm((current) => ({
       ...current,
@@ -179,6 +217,7 @@ export function TradeModal({
       totalFee: fees.totalFee,
       rulesConclusion: form.historicalBackfill ? form.rulesConclusion : undefined,
       violationTags: form.historicalBackfill ? form.violationTags : [],
+      strategySnapshot: isMode3 ? buildMode3Snapshot(side, mode3Entry, mode3Fields) : edit?.strategySnapshot || {},
       accountMode: mode,
       strategyId,
     };
@@ -188,7 +227,7 @@ export function TradeModal({
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur-[3px]" onMouseDown={onClose}>
-      <section className="max-h-[94vh] w-full max-w-[512px] overflow-hidden rounded-xl border border-[#25324a] bg-[#121722] shadow-2xl" onMouseDown={(event) => event.stopPropagation()}>
+      <section className={`max-h-[94vh] w-full ${isMode3 ? "max-w-[672px]" : "max-w-[512px]"} overflow-hidden rounded-xl border border-[#25324a] bg-[#121722] shadow-2xl`} onMouseDown={(event) => event.stopPropagation()}>
         <div className="flex items-center justify-between border-b border-[#25324a] bg-[#0f1d3a] px-6 py-4">
           <div className="flex items-center gap-3">
             <Landmark size={18} className="mode-accent" />
@@ -261,6 +300,71 @@ export function TradeModal({
               />
             </Field>
           </div>
+
+          {isMode3 && side === "BUY" && (
+            <div className="mt-4 rounded-lg border border-[#25324a] bg-[#111821] p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="text-[12px] font-black text-white">模式三入场检查表</div>
+                <Badge tone="indigo">plannedExitRule: NEXT_TRADING_DAY</Badge>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {mode3EntryChecklist.map(([key, label]) => (
+                  <label key={key} className="flex gap-2 rounded-md border border-[#27313b] bg-[#0f151f] p-2 text-[11px] leading-5 text-[#cfd6df]">
+                    <input type="checkbox" checked={mode3Entry[key]} onChange={(event) => setMode3Check(key, event.target.checked)} />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <Field label="买入时十日线价格">
+                  <input className="input font-mono" inputMode="decimal" value={mode3Fields.ma10AtEntry} onChange={(event) => setMode3Field("ma10AtEntry", normalizePriceInput(event.target.value))} />
+                </Field>
+                <Field label="买入价距离十日线百分比">
+                  <input className="input font-mono" inputMode="decimal" placeholder="例如 1.2" value={mode3Fields.distanceToMa10Pct} onChange={(event) => setMode3Field("distanceToMa10Pct", normalizeSignedDecimalInput(event.target.value))} />
+                </Field>
+              </div>
+              <label className="mt-3 flex gap-2 rounded-md border border-[#27313b] bg-[#0f151f] p-2 text-[11px] leading-5 text-[#9aa3af]">
+                <input type="checkbox" checked={mode3Fields.priorLimitUp} onChange={(event) => setMode3Field("priorLimitUp", event.target.checked)} />
+                <span>前期出现涨停，仅作为优先条件记录，不作为必买条件</span>
+              </label>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <Field label="买入图形说明">
+                  <textarea className="input min-h-[58px] resize-none" value={mode3Fields.entryPatternNote} onChange={(event) => setMode3Field("entryPatternNote", event.target.value)} />
+                </Field>
+                <Field label="其他人工判断">
+                  <textarea className="input min-h-[58px] resize-none" value={mode3Fields.manualJudgement} onChange={(event) => setMode3Field("manualJudgement", event.target.value)} />
+                </Field>
+              </div>
+            </div>
+          )}
+
+          {isMode3 && side === "SELL" && (
+            <div className="mt-4 rounded-lg border border-[#25324a] bg-[#111821] p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="text-[12px] font-black text-white">模式三退出记录</div>
+                <Badge tone={mode3Fields.extendedObservation ? "amber" : "slate"}>{mode3Fields.extendedObservation ? "已登记延长观察" : "未延长"}</Badge>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="退出原因">
+                  <select className="input" value={mode3Fields.exitReason} onChange={(event) => setMode3Field("exitReason", event.target.value)}>
+                    {mode3ExitReasons.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                  </select>
+                </Field>
+                <Field label="盘中最高盈利百分比">
+                  <input className="input font-mono" inputMode="decimal" placeholder="例如 2.3" value={mode3Fields.maxProfitPct} onChange={(event) => setMode3Field("maxProfitPct", normalizeSignedDecimalInput(event.target.value))} />
+                </Field>
+              </div>
+              <label className="mt-3 flex gap-2 rounded-md border border-[#27313b] bg-[#0f151f] p-2 text-[11px] leading-5 text-[#9aa3af]">
+                <input type="checkbox" checked={mode3Fields.extendedObservation} onChange={(event) => setMode3Field("extendedObservation", event.target.checked)} />
+                <span>10:00 前突破五日线，登记延长观察至当日尾盘</span>
+              </label>
+              <div className="mt-3">
+                <Field label="退出备注">
+                  <textarea className="input min-h-[58px] resize-none" value={mode3Fields.exitNote} onChange={(event) => setMode3Field("exitNote", event.target.value)} />
+                </Field>
+              </div>
+            </div>
+          )}
 
           <label className="mt-5 flex gap-3 rounded-lg border border-[#25324a] bg-[#111821] p-3 text-[11px] leading-5 text-[#9aa3af]">
             <input type="checkbox" className="mt-1" checked={form.historicalBackfill} onChange={(event) => setHistoricalBackfill(event.target.checked)} />
@@ -766,6 +870,59 @@ function TimeWheelColumn({
   );
 }
 
+function snapshotObject(value: unknown): StrategySnapshot {
+  return value && typeof value === "object" ? value as StrategySnapshot : {};
+}
+
+function initialMode3EntryChecklist(snapshot?: StrategySnapshot): Record<Mode3EntryCheckKey, boolean> {
+  const entry = snapshotObject(snapshot?.entryChecklist);
+  return Object.fromEntries(mode3EntryChecklist.map(([key]) => [key, Boolean(entry[key])])) as Record<Mode3EntryCheckKey, boolean>;
+}
+
+function initialMode3Fields(snapshot?: StrategySnapshot): Mode3Fields {
+  const item = snapshotObject(snapshot);
+  return {
+    ma10AtEntry: stringValue(item.ma10AtEntry),
+    distanceToMa10Pct: stringValue(item.distanceToMa10Pct),
+    priorLimitUp: Boolean(item.priorLimitUp),
+    entryPatternNote: stringValue(item.entryPatternNote),
+    manualJudgement: stringValue(item.manualJudgement),
+    exitReason: stringValue(item.exitReason),
+    extendedObservation: Boolean(item.extendedObservation),
+    maxProfitPct: stringValue(item.maxProfitPct),
+    exitNote: stringValue(item.exitNote),
+  };
+}
+
+function buildMode3Snapshot(side: Side, entry: Record<Mode3EntryCheckKey, boolean>, fields: Mode3Fields): StrategySnapshot {
+  if (side === "BUY") {
+    return {
+      entryChecklist: entry,
+      ma10AtEntry: numberOrEmpty(fields.ma10AtEntry),
+      distanceToMa10Pct: numberOrEmpty(fields.distanceToMa10Pct),
+      priorLimitUp: fields.priorLimitUp,
+      plannedExitRule: "NEXT_TRADING_DAY",
+      entryPatternNote: fields.entryPatternNote.trim(),
+      manualJudgement: fields.manualJudgement.trim(),
+    };
+  }
+  return {
+    exitReason: fields.exitReason,
+    extendedObservation: fields.extendedObservation,
+    maxProfitPct: numberOrEmpty(fields.maxProfitPct),
+    exitNote: fields.exitNote.trim(),
+  };
+}
+
+function stringValue(value: unknown) {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function numberOrEmpty(value: string) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : "";
+}
+
 function parseTime(value: string) {
   const [rawHour, rawMinute] = String(value || "").split(":");
   return {
@@ -788,6 +945,19 @@ function normalizePriceInput(value: string) {
   const [whole, ...decimalParts] = normalized.split(".");
   const decimal = decimalParts.join("").slice(0, 3);
   return decimalParts.length ? `${whole || "0"}.${decimal}` : whole;
+}
+
+function normalizeSignedDecimalInput(value: string) {
+  const normalized = value
+    .replace(/[０-９]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0))
+    .replace(/[，,。．]/g, ".")
+    .replace(/[^\d.-]/g, "");
+  if (!normalized) return "";
+  const sign = normalized.startsWith("-") ? "-" : "";
+  const unsigned = normalized.replace(/-/g, "");
+  const [whole, ...decimalParts] = unsigned.split(".");
+  const decimal = decimalParts.join("").slice(0, 3);
+  return decimalParts.length ? `${sign}${whole || "0"}.${decimal}` : `${sign}${whole}`;
 }
 
 function normalizeRateInput(value: string) {
